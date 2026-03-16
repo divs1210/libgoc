@@ -1,3 +1,4 @@
+
 # libgoc
 > A Go-style CSP concurrency runtime for C: threadpools, stackful coroutines, channels, select, async I/O, and garbage collection in one coherent API.
 
@@ -17,9 +18,7 @@ See the [Design Doc](./DESIGN.md) for implementation details.
 |---|---|
 | `minicoro` | fiber suspend/resume (cross-platform; POSIX and Windows) |
 | `libuv` | event loop, timers, cross-thread wakeup |
-| `pthreads` | thread pool workers (POSIX) |
-| `pthreads4w` | thread pool workers (Windows only) |
-| Boehm GC | garbage collection; **must be built with `--enable-threads`**; linked automatically, initialised by `goc_init` |
+| Boehm GC | garbage collection; **must be built with `--enable-threads`**; linked automatically, initialised by `goc_init`; owns thread pool worker creation via `GC_pthread_create` / `GC_pthread_join` |
 
 > See [minicoro limitations](#minicoro-limitations) in the Public API section for fiber stack constraints.
 
@@ -675,7 +674,6 @@ int main(void) {
 | Boehm GC | `brew install bdw-gc` | source build (see below) | `dnf install gc-devel` | vcpkg or source build |
 | pkg-config | `brew install pkg-config` | `apt install pkg-config` | `dnf install pkgconfig` | — |
 | minicoro | vendored (submodule); instantiated via `src/minicoro.c` |
-| pthreads4w | — | — | — | bundled or vcpkg |
 
 A C11 compiler (clang or gcc on POSIX; MSVC or clang-cl on Windows) is required.
 
@@ -721,8 +719,9 @@ sudo apt update
 sudo apt install cmake libuv1-dev libatomic-ops-dev pkg-config build-essential
 
 # Ubuntu's libgc-dev is NOT compiled with --enable-threads, which libgoc requires.
-# GC_allow_register_threads / GC_register_my_thread are absent in the system package
-# and will cause a crash at runtime. Build Boehm GC from source instead:
+# GC_allow_register_threads and the GC_pthread_create / GC_pthread_join wrappers
+# are absent in the system package and will cause a crash at runtime.
+# Build Boehm GC from source instead:
 wget https://github.com/ivmai/bdwgc/releases/download/v8.2.6/gc-8.2.6.tar.gz
 tar xf gc-8.2.6.tar.gz && cd gc-8.2.6
 ./configure --enable-threads=posix --enable-thread-local-alloc --enable-shared --prefix=/usr/local
@@ -749,7 +748,7 @@ ctest --test-dir build --output-on-failure
 
 ```bat
 REM 1. Install dependencies via vcpkg (or adjust paths as needed)
-vcpkg install libuv bdw-gc pthreads
+vcpkg install libuv bdw-gc
 
 REM 2. Configure (pass vcpkg toolchain if using vcpkg)
 cmake -B build -DCMAKE_TOOLCHAIN_FILE=<vcpkg-root>/scripts/buildsystems/vcpkg.cmake
@@ -764,7 +763,7 @@ REM Or run a single phase directly
 build\RelWithDebInfo\test_p1_foundation.exe
 ```
 
-> **Note:** minicoro and pthreads4w replace the POSIX-specific `ucontext_t` and native pthreads on Windows. No additional compiler flags are needed; the build system detects the platform automatically.
+> **Note:** minicoro replaces the POSIX-specific `ucontext_t` on Windows. No additional compiler flags are needed; the build system detects the platform automatically.
 
 ---
 
