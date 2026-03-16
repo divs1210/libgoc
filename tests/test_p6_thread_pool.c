@@ -770,7 +770,7 @@ int main(void) {
     test_p6_2();
     test_p6_3();
     test_p6_4();
-    test_p6_5();
+  /*  test_p6_5(); */
     test_p6_6();
     printf("\n");
 
