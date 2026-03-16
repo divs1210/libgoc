@@ -607,14 +607,15 @@ while not shutdown:
     GC_add_roots(&entry, &entry + 1)   /* entry reachable for entire mco_resume window */
     if *entry->stack_canary_ptr != GOC_STACK_CANARY:
         abort()                        /* stack overflow — deterministic crash, not silent corruption */
-    mco_resume(entry->coro)            /* run fiber until next mco_yield or return */
+    mco_coro* coro = entry->coro       /* snapshot handle before resume — see note below */
+    mco_resume(coro)                   /* run fiber until next mco_yield or return */
     GC_remove_roots(&entry, &entry + 1)
     lock(drain_mutex); active_count--; unlock(drain_mutex)
     /* The decrement is always committed and the lock released before checking MCO_DEAD.
        mco_destroy and the broadcast are separate subsequent actions, never nested inside
        the decrement lock — this avoids holding drain_mutex across mco_destroy. */
-    if mco_status(entry->coro) == MCO_DEAD:
-        mco_destroy(entry->coro)
+    if mco_status(coro) == MCO_DEAD:
+        mco_destroy(coro)
         lock(drain_mutex); signal(drain_cond); unlock(drain_mutex)
     /* if MCO_SUSPENDED: the fiber yielded and is parked on a channel.
        active_count has already been decremented above.  wake() →
@@ -624,6 +625,8 @@ while not shutdown:
        because post_to_run_queue increments before the fiber can be seen by
        the drain-wait. */
 ```
+
+> **Why `coro` is snapshotted before `mco_resume`.** When a fiber suspends inside `goc_take`, it stack-allocates a `goc_entry` (the parking entry) on its own coroutine stack and parks. The pool worker's `entry` pointer therefore points into the fiber's stack for the duration of that park. If the fiber is immediately re-scheduled on the same resume call (i.e. it runs to completion without yielding again), minicoro recycles the stack — and the memory `entry` pointed at is gone by the time `mco_resume` returns. Reading `entry->coro` after the resume is therefore a use-after-free and a potential segfault. The `mco_coro` object itself is minicoro heap-allocated and remains valid until `mco_destroy`, so snapshotting `coro = entry->coro` *before* the resume is always safe and eliminates the hazard entirely.
 
 `active_count` tracks the number of fiber entries that are either queued in the run queue or currently executing on a worker thread. It does **not** count fibers that are parked waiting for a channel event — those are suspended and invisible to the pool until `wake()` re-enqueues them.
 
