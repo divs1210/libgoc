@@ -199,7 +199,17 @@ void loop_init(void)
     cb_queue_init();
 
     /* 6. Spawn the loop thread via GC_pthread_create so the GC wrapper
-     *    registers the thread automatically (consistent with pool workers). */
+     *    registers the thread automatically.
+     *
+     *    NOTE: An earlier version of DESIGN.md stated that the loop thread was
+     *    spawned with plain pthread_create and registered manually via
+     *    GC_register_my_thread / GC_unregister_my_thread.  That approach was
+     *    superseded: using GC_pthread_create is simpler, consistent with pool
+     *    workers, and avoids the manual registration / unregistration calls.
+     *    Pool workers and the loop thread must NOT call GC_register_my_thread
+     *    manually — doing so double-registers the thread and corrupts the GC's
+     *    internal thread table (observed as SIGSEGV in GC_call_with_stack_base
+     *    during P1.4). */
     GC_pthread_create(&g_loop_thread, NULL, loop_thread_fn, NULL);
 }
 
