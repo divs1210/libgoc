@@ -203,7 +203,15 @@ static void p8_1_child_fn(void* arg) {
      */
     goc_take_sync(ch);
 
-    /* Unreachable if abort() fires correctly. */
+    /*
+     * goc_take_sync() has returned — the pool worker now has the fiber
+     * re-queued and will check the canary on the next mco_resume, calling
+     * abort() on the pool thread.  abort() sends SIGABRT to the whole
+     * process, so we must not exit before it fires.  pause() suspends the
+     * main thread indefinitely; the signal kills the process before pause()
+     * ever returns.
+     */
+    pause();
 }
 
 /*
