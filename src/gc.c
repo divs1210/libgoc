@@ -153,12 +153,12 @@ void goc_init(void) {
 /* ---------------------------------------------------------------------------
  * goc_shutdown
  *
- * Orderly teardown. The caller is responsible for ensuring all fibers have
- * exited before calling this function; goc_shutdown does NOT forcibly close
- * channels or cancel parked fibers.
+ * Orderly teardown. Blocks until all fibers on all pools have run to
+ * completion, then tears down the event loop and frees all resources.
+ * Intended to be called once at the end of main().
  *
  * Sequence:
- *   B.1  pool_registry_destroy_all()  — drains and destroys every pool
+ *   B.1  pool_registry_destroy_all()  — drains (blocks) and destroys every pool
  *   B.2  Destroy all channel mutexes; free live_channels; destroy g_live_mutex
  *   B.3  loop_shutdown()              — signals loop thread, joins, frees g_loop
  * ---------------------------------------------------------------------------*/
@@ -169,8 +169,10 @@ void goc_shutdown(void) {
 
     /* B.2 — Destroy channel mutexes and tear down the live-channels registry.
      *
-     * No lock is needed here: all pools are destroyed (all fibers have exited),
-     * and no other thread will call chan_register / chan_unregister at this point.
+     * No lock is needed here: pool_registry_destroy_all() (B.1) blocks until
+     * every pool has drained — all fibers have run to completion before we
+     * reach this point. No other thread will call chan_register / chan_unregister
+     * after that drain completes.
      */
     for (size_t i = 0; i < live_channels_len; i++) {
         goc_chan* ch = live_channels[i];
