@@ -196,6 +196,9 @@ static void p8_1_overflow_fiber(void* arg) {
  * This two-phase approach (overflow, then yield) is necessary because the
  * canary is checked only on the resume path, not during the initial run.
  */
+/* Forward declaration — defined at file scope below p8_1_child_fn. */
+static void overflow_then_yield(void* c);
+
 static void p8_1_child_fn(void* arg) {
     (void)arg;
 
@@ -210,7 +213,6 @@ static void p8_1_child_fn(void* arg) {
     goc_chan* ch = goc_chan_make(0);
 
     /* Fiber: overflow stack, then park on goc_put(ch, ...). */
-    static void overflow_then_yield(void* c);
     goc_go(overflow_then_yield, ch);
 
     /*
