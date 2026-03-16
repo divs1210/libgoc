@@ -1,3 +1,23 @@
+/*
+Minimal asymmetric stackful cross-platform coroutine library in pure C.
+minicoro - v0.2.0 - 15/Nov/2023
+Eduardo Bart - edub4rt@gmail.com
+https://github.com/edubart/minicoro
+
+Minicoro is single file library for using asymmetric coroutines in C.
+The API is inspired by Lua coroutines but with C use in mind.
+
+# Features
+
+- Stackful asymmetric coroutines.
+- Supports nesting coroutines (resuming a coroutine from another coroutine).
+- Supports custom allocators.
+- Storage system to allow passing values between yield and resume.
+- Customizable stack size.
+- Supports growable stacks and low memory footprint when enabling the virtual memory allocator.
+- Coroutine API design inspired by Lua with C use in mind.
+- Yield across any C function.
+- Made to work in multithread applications.
 - Cross platform.
 - Minimal, self contained and no external dependencies.
 - Readable sources and documented.
