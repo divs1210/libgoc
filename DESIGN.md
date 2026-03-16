@@ -619,7 +619,9 @@ while not shutdown:
     goc_entry* entry = runq_pop()
     GC_add_roots(&entry, &entry + 1)   /* entry reachable for entire mco_resume window */
     if *entry->stack_canary_ptr != GOC_STACK_CANARY:
-        abort()                        /* stack overflow — deterministic crash, not silent corruption */
+        abort()                        /* stack overflow — deterministic crash, not silent corruption
+                                          applies to ALL entry kinds: launch entries AND goc_alts
+                                          park entries; stack_canary_ptr must never be NULL */
     mco_coro* coro = entry->coro       /* snapshot handle before resume — see note below */
     mco_resume(coro)                   /* run fiber until next mco_yield or return */
     GC_remove_roots(&entry, &entry + 1)
@@ -864,6 +866,8 @@ The returned `goc_alts_result.index` is the zero-based index of the winning arm.
 
    For **take arms**: if the channel is closed and empty, return `{NULL, GOC_CLOSED}` with the arm's index immediately. For **put arms**: if the channel is closed, likewise return `{NULL, GOC_CLOSED}` with the arm's index immediately. Both directions are symmetrical — a closed channel is a terminal condition and must not fall through to the DEFAULT arm or the park phases.
 3. Allocate one `goc_entry` per **non-default** op **and** a single `_Atomic int fired` flag (all via `goc_malloc`). Every entry's `fired` pointer points at this shared flag. The `fired` object lives on the GC heap alongside the entries for the duration of the select. `GOC_ALT_DEFAULT` arms do not produce entries because they are only reachable in Phase 2.
+
+   **`stack_canary_ptr` must be set for every `GOC_FIBER` park entry.** `pool_worker_fn` unconditionally dereferences `entry->stack_canary_ptr` before calling `mco_resume` on any entry it pops from the run queue. Because park entries are posted to the run queue by `wake()` when the winning channel fires, they pass through this check just like launch entries. Set `e->stack_canary_ptr = (uint32_t *)running->stack_base` — the same value written by fiber launch — so the canary check reads the word at the bottom of the fiber's stack and detects overflow correctly. Leaving `stack_canary_ptr` as `NULL` causes a null-pointer dereference the moment the first park path is exercised.
 
    **Lock setup:** Build a deduplicated, sorted copy of the channel pointers to establish acquisition order. Stack-allocate this scratch buffer for small `n` (≤ `GOC_ALTS_STACK_THRESHOLD`), or `malloc`/`free` it immediately after the locks are acquired. Do **not** allocate it via `goc_malloc`. The buffer's lifetime is strictly bounded to this call frame: it is freed (or goes out of scope) before the fiber parks, so there is no suspension window during which the GC could observe or need to trace it. Plain `malloc` is therefore correct and avoids polluting the GC heap with short-lived, pointer-free scratch memory.
 
