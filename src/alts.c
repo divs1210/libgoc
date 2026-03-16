@@ -17,6 +17,7 @@
 
 #include <stdlib.h>
 #include <stdatomic.h>
+#include <assert.h>
 #include <semaphore.h>
 #include <uv.h>
 #include <gc.h>
@@ -26,6 +27,16 @@
 #include "internal.h"
 
 /* -------------------------------------------------------------------------
+ * alts_rand_seed
+ *
+ * Per-call seed for rand_r(). Using a global atomic counter avoids the
+ * thread-safety problem with rand() (which shares global state) while
+ * keeping the implementation simple. The shuffle is for starvation
+ * avoidance, not security, so the quality of the PRNG is unimportant.
+ * ------------------------------------------------------------------------- */
+static _Atomic unsigned int g_alts_rand_seed = 1;
+
+/* -------------------------------------------------------------------------
  * alts_shuffle
  *
  * Fisher-Yates in-place shuffle on indices[0..n-1].
@@ -33,9 +44,13 @@
  * ------------------------------------------------------------------------- */
 static void alts_shuffle(size_t *indices, size_t n) {
     if (n < 2) return;
+    /* rand_r() with a per-call seed snapshot is thread-safe. The seed is an
+     * atomic counter rather than per-fiber state; collisions between threads
+     * merely reduce shuffle variety, which is acceptable for fairness. */
+    unsigned int seed = atomic_fetch_add_explicit(&g_alts_rand_seed, 1,
+                                                  memory_order_relaxed);
     for (size_t i = n - 1; i > 0; i--) {
-        /* rand() is acceptable here; this is for fairness, not security */
-        size_t j = (size_t)rand() % (i + 1);
+        size_t j = (size_t)rand_r(&seed) % (i + 1);
         size_t tmp = indices[i];
         indices[i] = indices[j];
         indices[j] = tmp;
@@ -59,14 +74,13 @@ static void alts_shuffle(size_t *indices, size_t n) {
  * ------------------------------------------------------------------------- */
 static size_t alts_dedup_sort_channels(goc_alt_op *ops, size_t n,
                                         goc_chan **scratch, size_t scratch_n) {
-    (void)scratch_n; /* caller guarantees sufficient space */
-
     size_t count = 0;
 
     /* collect non-NULL channel pointers */
     for (size_t i = 0; i < n; i++) {
         if (ops[i].op_kind == GOC_ALT_DEFAULT || ops[i].ch == NULL)
             continue;
+        assert(count < scratch_n && "alts_dedup_sort_channels: scratch overflow");
         scratch[count++] = ops[i].ch;
     }
 
@@ -116,7 +130,10 @@ goc_alts_result goc_alts(goc_alt_op *ops, size_t n) {
     /* ------------------------------------------------------------------ */
     size_t  default_idx  = (size_t)-1;
     size_t  n_nondefault = 0;
-    size_t  indices[n]; /* VLA; n is typically small */
+    /* VLA: n is expected to be small (single digits in practice). A
+     * pathologically large n could overflow the fiber's 64 KB stack; callers
+     * are responsible for keeping arm counts reasonable. */
+    size_t  indices[n];
 
     for (size_t i = 0; i < n; i++) {
         if (ops[i].op_kind == GOC_ALT_DEFAULT) {
@@ -351,6 +368,11 @@ goc_alts_result goc_alts(goc_alt_op *ops, size_t n) {
         }
     }
 
+    /* The woken CAS in wake() / goc_close() guarantees exactly one entry wins.
+     * A NULL winner here means the protocol is broken — abort rather than
+     * silently producing undefined behaviour via a NULL dereference. */
+    assert(winner != NULL && "goc_alts: no winner after wake — woken CAS invariant violated");
+
     /* winner must not be NULL — the runtime guarantees exactly one wake */
     void *result_val = (winner->result_slot) ? *winner->result_slot : NULL;
     return (goc_alts_result){ .index = winner->arm_idx,
@@ -371,7 +393,8 @@ goc_alts_result goc_alts_sync(goc_alt_op *ops, size_t n) {
     /* ------------------------------------------------------------------ */
     size_t  default_idx  = (size_t)-1;
     size_t  n_nondefault = 0;
-    size_t  indices[n]; /* VLA */
+    /* VLA: same size constraint as goc_alts — n should be small. */
+    size_t  indices[n];
 
     for (size_t i = 0; i < n; i++) {
         if (ops[i].op_kind == GOC_ALT_DEFAULT) {
@@ -613,6 +636,9 @@ goc_alts_result goc_alts_sync(goc_alt_op *ops, size_t n) {
             atomic_store_explicit(&e->cancelled, 1, memory_order_release);
         }
     }
+
+    /* Same invariant as goc_alts: exactly one entry must have won the woken CAS. */
+    assert(winner != NULL && "goc_alts_sync: no winner after wake — woken CAS invariant violated");
 
     void *result_val = (winner->result_slot) ? *winner->result_slot : NULL;
     return (goc_alts_result){ .index = winner->arm_idx,
