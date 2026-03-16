@@ -7,7 +7,7 @@ The library provides stackful coroutines ("fibers"), channels, a select primitiv
 
 See the [Design Doc](./DESIGN.md) for implementation details.
 
-> **Boehm GC must be compiled with thread support.** libgoc calls `GC_allow_register_threads()` and marks pool-worker stacks via `GC_register_my_thread` / `GC_unregister_my_thread`. A non-threaded build of the GC (i.e. one built without `--enable-threads`) is missing these symbols and will crash at runtime. See the per-platform instructions in [Building and Testing](#building-and-testing) for how to satisfy this requirement on each OS.
+> **Boehm GC must be compiled with thread support.** libgoc calls `GC_allow_register_threads()` during initialisation. With `-DGC_THREADS` active, the GC's pthread wrapper automatically registers every pool worker thread via `GC_call_with_stack_base` — pool workers must not call `GC_register_my_thread` / `GC_unregister_my_thread` manually, as doing so double-registers the thread and causes a crash. A non-threaded build of the GC (i.e. one built without `--enable-threads`) is missing the required symbols and will crash at runtime. See the per-platform instructions in [Building and Testing](#building-and-testing) for how to satisfy this requirement on each OS.
 
 **Platform:** Linux, macOS, and Windows.
 
