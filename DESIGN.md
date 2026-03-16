@@ -335,7 +335,7 @@ Per-fiber stack size is fixed at the default defined in `config.h` (`GOC_DEFAULT
 
 ```c
 /* written once in fiber.c immediately after mco_create */
-entry->stack_canary_ptr = (uint32_t*)mco_get_stack_base(entry->coro);
+entry->stack_canary_ptr = (uint32_t*)entry->coro->stack_base;
 *entry->stack_canary_ptr = GOC_STACK_CANARY;   /* e.g. 0xDEADC0DE */
 
 /* checked in pool.c before every mco_resume */
@@ -364,7 +364,7 @@ mco_create(&coro, &desc);
 entry->coro = coro;
 
 /* write canary at the lowest address of the newly-created stack */
-entry->stack_canary_ptr = (uint32_t*)mco_get_stack_base(coro);
+entry->stack_canary_ptr = (uint32_t*)coro->stack_base;
 *entry->stack_canary_ptr = GOC_STACK_CANARY;
 
 post_to_run_queue(pool, entry);
