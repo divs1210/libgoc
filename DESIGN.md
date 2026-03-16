@@ -800,10 +800,11 @@ void cb_queue_init(void) {
 
 ```c
 typedef struct {
-    uv_async_t  async;    /* MUST be first — cast between async* and req* */
+    uv_async_t  async;       /* MUST be first — cast between async* and req* */
     goc_chan*    ch;
     uv_timer_t* t;
     uint64_t    ms;
+    uint64_t    deadline_ns; /* uv_hrtime() snapshot taken at goc_timeout() call time */
 } goc_timeout_req;
 
 goc_chan* goc_timeout(uint64_t ms) {
@@ -812,6 +813,7 @@ goc_chan* goc_timeout(uint64_t ms) {
     uv_timer_t* t = malloc(sizeof(uv_timer_t));
     t->data = ch;
     req->ch = ch; req->t = t; req->ms = ms;
+    req->deadline_ns = uv_hrtime();              /* record wall-clock call time */
     uv_async_init(g_loop, &req->async, on_start_timer);  /* safe from any thread */
     uv_async_send(&req->async);                           /* dispatch to loop thread */
     return ch;
@@ -820,8 +822,15 @@ goc_chan* goc_timeout(uint64_t ms) {
 /* runs on the loop thread */
 static void on_start_timer(uv_async_t* h) {
     goc_timeout_req* req = (goc_timeout_req*)h;
+    /* Subtract async dispatch latency so the timer fires at the wall-clock
+     * deadline recorded above, not req->ms after this callback happens to run.
+     * Clamp to zero if the deadline has already passed — fire next iteration. */
+    uint64_t now_ns     = uv_hrtime();
+    uint64_t elapsed_ms = (now_ns > req->deadline_ns)
+                        ? (now_ns - req->deadline_ns) / 1000000ULL : 0;
+    uint64_t remaining  = (elapsed_ms < req->ms) ? (req->ms - elapsed_ms) : 0;
     uv_timer_init(g_loop, req->t);
-    uv_timer_start(req->t, on_timeout, req->ms, 0);
+    uv_timer_start(req->t, on_timeout, remaining, 0);
     uv_close((uv_handle_t*)h, free_start_cb);  /* one-shot: close after use */
 }
 
@@ -847,6 +856,8 @@ static void free_timer_cb(uv_handle_t* h) {
     free(h);   /* safe: uv_close guarantees no further callbacks */
 }
 ```
+
+> **Dispatch-latency correction.** `uv_timer_start` is called from `on_start_timer`, which runs on the loop thread some time *after* `goc_timeout()` returned to the caller. Without correction, the observable latency from `goc_timeout()` to channel-close would be `async_dispatch_delay + ms`, not `ms`. On a loaded system the dispatch delay can be hundreds of milliseconds — large enough to exceed any reasonable upper-bound assertion in tests. The fix is to snapshot `uv_hrtime()` at call time, compute how many milliseconds of the budget were consumed by the dispatch, and pass the reduced `remaining` duration to `uv_timer_start`. If the budget is already exhausted (`remaining == 0`), libuv fires the timer on the very next loop iteration, which is the correct expired-deadline behaviour.
 
 Runs entirely on the uv loop thread (after the async dispatch). Composes with `goc_alts` for deadline semantics:
 
@@ -1095,7 +1106,11 @@ The test suite is split across phase files in `tests/`, each a self-contained C 
 - **Isolation**: `goc_init()` and `goc_shutdown()` bracket the entire test binary — called once each in the `main()` of **each phase's test binary** before and after all tests in that phase run. Individual test functions do not call them.
 - **Synchronisation**: a `done_t` helper (a plain POSIX `sem_t` — `done_signal` calls `sem_post`, `done_wait` calls `sem_wait`) lets the main thread block until fibers finish without relying on `sleep` or a `goc_chan`.
 - **GC integration**: Boehm GC is linked automatically; no hook table setup is required in tests.
-- **Crash tests**: tests that expect `abort()` (e.g. canary violation) use `fork` + `waitpid` in the test function itself. Each test forks a child, which calls `goc_init()` from scratch (the forked address space inherits the parent's memory image but libuv handles, mutexes, and the GC's internal thread table are all in an inconsistent state because background threads were not forked). The child performs the unsafe operation and should never return — the runtime calls `abort()` before that is possible. If the child exits normally it uses `_exit(2)` so the parent can distinguish this from an abort. The parent calls `waitpid` and asserts `WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT`. The child never calls `goc_shutdown()`.
+- **Crash tests**: tests that expect `abort()` (e.g. canary violation) use `fork` + `waitpid` in the test function itself (`fork_expect_sigabrt` helper). Each test forks a child; before calling `goc_init()` the child performs two setup steps:
+  1. **Reset `SIGABRT` to `SIG_DFL`** — the parent installs a `crash_handler` for `SIGABRT` (via `install_crash_handler()`), which the child inherits through `fork`. When `abort()` fires on a pool worker thread, glibc's `abort` implementation blocks `SIGABRT` on the calling thread before raising it. The inherited crash handler then calls `raise(SIGABRT)` while the signal is still blocked, which interacts with `abort()`'s internal signal-mask loop and causes the child to hang rather than terminate. Resetting to `SIG_DFL` before `goc_init()` ensures `abort()` terminates the child immediately regardless of which thread calls it.
+  2. **Force `GOC_POOL_THREADS=1`** — P8.1 requires a specific fiber execution order (victim parks before sender runs). With multiple pool workers, both fibers can be dequeued simultaneously and the ordering is not guaranteed. A single worker serialises fiber execution so the victim always parks first.
+
+  After setup the child calls `goc_init()` from scratch (the forked address space inherits the parent's memory image but libuv handles, mutexes, and the GC's internal thread table are all in an inconsistent state because background threads were not forked). The child performs the unsafe operation and should never return — the runtime calls `abort()` before that is possible. If the child exits normally it uses `_exit(2)` so the parent can distinguish this from an abort. The parent calls `waitpid` and asserts `WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT`. The child never calls `goc_shutdown()`.
 
 ### Coverage
 
@@ -1195,7 +1210,7 @@ The test suite is split across phase files in `tests/`, each a self-contained C 
 
 | Test | Description |
 |---|---|
-| P8.1 | Stack overflow: fiber directly corrupts its canary word (simulating a stack overflow reaching the bottom of the stack region) → pool worker calls `abort()` before the next `mco_resume`; verified via `fork` + `waitpid` asserting `SIGABRT` |
+| P8.1 | Stack overflow: an `overflow_fiber` corrupts its own canary word then parks on `goc_take`; a `sender_fiber` calls `goc_put` to wake it; `pool_worker_fn` checks the canary before the next `mco_resume`, finds it corrupted, and calls `abort()`; verified via `fork` + `waitpid` asserting `SIGABRT`. Two fibers are used (rather than a fiber + `goc_take_sync` from the OS thread) to guarantee the victim parks before the sender runs — with `goc_take_sync`, a race exists where the OS thread parks first and the fiber's `goc_put` rendezvouses immediately without ever suspending, so the canary check never fires. |
 | P8.2 | `goc_take` called from a bare OS thread (not a fiber) → `abort()`; verified via `fork` + `waitpid` asserting `SIGABRT` |
 | P8.3 | `goc_put` called from a bare OS thread (not a fiber) → `abort()`; verified via `fork` + `waitpid` asserting `SIGABRT` |
 
