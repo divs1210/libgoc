@@ -1,297 +1,213 @@
 cmake_minimum_required(VERSION 3.20)
-project(libgoc VERSION 0.1.0 LANGUAGES C)
+project(libgoc C)
 
-# ---------------------------------------------------------------------------
-# C standard
-# ---------------------------------------------------------------------------
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# ---------------------------------------------------------------------------
-# Default build type
-# ---------------------------------------------------------------------------
-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-    message(STATUS "No build type specified — defaulting to RelWithDebInfo")
+if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
 
+# ---------------------------------------------------------------------------
+# Build options
+# ---------------------------------------------------------------------------
+option(LIBGOC_SHARED   "Build a shared library (libgoc.so / .dylib / .dll)" OFF)
+option(LIBGOC_ASAN     "Build an instrumented copy of goc with AddressSanitizer" OFF)
+option(LIBGOC_TSAN     "Build an instrumented copy of goc with ThreadSanitizer" OFF)
+option(LIBGOC_COVERAGE "Instrument goc and tests for code coverage" OFF)
+
+# ---------------------------------------------------------------------------
+# Mutual-exclusion guards
+# ---------------------------------------------------------------------------
+if(LIBGOC_ASAN AND LIBGOC_TSAN)
+    message(FATAL_ERROR "LIBGOC_ASAN and LIBGOC_TSAN are mutually exclusive. "
+                        "Configure them in separate build directories.")
+endif()
+if(LIBGOC_COVERAGE AND LIBGOC_ASAN)
+    message(FATAL_ERROR "LIBGOC_COVERAGE and LIBGOC_ASAN are mutually exclusive.")
+endif()
+if(LIBGOC_COVERAGE AND LIBGOC_TSAN)
+    message(FATAL_ERROR "LIBGOC_COVERAGE and LIBGOC_TSAN are mutually exclusive.")
+endif()
+
+# ---------------------------------------------------------------------------
+# Dependencies — pkg-config only, no fallback
+# ---------------------------------------------------------------------------
 find_package(PkgConfig REQUIRED)
-find_package(Threads REQUIRED)
 
 pkg_check_modules(LIBUV REQUIRED IMPORTED_TARGET libuv)
-# libgoc requires a thread-aware build of Boehm GC.  The plain bdw-gc package
-# resolves to libgc on some Debian/Ubuntu systems compiled without
-# --enable-threads; linking it while compiling with -DGC_THREADS causes
-# GC_INIT() / GC_allow_register_threads() to misbehave or segfault at runtime.
-# bdw-gc-threaded (libgc-threaded) is the explicitly thread-safe variant and is
-# the only acceptable dependency.  If it is not present, fail loudly so the
-# developer installs the correct package rather than silently linking a broken
-# build.
-#
-# IMPORTED_TARGET is required so that the linker search path (-L) from the
-# .pc file is embedded in the PkgConfig::bdw-gc-threaded imported target and
-# propagated to all consumers.  Without it, pkg_check_modules populates only
-# BDWGC_LIBRARIES with bare library names (e.g. -lgc) and the linker never
-# learns the non-default install prefix, causing "cannot find -lgc" at link
-# time when Boehm GC is installed outside the system library paths.
 pkg_check_modules(BDWGC REQUIRED IMPORTED_TARGET bdw-gc-threaded)
 
 # ---------------------------------------------------------------------------
-# Source list
+# Source lists
 # ---------------------------------------------------------------------------
 set(GOC_SOURCES
-    src/gc.c
-    src/pool.c
-    src/loop.c
-    src/channel.c
-    src/fiber.c
     src/alts.c
     src/timeout.c
+    src/gc.c
+    src/loop.c
+    src/pool.c
+    src/fiber.c
+    src/channel.c
     src/minicoro.c
 )
 
 # ---------------------------------------------------------------------------
-# Phase test sources — discover every tests/test_*.c automatically
-# (cmake_path requires CMake 3.20+)
+# Helper: apply common compile options to a goc library target
 # ---------------------------------------------------------------------------
-file(GLOB PHASE_TEST_SOURCES CONFIGURE_DEPENDS tests/test_*.c)
-
-# ---------------------------------------------------------------------------
-# Shared base flags reused across all instrumented variants  (#2)
-# ---------------------------------------------------------------------------
-set(INSTRUMENT_BASE_FLAGS -fno-omit-frame-pointer -g)
-
-# ---------------------------------------------------------------------------
-# Helper: apply common compile options to a goc library variant
-# ---------------------------------------------------------------------------
-function(configure_goc_target target_name extra_flags)
-    target_include_directories(${target_name} PUBLIC
-        include
-        vendor/minicoro
+function(goc_configure_target target_name)
+    target_include_directories(${target_name}
+        PUBLIC  include
+        PRIVATE src
+                vendor/minicoro
     )
-    target_compile_definitions(${target_name} PUBLIC
-        # Required for Boehm GC multi-thread support: activates the GC's
-        # pthread wrapper (GC_pthread_create / GC_pthread_join) so that pool
-        # worker threads are automatically registered with the collector, and
-        # exposes GC_allow_register_threads / GC_add_roots / GC_remove_roots
-        # in gc.h.
-        GC_THREADS
-        # Required for POSIX extensions (pthread_rwlock_t et al.) when
-        # compiling with -std=c11, which disables _POSIX_SOURCE by default.
-        _GNU_SOURCE
-    )
-    target_link_libraries(${target_name} PUBLIC
-        PkgConfig::LIBUV
-        PkgConfig::BDWGC
-        Threads::Threads
-    )
-    target_compile_options(${target_name} PRIVATE
-        -Wall -Wextra
-        ${extra_flags}
+    target_compile_definitions(${target_name} PRIVATE GC_THREADS)
+    target_link_libraries(${target_name}
+        PUBLIC
+            PkgConfig::LIBUV
+            PkgConfig::BDWGC
     )
 endfunction()
 
-# ---------------------------------------------------------------------------
-# Helper: build one instrumented library + test suite variant  (#1)
-#   suffix      — target name suffix, e.g. "_asan"
-#   sanitizer   — -fsanitize=... flag, e.g. "-fsanitize=address"
-#   extra_flags — full compile flag list for this variant
-# ---------------------------------------------------------------------------
-function(add_instrumented_variant suffix sanitizer extra_flags)
-    set(lib_name "goc${suffix}")
-
-    add_library(${lib_name} STATIC ${GOC_SOURCES})
-    configure_goc_target(${lib_name} "${extra_flags}")
-    target_link_options(${lib_name} PUBLIC ${sanitizer})
-
-    foreach(src IN LISTS PHASE_TEST_SOURCES)
-        cmake_path(GET src STEM phase)
-        set(exe "${phase}${suffix}")
-        add_executable(${exe} ${src})
-        target_link_libraries(${exe} PRIVATE -Wl,--start-group ${lib_name} -Wl,--end-group)
-        target_compile_options(${exe} PRIVATE -Wall -Wextra ${extra_flags})
-        target_link_options(${exe} PRIVATE ${sanitizer})
-        add_goc_test(${exe})
-    endforeach()
-endfunction()
+# minicoro.c must NOT be compiled with -DGC_THREADS.
+# Set globally before any add_library so it applies to all targets that
+# include this source file. Does not require TARGET_DIRECTORY (CMake 3.26+).
+set_source_files_properties(src/minicoro.c PROPERTIES COMPILE_OPTIONS "-UGC_THREADS")
 
 # ---------------------------------------------------------------------------
-# minicoro isolation — must precede all add_library calls
-#
-# minicoro declares a static MCO_THREAD_LOCAL (thread_local) variable
-# `mco_current_co` to track the active coroutine per thread.  When Boehm GC
-# is compiled with GC_THREADS it wraps pthread_create so that every new thread
-# calls GC_call_with_stack_base during startup, which walks TLS descriptors.
-# If minicoro's TLS block is visible to that walk before mco_current_co has
-# been initialised on the new thread, the GC crashes with a SIGSEGV inside its
-# own startup code — even if no minicoro function has yet been called on that
-# thread.
-#
-# The fix is to compile src/minicoro.c without GC_THREADS so the GC header
-# does not activate its TLS-scanning hooks in that translation unit.  minicoro
-# never calls any GC function, so the flag is irrelevant to its correctness.
-#
-# set_source_files_properties has directory scope: it applies to every target
-# in this CMakeLists.txt that compiles src/minicoro.c (goc, goc_asan,
-# goc_tsan, goc_coverage, goc_shared), so we only need to set it once here.
-# ---------------------------------------------------------------------------
-set_source_files_properties(src/minicoro.c PROPERTIES
-    COMPILE_OPTIONS "-UGC_THREADS"
-)
-
-# ---------------------------------------------------------------------------
-# Default static library
+# Primary static library: goc
 # ---------------------------------------------------------------------------
 add_library(goc STATIC ${GOC_SOURCES})
-configure_goc_target(goc "")
+goc_configure_target(goc)
 
 # ---------------------------------------------------------------------------
-# Optional: shared library  (-DLIBGOC_SHARED=ON)
+# Optional shared library: goc_shared  (-DLIBGOC_SHARED=ON)
 # ---------------------------------------------------------------------------
-option(LIBGOC_SHARED "Build libgoc as a shared library as well" OFF)
-
 if(LIBGOC_SHARED)
     add_library(goc_shared SHARED ${GOC_SOURCES})
-    configure_goc_target(goc_shared "")
-    set_target_properties(goc_shared PROPERTIES
-        OUTPUT_NAME goc
-        VERSION     ${PROJECT_VERSION}
-        SOVERSION   ${PROJECT_VERSION_MAJOR}
-    )
+    goc_configure_target(goc_shared)
+    set_target_properties(goc_shared PROPERTIES OUTPUT_NAME goc)
 endif()
 
 # ---------------------------------------------------------------------------
-# Phase test executables (default build)  (#5)
-# Compile definitions and include paths propagate transitively from goc (PUBLIC).
+# Optional: AddressSanitizer  (-DLIBGOC_ASAN=ON)
+# ---------------------------------------------------------------------------
+if(LIBGOC_ASAN)
+    add_library(goc_asan STATIC ${GOC_SOURCES})
+    goc_configure_target(goc_asan)
+    target_compile_options(goc_asan PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+    target_link_options(goc_asan INTERFACE -fsanitize=address)
+endif()
+
+# ---------------------------------------------------------------------------
+# Optional: ThreadSanitizer  (-DLIBGOC_TSAN=ON)
+# ---------------------------------------------------------------------------
+if(LIBGOC_TSAN)
+    add_library(goc_tsan STATIC ${GOC_SOURCES})
+    goc_configure_target(goc_tsan)
+    target_compile_options(goc_tsan PRIVATE -fsanitize=thread)
+    target_link_options(goc_tsan INTERFACE -fsanitize=thread)
+endif()
+
+# ---------------------------------------------------------------------------
+# Optional: Coverage  (-DLIBGOC_COVERAGE=ON)
+# ---------------------------------------------------------------------------
+if(LIBGOC_COVERAGE)
+    target_compile_options(goc PRIVATE --coverage -fprofile-arcs -ftest-coverage)
+    target_link_options(goc INTERFACE --coverage)
+endif()
+
+# ---------------------------------------------------------------------------
+# Test executables
 # ---------------------------------------------------------------------------
 enable_testing()
 
-# ---------------------------------------------------------------------------
-# Crash handler via backtrace_symbols_fd()
-#
-# Each test binary installs a SIGSEGV/SIGABRT handler (see tests/test_harness.h)
-# that prints a backtrace to stderr using backtrace_symbols_fd().  This is
-# always captured by CTest --output-on-failure without any dependency on
-# kernel core_pattern or apport configuration.
-#
-# -rdynamic is required so that dladdr() can resolve symbol names in the
-# backtrace output.  Without it, frames show as raw addresses only.
-# ---------------------------------------------------------------------------
+# Discover test source files (requires cmake_path — CMake >= 3.20)
+file(GLOB TEST_SOURCES "tests/test_p*.c")
 
-function(add_goc_test exe_name)
-    target_link_options(${exe_name} PRIVATE -rdynamic)
-    add_test(NAME ${exe_name} COMMAND ${exe_name})
-    set_tests_properties(${exe_name} PROPERTIES RUN_SERIAL TRUE)
-endfunction()
+foreach(test_src IN LISTS TEST_SOURCES)
+    cmake_path(GET test_src STEM test_name)
 
-foreach(src IN LISTS PHASE_TEST_SOURCES)
-    cmake_path(GET src STEM phase)
-    add_executable(${phase} ${src})
-    target_link_libraries(${phase} PRIVATE -Wl,--start-group goc -Wl,--end-group)
-    target_compile_options(${phase} PRIVATE -Wall -Wextra)
-    add_goc_test(${phase})
+    # Choose which goc variant to link against
+    if(LIBGOC_ASAN)
+        set(GOC_LINK_TARGET goc_asan)
+    elseif(LIBGOC_TSAN)
+        set(GOC_LINK_TARGET goc_tsan)
+    else()
+        set(GOC_LINK_TARGET goc)
+    endif()
+
+    add_executable(${test_name} ${test_src})
+
+    target_include_directories(${test_name} PRIVATE include src tests vendor/minicoro)
+
+    # Wrap libgoc.a in a rescan group so ld resolves cross-archive references
+    # regardless of object-file ordering (Linux ld single-pass limitation).
+    # $<LINK_GROUP:RESCAN,...> (CMake >= 3.24) is intentionally avoided to
+    # preserve the stated minimum of CMake 3.20.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_options(${test_name} PRIVATE
+            "LINKER:--start-group"
+            "$<TARGET_FILE:${GOC_LINK_TARGET}>"
+            "LINKER:--end-group"
+        )
+    endif()
+    target_link_libraries(${test_name} PRIVATE
+        ${GOC_LINK_TARGET}
+        PkgConfig::LIBUV
+        PkgConfig::BDWGC
+    )
+
+    add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
 
 # ---------------------------------------------------------------------------
-# Optional instrumented variants  (-DLIBGOC_ASAN=ON / -DLIBGOC_TSAN=ON / -DLIBGOC_COVERAGE=ON)
-# ---------------------------------------------------------------------------
-option(LIBGOC_ASAN     "Build with AddressSanitizer" OFF)
-option(LIBGOC_TSAN     "Build with ThreadSanitizer"  OFF)
-option(LIBGOC_COVERAGE "Build with lcov coverage"    OFF)
-
-if(LIBGOC_ASAN AND LIBGOC_TSAN)
-    message(FATAL_ERROR "LIBGOC_ASAN and LIBGOC_TSAN are mutually exclusive.")
-endif()
-if(LIBGOC_ASAN AND LIBGOC_COVERAGE)
-    message(FATAL_ERROR "LIBGOC_ASAN and LIBGOC_COVERAGE should not be combined.")
-endif()
-if(LIBGOC_TSAN AND LIBGOC_COVERAGE)
-    message(FATAL_ERROR "LIBGOC_TSAN and LIBGOC_COVERAGE should not be combined.")
-endif()
-
-if(LIBGOC_ASAN)
-    add_instrumented_variant(
-        _asan
-        -fsanitize=address
-        "-fsanitize=address;${INSTRUMENT_BASE_FLAGS}"
-    )
-endif()
-
-if(LIBGOC_TSAN)
-    add_instrumented_variant(
-        _tsan
-        -fsanitize=thread
-        "-fsanitize=thread;${INSTRUMENT_BASE_FLAGS}"
-    )
-endif()
-
-# ---------------------------------------------------------------------------
-# Optional: Coverage  (-DLIBGOC_COVERAGE=ON)  (#3)
-# Builds a separate goc_coverage variant rather than mutating the base goc
-# target, consistent with the ASAN/TSAN pattern above.
+# Coverage target (requires lcov + genhtml)
 # ---------------------------------------------------------------------------
 if(LIBGOC_COVERAGE)
-    if(CMAKE_BUILD_TYPE STREQUAL "Release")
-        message(FATAL_ERROR "LIBGOC_COVERAGE is incompatible with Release build type.")
+    find_program(LCOV lcov)
+    find_program(GENHTML genhtml)
+    if(LCOV AND GENHTML)
+        add_custom_target(coverage
+            COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+            COMMAND ${LCOV}
+                --capture
+                --directory ${CMAKE_BINARY_DIR}
+                --output-file ${CMAKE_BINARY_DIR}/coverage.info
+                --exclude "*/tests/*"
+                --exclude "/usr/*"
+                --exclude "*/vendor/*"
+            COMMAND ${GENHTML}
+                ${CMAKE_BINARY_DIR}/coverage.info
+                --output-directory ${CMAKE_BINARY_DIR}/coverage_html
+            WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+            COMMENT "Running tests and generating HTML coverage report -> coverage_html/index.html"
+        )
+    else()
+        message(WARNING "lcov/genhtml not found — 'coverage' target will not be available.")
     endif()
-
-    find_program(LCOV    lcov    REQUIRED)
-    find_program(GENHTML genhtml REQUIRED)
-
-    set(COVERAGE_FLAGS --coverage -fprofile-arcs -ftest-coverage -g -O0)
-
-    add_instrumented_variant(_coverage --coverage "${COVERAGE_FLAGS}")
-
-    # Collect the test targets that must run before the report is generated
-    set(COVERAGE_TEST_TARGETS "")
-    foreach(src IN LISTS PHASE_TEST_SOURCES)
-        cmake_path(GET src STEM phase)
-        list(APPEND COVERAGE_TEST_TARGETS "${phase}_coverage")
-    endforeach()
-
-    # Two lcov passes collapsed into one via --rc + chained COMMANDs  (#3)
-    add_custom_target(coverage
-        COMMAND ${LCOV}
-            --capture
-            --directory .
-            --output-file coverage.info
-        COMMAND ${LCOV}
-            --remove coverage.info '/usr/*' '*/vendor/*'
-            --output-file coverage.info
-        COMMAND ${GENHTML} coverage.info --output-directory coverage_html
-        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-        DEPENDS ${COVERAGE_TEST_TARGETS}
-        COMMENT "Generating HTML coverage report in coverage_html/"
-    )
 endif()
 
 # ---------------------------------------------------------------------------
-# Install rules
+# Install rules (used with -DLIBGOC_SHARED=ON)
 # ---------------------------------------------------------------------------
 include(GNUInstallDirs)
 
-# Static library and public header
 install(TARGETS goc
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 install(FILES include/goc.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
-
-# Shared library (only when LIBGOC_SHARED=ON)
 if(LIBGOC_SHARED)
     install(TARGETS goc_shared
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}   # .dll on Windows
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
 endif()
 
-# pkg-config file: expand @-variables and write into the build tree, then install
-configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/libgoc.pc.in
-    ${CMAKE_CURRENT_BINARY_DIR}/libgoc.pc
-    @ONLY
-)
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libgoc.pc
+# pkg-config file
+configure_file(libgoc.pc.in ${CMAKE_BINARY_DIR}/libgoc.pc @ONLY)
+install(FILES ${CMAKE_BINARY_DIR}/libgoc.pc
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
 )
