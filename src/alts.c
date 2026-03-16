@@ -218,7 +218,7 @@ goc_alts_result goc_alts(goc_alt_op *ops, size_t n) {
         e->next            = NULL;
         e->pool            = pool;
         e->coro            = running;
-        e->stack_canary_ptr = NULL; /* not a launch entry; no canary needed */
+        e->stack_canary_ptr = (uint32_t *)running->stack_base;
         e->ok              = GOC_CLOSED; /* safe default; overwritten on wake */
         e->arm_idx         = i;
 
