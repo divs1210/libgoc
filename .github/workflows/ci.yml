@@ -78,7 +78,7 @@ jobs:
           set -x
           cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
           cmake --build build --parallel $(nproc)
-        timeout-minutes: 10
+        timeout-minutes: 2
         env:
           PKG_CONFIG_PATH: ${{ env.BDWGC_PREFIX }}/lib/pkgconfig
 
