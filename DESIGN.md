@@ -381,6 +381,10 @@ entry->coro = coro;
 entry->stack_canary_ptr = (uint32_t*)coro->stack_base;
 *entry->stack_canary_ptr = GOC_STACK_CANARY;
 
+/* Increment live_count exactly once for this new fiber before queuing it.
+   pool_fiber_born must precede post_to_run_queue so that live_count is
+   non-zero before the worker could potentially see MCO_DEAD and decrement. */
+pool_fiber_born(pool);
 post_to_run_queue(pool, entry);
 return join_ch;
 ```
@@ -604,12 +608,17 @@ typedef struct goc_pool {
                                        by post_to_run_queue, decremented unconditionally
                                        after every mco_resume (yield or exit).  Used for
                                        internal scheduling accounting only. */
-    size_t          live_count;     /* fibers still alive on this pool; incremented by
-                                       post_to_run_queue, decremented only when
-                                       mco_status == MCO_DEAD.  This is the correct drain
-                                       signal: a parked fiber (MCO_SUSPENDED) still has
+    size_t          live_count;     /* fibers still alive on this pool; incremented exactly
+                                       once per fiber at birth by pool_fiber_born() (called
+                                       from goc_go_on before post_to_run_queue), decremented
+                                       only when mco_status == MCO_DEAD.  This is the correct
+                                       drain signal: a parked fiber (MCO_SUSPENDED) still has
                                        live_count > 0 even though active_count has already
-                                       been decremented to 0. */
+                                       been decremented to 0.
+                                       NOTE: post_to_run_queue does NOT increment live_count.
+                                       Re-queuing a parked fiber via wake() must not inflate
+                                       it, or the count would grow unboundedly with channel
+                                       operations and goc_pool_destroy would never unblock. */
 } goc_pool;
 ```
 
@@ -639,10 +648,10 @@ while not shutdown:
         lock(drain_mutex); live_count--; broadcast(drain_cond); unlock(drain_mutex)
     /* if MCO_SUSPENDED: the fiber yielded and is parked on a channel.
        active_count has been decremented but live_count has NOT — the fiber is
-       still alive.  wake() → post_to_run_queue() will re-increment both counts
-       when the fiber is rescheduled.  drain_cond is not broadcast here:
-       live_count > 0 still holds, so goc_pool_destroy / goc_pool_destroy_timeout
-       will not see a spurious drain-complete. */
+       still alive.  wake() → post_to_run_queue() will re-increment active_count
+       only (not live_count) when the fiber is rescheduled.  drain_cond is not
+       broadcast here: live_count > 0 still holds, so goc_pool_destroy /
+       goc_pool_destroy_timeout will not see a spurious drain-complete. */
 ```
 
 > **Why `coro` is snapshotted before `mco_resume`.** When a fiber suspends inside `goc_take`, it stack-allocates a `goc_entry` (the parking entry) on its own coroutine stack and parks. The pool worker's `entry` pointer therefore points into the fiber's stack for the duration of that park. If the fiber is immediately re-scheduled on the same resume call (i.e. it runs to completion without yielding again), minicoro recycles the stack — and the memory `entry` pointed at is gone by the time `mco_resume` returns. Reading `entry->coro` after the resume is therefore a use-after-free and a potential segfault. The `mco_coro` object itself is minicoro heap-allocated and remains valid until `mco_destroy`, so snapshotting `coro = entry->coro` *before* the resume is always safe and eliminates the hazard entirely.
@@ -653,7 +662,8 @@ while not shutdown:
 
 The invariant is:
 
-- `post_to_run_queue` increments **both** `active_count` and `live_count` before pushing to the run queue.
+- `pool_fiber_born` increments `live_count` exactly once per fiber, immediately before `post_to_run_queue` in `goc_go_on`.
+- `post_to_run_queue` increments **only** `active_count` before pushing to the run queue. It does **not** touch `live_count` — re-queuing a parked fiber must not inflate it.
 - After `mco_resume` returns, the worker always decrements `active_count` — whether the fiber yielded (`MCO_SUSPENDED`) or exited (`MCO_DEAD`).
 - `live_count` is decremented **only** when `mco_status(coro) == MCO_DEAD`. `drain_cond` is broadcast at the same time.
 - `goc_pool_destroy` and `goc_pool_destroy_timeout` wait on `live_count == 0`. This correctly waits for all fibers to exit, not merely to yield.
@@ -980,7 +990,8 @@ uv_loop_t*    goc_scheduler(void);
 | Function | Signature | Defined in |
 |---|---|---|
 | `cb_queue_init` | `void cb_queue_init(void)` | `loop.c` |
-| `post_to_run_queue` | `void post_to_run_queue(goc_pool* pool, goc_entry* entry)` | `pool.c` |
+| `post_to_run_queue` | `void post_to_run_queue(goc_pool* pool, goc_entry* entry)` | `pool.c` — increments `active_count` only; does **not** touch `live_count` |
+| `pool_fiber_born` | `void pool_fiber_born(goc_pool* pool)` | `pool.c` — increments `live_count` exactly once per new fiber; called from `goc_go_on` before `post_to_run_queue` |
 | `post_callback` | `void post_callback(goc_entry* entry, void* value)` | `loop.c` |
 | `on_wakeup` | `void on_wakeup(uv_async_t* handle)` | `loop.c` |
 | `wake` | `void wake(goc_chan* ch, goc_entry* entry, void* value)` | `channel.c` |
