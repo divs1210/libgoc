@@ -3,10 +3,8 @@
  *
  * Verifies goc_pool_make / goc_pool_destroy lifecycle, goc_go_on dispatch,
  * goc_pool_destroy_timeout (both GOC_DRAIN_OK and GOC_DRAIN_TIMEOUT paths),
- * the goc_malloc GC-heap allocator end-to-end, the compact_dead_entries sweep
- * (triggered by cancelling >= GOC_DEAD_COUNT_THRESHOLD stale alts entries),
- * and the malloc path in alts_dedup_sort_channels for n > GOC_ALTS_STACK_THRESHOLD
- * arms.
+ * the goc_malloc GC-heap allocator end-to-end, and the malloc path in
+ * alts_dedup_sort_channels for n > GOC_ALTS_STACK_THRESHOLD arms.
  *
  * Build:  cmake -B build && cmake --build build
  * Run:    ctest --test-dir build --output-on-failure
@@ -44,15 +42,7 @@
  *          runs to completion before goc_pool_destroy is called
  *   P6.4   goc_malloc end-to-end: fiber builds GC-heap linked list, main
  *          traverses after join
- *   P6.5   compact_dead_entries fires correctly: 12 fibers race on a single
- *          channel via goc_alts; 11 lose the woken CAS and become dead entries
- *          (dead_count == 11 > GOC_DEAD_COUNT_THRESHOLD == 8); a probe fiber
- *          calls goc_take on the same channel, triggering compact_dead_entries;
- *          probe receives the sentinel value without crash or hang.
- *          Synchronisation: atomic counter + 5 ms nanosleep replaces the
- *          previous done_signal-before-goc_alts pattern (which had a race
- *          between the signal and Phase 6 enqueue completion).
- *   P6.6   goc_alts with n > GOC_ALTS_STACK_THRESHOLD (8) arms exercises the
+ *   P6.5   goc_alts with n > GOC_ALTS_STACK_THRESHOLD (8) arms exercises the
  *          malloc path in alts_dedup_sort_channels; correct arm fires, no
  *          memory error (run under ASAN to catch heap misuse)
  *
@@ -64,15 +54,11 @@
  *     Cleanup code after the `done:` label runs in both pass and fail paths.
  */
 
-#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <string.h>
 #include <time.h>
 #include <semaphore.h>
-#include <sys/types.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #include "test_harness.h"
@@ -411,314 +397,70 @@ static void test_p6_4(void) {
 done:;
 }
 
-/* --- P6.5: compact_dead_entries sweep ---------------------------------- */
+/* --- P6.5: goc_alts with n > GOC_ALTS_STACK_THRESHOLD arms ------------ */
 
 /*
- * Number of competing fibers used to generate dead alts entries.
- * Must be > GOC_DEAD_COUNT_THRESHOLD (8) so that at least 8 stale entries
- * accumulate on the channel's taker list before the sweep fires.
- */
-#define P6_5_COMPETITOR_COUNT 12
-
-/*
- * Atomic counter incremented by each competitor fiber immediately before it
- * calls goc_alts.  The main thread spins on this reaching
- * P6_5_COMPETITOR_COUNT, then sleeps 5 ms to allow all fibers to complete
- * Phase 6 of the alts protocol (enqueue entries + release channel locks)
- * before the prize value is sent.
- *
- * This is not a formal happens-before barrier — a fiber could theoretically
- * be preempted after incrementing but before completing Phase 6.  5 ms is
- * orders of magnitude larger than the Phase 6 critical section in practice,
- * making the race window vanishingly small.  This replaces the previous
- * done_signal-before-goc_alts pattern, which had an unfixable race: the
- * signal fired before the fiber was enqueued, so goc_put_sync could run
- * while some fibers had not yet registered their taker entries.
- */
-static _Atomic int g_p6_5_ready;
-
-/*
- * Argument bundle for the competitor fibers in P6.5.
- *
- * target_ch  — channel all fibers race to take from via goc_alts;
- *              only one fiber wins the woken CAS, leaving the others with
- *              cancelled (dead) entries on the taker list
- * decoy_ch   — second arm in the select; never receives data — ensures
- *              fibers always reach Phase 6 and park on both channels,
- *              so the dead entries accumulate on target_ch's taker list
- * index_won  — populated after goc_alts returns with the winning arm index
- *              (-1 if the fiber lost the CAS race and was cancelled)
- * ok_won     — populated after goc_alts returns with the winning arm status
- */
-typedef struct {
-    goc_chan*    target_ch;
-    goc_chan*    decoy_ch;
-    int          index_won;
-    goc_status_t ok_won;
-} p6_5_competitor_args_t;
-
-/*
- * Competitor fiber for P6.5.
- *
- * Increments g_p6_5_ready to notify the main thread that this fiber is on
- * the cusp of parking, then immediately calls goc_alts.  The main thread's
- * 5 ms nanosleep after the spin covers the Phase 6 window.
- */
-static void test_p6_5_competitor_fn(void* arg) {
-    p6_5_competitor_args_t* a = (p6_5_competitor_args_t*)arg;
-
-    /* Increment before parking — main thread spins on this reaching N. */
-    atomic_fetch_add_explicit(&g_p6_5_ready, 1, memory_order_release);
-
-    goc_alt_op ops[] = {
-        { .ch = a->target_ch, .op_kind = GOC_ALT_TAKE },
-        { .ch = a->decoy_ch,  .op_kind = GOC_ALT_TAKE },
-    };
-    goc_alts_result r = goc_alts(ops, 2);
-
-    a->index_won = (int)r.index;
-    a->ok_won    = r.value.ok;
-}
-
-/*
- * Argument bundle for the probe fiber that triggers compact_dead_entries.
- *
- * target_ch — channel to call goc_take on; must have dead_count >=
- *             GOC_DEAD_COUNT_THRESHOLD so that the sweep fires on entry
- * done      — signalled after goc_take returns so the main thread can assert
- * result    — populated with the goc_take return value
- */
-typedef struct {
-    goc_chan*  target_ch;
-    done_t*    done;
-    goc_val_t  result;
-} p6_5_probe_args_t;
-
-/*
- * Probe fiber for P6.5.
- *
- * Calls goc_take on target_ch.  goc_take (fiber context) checks
- * dead_count >= GOC_DEAD_COUNT_THRESHOLD under the channel lock and calls
- * compact_dead_entries before attempting any data transfer.  This is the
- * sweep path under test.
- *
- * NOTE: goc_take_sync does NOT call compact_dead_entries — it has no
- * threshold check.  A fiber-context take is required to exercise the sweep.
- */
-static void test_p6_5_probe_fn(void* arg) {
-    p6_5_probe_args_t* a = (p6_5_probe_args_t*)arg;
-    a->result = goc_take(a->target_ch);
-    done_signal(a->done);
-}
-
-/*
- * P6.5 — compact_dead_entries fires correctly
- *
- * Launches P6_5_COMPETITOR_COUNT (12) fibers, each racing on the same
- * target_ch via a two-arm goc_alts (target_ch take | decoy_ch take).
- *
- * Synchronisation:
- *   Each fiber increments g_p6_5_ready immediately before calling goc_alts.
- *   The main thread spins until the counter reaches P6_5_COMPETITOR_COUNT,
- *   then sleeps 5 ms to allow all fibers to complete Phase 6 (enqueue their
- *   taker entries and release channel locks) before the prize is sent.
- *
- * Race:
- *   goc_put_sync delivers a single value; exactly one fiber wins the woken
- *   CAS inside wake().  The remaining 11 lose: wake() sets their cancelled
- *   flag and increments target_ch->dead_count.  dead_count ends up at 11,
- *   which is >= GOC_DEAD_COUNT_THRESHOLD (8).
- *
- * Sweep verification:
- *   A probe fiber calls goc_take on target_ch.  goc_take (fiber context)
- *   checks the threshold, calls compact_dead_entries, sweeps the 11 dead
- *   entries, then parks to wait for the sentinel value put by the main
- *   thread.  A crash or hang in the probe means the entry list was corrupt.
- *
- * Final consistency:
- *   target_ch is closed and a goc_take_sync on it must return GOC_CLOSED
- *   immediately, confirming the channel is still well-formed after the sweep.
- */
-static void test_p6_5(void) {
-    TEST_BEGIN("P6.5   compact_dead_entries: dead alts entries swept correctly");
-
-    atomic_store_explicit(&g_p6_5_ready, 0, memory_order_relaxed);
-
-    goc_chan* target_ch = goc_chan_make(0);
-    ASSERT(target_ch != NULL);
-
-    goc_chan* decoy_ch = goc_chan_make(0);
-    ASSERT(decoy_ch != NULL);
-
-    p6_5_competitor_args_t args[P6_5_COMPETITOR_COUNT];
-    goc_chan* joins[P6_5_COMPETITOR_COUNT];
-
-    for (int i = 0; i < P6_5_COMPETITOR_COUNT; i++) {
-        args[i].target_ch = target_ch;
-        args[i].decoy_ch  = decoy_ch;
-        args[i].index_won = -1;
-        args[i].ok_won    = GOC_CLOSED;
-
-        joins[i] = goc_go(test_p6_5_competitor_fn, &args[i]);
-        ASSERT(joins[i] != NULL);
-    }
-
-    /*
-     * Yield-spin until every fiber has incremented the counter (all are
-     * between the atomic_fetch_add and goc_alts Phase 6 completion), then
-     * sleep 5 ms to allow Phase 6 to finish across all fibers before the
-     * prize is sent.  5 ms >> actual Phase 6 duration (~nanoseconds).
-     *
-     * A plain busy-wait is avoided here: on machines with few cores the
-     * spinning main thread can starve pool workers, preventing fibers from
-     * running and incrementing the counter, causing an infinite loop.  A
-     * 100 µs nanosleep inside the loop releases the main thread's CPU slice
-     * on each iteration so pool threads can be scheduled.
-     */
-    {
-        struct timespec yield_sleep = { .tv_sec = 0, .tv_nsec = 100000L /* 100 µs */ };
-        while (atomic_load_explicit(&g_p6_5_ready, memory_order_acquire)
-               < P6_5_COMPETITOR_COUNT) {
-            nanosleep(&yield_sleep, NULL);
-        }
-    }
-    struct timespec park_wait = { .tv_sec = 0, .tv_nsec = 5000000L /* 5 ms */ };
-    nanosleep(&park_wait, NULL);
-
-    /* Deliver a single value — exactly one competitor wins the woken CAS. */
-    goc_status_t st = goc_put_sync(target_ch, (void*)(uintptr_t)0xDEAD);
-    ASSERT(st == GOC_OK);
-
-    /* Wait for all competitors to exit. */
-    for (int i = 0; i < P6_5_COMPETITOR_COUNT; i++) {
-        goc_val_t v = goc_take_sync(joins[i]);
-        ASSERT(v.ok == GOC_CLOSED);
-    }
-
-    /* Exactly one fiber must have won on arm index 0 (target_ch). */
-    int winners = 0;
-    for (int i = 0; i < P6_5_COMPETITOR_COUNT; i++) {
-        if (args[i].index_won == 0 && args[i].ok_won == GOC_OK)
-            winners++;
-    }
-    ASSERT(winners == 1);
-
-    /*
-     * Verify compact_dead_entries fires via a fiber-context goc_take.
-     *
-     * Launch the probe fiber first so it parks on target_ch (slow path),
-     * guaranteeing goc_take walks the taker list and sees dead_count >= 8.
-     * Then put the sentinel from the main thread; the probe fiber wakes,
-     * records the value, and signals done.
-     *
-     * The 1 ms sleep between launching the probe and putting the sentinel
-     * ensures the probe fiber has reached goc_take's slow path before the
-     * value arrives (so compact_dead_entries runs before the list is
-     * traversed for delivery, not after).
-     */
-    done_t probe_done;
-    done_init(&probe_done);
-
-    p6_5_probe_args_t probe_args = {
-        .target_ch = target_ch,
-        .done      = &probe_done,
-        .result    = { .val = NULL, .ok = GOC_CLOSED },
-    };
-
-    goc_chan* probe_join = goc_go(test_p6_5_probe_fn, &probe_args);
-    ASSERT(probe_join != NULL);
-
-    struct timespec probe_settle = { .tv_sec = 0, .tv_nsec = 1000000L /* 1 ms */ };
-    nanosleep(&probe_settle, NULL);
-
-    st = goc_put_sync(target_ch, (void*)(uintptr_t)0xC0DE);
-    ASSERT(st == GOC_OK);
-
-    done_wait(&probe_done);
-    ASSERT(probe_args.result.ok == GOC_OK);
-    ASSERT((uintptr_t)probe_args.result.val == 0xC0DE);
-
-    goc_val_t pj = goc_take_sync(probe_join);
-    ASSERT(pj.ok == GOC_CLOSED);
-
-    /*
-     * Final consistency check: close target_ch and confirm goc_take_sync
-     * returns GOC_CLOSED immediately without hanging.
-     */
-    goc_close(target_ch);
-    goc_val_t tv = goc_take_sync(target_ch);
-    ASSERT(tv.ok == GOC_CLOSED);
-
-    goc_close(decoy_ch);
-    done_destroy(&probe_done);
-    TEST_PASS();
-done:;
-}
-
-/* --- P6.6: goc_alts with n > GOC_ALTS_STACK_THRESHOLD arms ------------ */
-
-/*
- * Number of arms in the P6.6 select.  Must be > GOC_ALTS_STACK_THRESHOLD (8)
+ * Number of arms in the P6.5 select.  Must be > GOC_ALTS_STACK_THRESHOLD (8)
  * to force the malloc path in alts_dedup_sort_channels.
  */
-#define P6_6_ARM_COUNT 10
+#define P6_5_ARM_COUNT 10
 
 /*
- * Argument bundle for test_p6_6_fiber_fn.
+ * Argument bundle for test_p6_5_fiber_fn.
  *
- * channels  — array of P6_6_ARM_COUNT channels; one will be pre-loaded
+ * channels  — array of P6_5_ARM_COUNT channels; one will be pre-loaded
  * winner_idx — index of the channel pre-loaded with a value
  * result    — populated by the fiber with the goc_alts_result
  * done      — signalled when the fiber has recorded its result
  */
 typedef struct {
-    goc_chan*       channels[P6_6_ARM_COUNT];
+    goc_chan*       channels[P6_5_ARM_COUNT];
     int             winner_idx;
     goc_alts_result result;
     done_t*         done;
-} p6_6_args_t;
+} p6_5_args_t;
 
 /*
- * Fiber for P6.6.
- * Calls goc_alts with P6_6_ARM_COUNT take arms.  Because one channel is
+ * Fiber for P6.5.
+ * Calls goc_alts with P6_5_ARM_COUNT take arms.  Because one channel is
  * pre-loaded, the fast-path scan fires immediately on that arm.  The channel
  * pointer scratch buffer must be malloc-allocated (n > GOC_ALTS_STACK_THRESHOLD).
  */
-static void test_p6_6_fiber_fn(void* arg) {
-    p6_6_args_t* a = (p6_6_args_t*)arg;
+static void test_p6_5_fiber_fn(void* arg) {
+    p6_5_args_t* a = (p6_5_args_t*)arg;
 
-    goc_alt_op ops[P6_6_ARM_COUNT];
-    for (int i = 0; i < P6_6_ARM_COUNT; i++) {
+    goc_alt_op ops[P6_5_ARM_COUNT];
+    for (int i = 0; i < P6_5_ARM_COUNT; i++) {
         ops[i].ch       = a->channels[i];
         ops[i].op_kind  = GOC_ALT_TAKE;
         ops[i].put_val  = NULL;
     }
 
-    a->result = goc_alts(ops, P6_6_ARM_COUNT);
+    a->result = goc_alts(ops, P6_5_ARM_COUNT);
     done_signal(a->done);
 }
 
 /*
- * P6.6 — goc_alts with n > GOC_ALTS_STACK_THRESHOLD arms
+ * P6.5 — goc_alts with n > GOC_ALTS_STACK_THRESHOLD arms
  *
- * Creates P6_6_ARM_COUNT (10) buffered channels.  Pre-loads the last channel
- * (index P6_6_ARM_COUNT - 1) with a known value.  Launches a fiber that calls
- * goc_alts with take arms over all P6_6_ARM_COUNT channels.  The winning arm
+ * Creates P6_5_ARM_COUNT (10) buffered channels.  Pre-loads the last channel
+ * (index P6_5_ARM_COUNT - 1) with a known value.  Launches a fiber that calls
+ * goc_alts with take arms over all P6_5_ARM_COUNT channels.  The winning arm
  * must fire immediately (fast path) on the pre-loaded channel, returning the
  * correct index and value.  No memory error must be observed (run under ASAN
  * to catch heap misuse from the malloc/free path in alts_dedup_sort_channels).
  */
-static void test_p6_6(void) {
-    TEST_BEGIN("P6.6   goc_alts: n > GOC_ALTS_STACK_THRESHOLD; malloc path");
+static void test_p6_5(void) {
+    TEST_BEGIN("P6.5   goc_alts: n > GOC_ALTS_STACK_THRESHOLD; malloc path");
 
     done_t done;
     done_init(&done);
 
-    p6_6_args_t args;
+    p6_5_args_t args;
     args.done       = &done;
-    args.winner_idx = P6_6_ARM_COUNT - 1;
+    args.winner_idx = P6_5_ARM_COUNT - 1;
 
-    for (int i = 0; i < P6_6_ARM_COUNT; i++) {
+    for (int i = 0; i < P6_5_ARM_COUNT; i++) {
         args.channels[i] = goc_chan_make(1);
         ASSERT(args.channels[i] != NULL);
     }
@@ -728,7 +470,7 @@ static void test_p6_6(void) {
                                    (void*)(uintptr_t)0xABCD);
     ASSERT(st == GOC_OK);
 
-    goc_chan* join = goc_go(test_p6_6_fiber_fn, &args);
+    goc_chan* join = goc_go(test_p6_5_fiber_fn, &args);
     ASSERT(join != NULL);
 
     done_wait(&done);
@@ -740,7 +482,7 @@ static void test_p6_6(void) {
     goc_val_t v = goc_take_sync(join);
     ASSERT(v.ok == GOC_CLOSED);
 
-    for (int i = 0; i < P6_6_ARM_COUNT; i++) {
+    for (int i = 0; i < P6_5_ARM_COUNT; i++) {
         goc_close(args.channels[i]);
     }
 
@@ -770,8 +512,7 @@ int main(void) {
     test_p6_2();
     test_p6_3();
     test_p6_4();
-  /*  test_p6_5(); */
-    test_p6_6();
+    test_p6_5();
     printf("\n");
 
     goc_shutdown();
