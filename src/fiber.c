@@ -77,7 +77,11 @@ goc_chan* goc_go_on(goc_pool* pool, void (*fn)(void*), void* arg) {
     /* 7. Write the canary value so pool_worker_fn can detect stack overflow. */
     *entry->stack_canary_ptr = GOC_STACK_CANARY;
 
-    /* 8. Hand the entry to the pool run queue. */
+    /* 8. Record this fiber's birth in live_count (exactly once per fiber),
+     *    then hand the entry to the pool run queue.
+     *    pool_fiber_born must come before post_to_run_queue so that live_count
+     *    is non-zero before the worker could potentially decrement it. */
+    pool_fiber_born(pool);
     post_to_run_queue(pool, entry);
 
     /* 9. Return the join channel to the caller. */
