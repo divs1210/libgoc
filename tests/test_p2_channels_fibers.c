@@ -60,12 +60,9 @@
  *     use goc_go() for fiber launch.
  */
 
-#define _GNU_SOURCE
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <semaphore.h>
 #include <sys/types.h>
@@ -73,58 +70,8 @@
 #include <unistd.h>
 #include <pthread.h>
 
+#include "test_harness.h"
 #include "goc.h"
-
-/* =========================================================================
- * Minimal test harness
- *
- * Identical to Phase 1.  Three module-level counters track results.
- *
- *   TEST_BEGIN(name)  — registers the test and prints its name.
- *   ASSERT(cond)      — on failure, prints a diagnostic, increments
- *                        g_tests_failed, and jumps to `done:`.
- *   TEST_PASS()       — increments g_tests_passed and jumps to `done:`.
- *   TEST_FAIL(msg)    — prints msg, increments g_tests_failed, jumps to
- *                        `done:`.
- *
- * Every test function must end with a `done:;` label.
- * ====================================================================== */
-
-static int g_tests_run    = 0;
-static int g_tests_passed = 0;
-static int g_tests_failed = 0;
-
-#define TEST_BEGIN(name)                                    \
-    do {                                                    \
-        g_tests_run++;                                      \
-        printf("  %-50s ", (name));                         \
-        fflush(stdout);                                     \
-    } while (0)
-
-#define ASSERT(cond)                                        \
-    do {                                                    \
-        if (!(cond)) {                                      \
-            printf("FAIL\n    Assertion failed: %s\n"       \
-                   "    %s:%d\n", #cond, __FILE__, __LINE__);\
-            g_tests_failed++;                               \
-            goto done;                                      \
-        }                                                   \
-    } while (0)
-
-#define TEST_PASS()                                         \
-    do {                                                    \
-        printf("pass\n");                                   \
-        g_tests_passed++;                                   \
-        goto done;                                          \
-    } while (0)
-
-#define TEST_FAIL(msg)                                      \
-    do {                                                    \
-        printf("FAIL\n    %s\n    %s:%d\n",                 \
-               (msg), __FILE__, __LINE__);                  \
-        g_tests_failed++;                                   \
-        goto done;                                          \
-    } while (0)
 
 /* =========================================================================
  * done_t — lightweight fiber-to-main synchronisation via POSIX semaphore
@@ -565,6 +512,8 @@ done:;
  * ====================================================================== */
 
 int main(void) {
+    install_crash_handler();
+
     printf("libgoc test suite — Phase 2: Channels and fiber launch\n");
     printf("========================================================\n\n");
 
