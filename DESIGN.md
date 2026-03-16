@@ -65,6 +65,7 @@ libgoc/
 │   ├── chan_type.h         # Authoritative struct goc_chan definition (included by channel.c and alts.c)
 │   └── config.h           # Build configuration (PAGE_SIZE, stack defaults, etc.)
 ├── tests/
+│   ├── test_harness.h              # Shared harness macros + SIGSEGV/SIGABRT crash handler
 │   ├── test_p1_foundation.c        # Phase 1 — Foundation
 │   ├── test_p2_channels_fibers.c   # Phase 2 — Channels and fiber launch
 │   ├── test_p3_channel_io.c        # Phase 3 — Channel I/O
@@ -1047,11 +1048,12 @@ Once both close callbacks have fired, the loop has no remaining active handles a
 
 ## Testing
 
-The test suite lives in `tests/test_libgoc.c` and is a single self-contained C file (~1200 lines) with no external test framework dependency.
+The test suite is split across phase files in `tests/`, each a self-contained C file with no external test framework dependency.
 
 ### Design
 
-- **Harness**: minimal `TEST_BEGIN` / `ASSERT` / `TEST_PASS` / `TEST_FAIL` macros with `goto done` cleanup — no `setjmp`.
+- **Harness**: `tests/test_harness.h` provides shared `TEST_BEGIN` / `ASSERT` / `TEST_PASS` / `TEST_FAIL` macros with `goto done` cleanup — no `setjmp`. All phase test files include this header instead of duplicating the macros.
+- **Crash handler**: `test_harness.h` also provides `install_crash_handler()`, which registers a `SIGSEGV` and `SIGABRT` signal handler. The handler calls `backtrace_symbols_fd()` to print a full backtrace to `stderr`, then re-raises the signal with the default disposition restored so the process exits with the correct signal status. `install_crash_handler()` is called as the first statement of `main()` in each phase binary, before `goc_init()`. This approach is used in preference to core dumps because GitHub Actions runners do not reliably write core files to disk (apport and systemd-coredump intercept them at the kernel level), whereas `stderr` output is always captured by CTest `--output-on-failure`. Test executables are linked with `-rdynamic` so that `backtrace_symbols_fd()` can resolve function names; without it, frames appear as raw addresses only.
 - **Isolation**: `goc_init()` and `goc_shutdown()` bracket the entire test binary — called once each in the `main()` of **each phase's test binary** before and after all tests in that phase run. Individual test functions do not call them.
 - **Synchronisation**: a `done_t` helper (a plain POSIX `sem_t` — `done_signal` calls `sem_post`, `done_wait` calls `sem_wait`) lets the main thread block until fibers finish without relying on `sleep` or a `goc_chan`.
 - **GC integration**: Boehm GC is linked automatically; no hook table setup is required in tests.
