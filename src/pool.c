@@ -187,7 +187,16 @@ static void* pool_worker_fn(void* arg) {
             abort();
         }
 
-        mco_resume(entry->coro);
+        /* Save the coroutine handle before resuming.  If this is a parking
+         * entry (stack-allocated inside goc_take on the fiber's own stack),
+         * the fiber may run to completion during mco_resume — clobbering the
+         * memory where `entry` lives before control returns here.  The
+         * mco_coro object itself is minicoro heap-allocated and remains valid
+         * until mco_destroy, so `coro` is safe to dereference after the
+         * resume regardless of what happened to `entry`. */
+        mco_coro* coro = entry->coro;
+
+        mco_resume(coro);
 
         GC_remove_roots(&entry, &entry + 1);
 
@@ -197,8 +206,8 @@ static void* pool_worker_fn(void* arg) {
         pthread_mutex_unlock(&pool->drain_mutex);
 
         /* Check for fiber completion *after* the decrement has landed. */
-        if (mco_status(entry->coro) == MCO_DEAD) {
-            mco_destroy(entry->coro);
+        if (mco_status(coro) == MCO_DEAD) {
+            mco_destroy(coro);
 
             pthread_mutex_lock(&pool->drain_mutex);
             pthread_cond_broadcast(&pool->drain_cond);
