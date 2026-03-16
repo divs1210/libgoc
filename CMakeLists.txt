@@ -109,8 +109,7 @@ function(add_instrumented_variant suffix sanitizer extra_flags)
         target_link_libraries(${exe} PRIVATE ${lib_name})
         target_compile_options(${exe} PRIVATE -Wall -Wextra ${extra_flags})
         target_link_options(${exe} PRIVATE ${sanitizer})
-        add_test(NAME ${exe} COMMAND ${exe})
-        set_tests_properties(${exe} PROPERTIES RUN_SERIAL TRUE)
+        add_goc_test(${exe})
     endforeach()
 endfunction()
 
@@ -141,13 +140,84 @@ endif()
 # ---------------------------------------------------------------------------
 enable_testing()
 
+# ---------------------------------------------------------------------------
+# Core-dump wrapper
+#
+# Each test is run via a small shell script that:
+#   1. Enables core dumps for the child process (ulimit -c unlimited).
+#   2. Sets a per-test core pattern so cores land in <build>/cores/<test>.core
+#      rather than the cwd (requires the kernel core_pattern to honour the
+#      override, which it does when the pattern is a plain path).
+#   3. On a non-zero exit runs gdb --batch to print a full backtrace from the
+#      core file, then exits with the original failure code so CTest still
+#      marks the test as failed.
+#
+# The script is generated into <build>/run_with_coredump/<test>.sh at
+# configure time.  The COREDIR variable used inside the script resolves to an
+# absolute path so it works regardless of CTest's working directory.
+# ---------------------------------------------------------------------------
+
+find_program(GDB_EXECUTABLE gdb)
+
+set(CORE_DIR "${CMAKE_BINARY_DIR}/cores")
+file(MAKE_DIRECTORY "${CORE_DIR}")
+
+function(add_goc_test exe_name)
+    set(wrapper "${CMAKE_BINARY_DIR}/run_with_coredump/${exe_name}.sh")
+    set(exe_path "$<TARGET_FILE:${exe_name}>")
+    set(core_path "${CORE_DIR}/${exe_name}.core")
+
+    if(GDB_EXECUTABLE)
+        file(GENERATE OUTPUT "${wrapper}" CONTENT
+"#!/usr/bin/env sh
+set -e
+COREFILE=\"${core_path}\"
+# Remove stale core from a previous run.
+rm -f \"$COREFILE\"
+# Request a core dump and tell the kernel where to write it.
+ulimit -c unlimited
+# Some Linux kernels require an absolute path in /proc/sys/kernel/core_pattern;
+# when running in a container that file may be read-only.  We set it
+# opportunistically and ignore failures — the ulimit is sufficient on most CIs.
+echo \"$COREFILE\" | sudo tee /proc/sys/kernel/core_pattern > /dev/null 2>&1 || true
+# Run the test binary.
+\"${exe_path}\" \"$@\"
+RC=$?
+if [ $RC -ne 0 ] && [ -f \"$COREFILE\" ]; then
+    echo \"--- core dump found: $COREFILE ---\"
+    ${GDB_EXECUTABLE} --batch --nx \\
+        -ex \"file ${exe_path}\" \\
+        -ex \"core-file $COREFILE\" \\
+        -ex \"set pagination off\" \\
+        -ex \"thread apply all bt full\" \\
+        -ex \"quit\"
+fi
+exit $RC
+"
+        FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                         GROUP_READ GROUP_EXECUTE
+                         WORLD_READ WORLD_EXECUTE
+        NEWLINE_STYLE UNIX
+        )
+
+        add_test(NAME ${exe_name} COMMAND sh "${wrapper}")
+    else()
+        # gdb not available — run plain, cores will still be collected by CI.
+        add_test(NAME ${exe_name}
+            COMMAND sh -c
+                "ulimit -c unlimited && \"${exe_path}\" \"$@\""
+        )
+    endif()
+
+    set_tests_properties(${exe_name} PROPERTIES RUN_SERIAL TRUE)
+endfunction()
+
 foreach(src IN LISTS PHASE_TEST_SOURCES)
     cmake_path(GET src STEM phase)
     add_executable(${phase} ${src})
     target_link_libraries(${phase} PRIVATE goc)
     target_compile_options(${phase} PRIVATE -Wall -Wextra)
-    add_test(NAME ${phase} COMMAND ${phase})
-    set_tests_properties(${phase} PROPERTIES RUN_SERIAL TRUE)
+    add_goc_test(${phase})
 endforeach()
 
 # ---------------------------------------------------------------------------
