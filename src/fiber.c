@@ -72,7 +72,7 @@ goc_chan* goc_go_on(goc_pool* pool, void (*fn)(void*), void* arg) {
     }
 
     /* 6. Record the canary pointer (lowest word of the fiber stack). */
-    entry->stack_canary_ptr = (uint32_t*)mco_get_stack_base(entry->coro);
+    entry->stack_canary_ptr = (uint32_t*)entry->coro->stack_base;
 
     /* 7. Write the canary value so pool_worker_fn can detect stack overflow. */
     *entry->stack_canary_ptr = GOC_STACK_CANARY;
