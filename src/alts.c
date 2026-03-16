@@ -322,8 +322,8 @@ goc_alts_result goc_alts(goc_alt_op *ops, size_t n) {
     }
 
     /* Register fiber stack as a GC root for the suspension window. */
-    void *stack_base = mco_get_stack_base(running);
-    void *stack_top  = (char *)stack_base + mco_get_stack_size(running);
+    void *stack_base = running->stack_base;
+    void *stack_top  = (char *)stack_base + running->stack_size;
     GC_add_roots(stack_base, stack_top);
 
     /* Release all locks in reverse order before yielding. */
