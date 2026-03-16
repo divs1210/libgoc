@@ -286,6 +286,8 @@ struct goc_chan {
 2. **Loser path:** if the CAS fails, another caller already owns teardown — return immediately. No pointer is read, no lock is attempted.
 3. **Winner path:** acquire `ch->lock`, set `ch->closed = 1`, wake all parked takers and putters with `ok==GOC_CLOSED`, release the lock, call `chan_unregister`. **The mutex is left valid and intact** — ownership of `ch->lock` passes to the shutdown sweep in Step 2b.
 
+   When iterating takers and putters, `goc_close` must skip any entry where `e->cancelled == 1` **before** attempting the `woken` CAS. Cancelled entries belong to `goc_alts` losers whose coroutine is already `MCO_DEAD`; winning the CAS on such an entry and calling `post_to_run_queue` would call `mco_resume` on a dead coroutine, producing a SIGSEGV. This is the same guard applied by `wake()` and must be kept consistent with it.
+
 > **Why not destroy the mutex inline?** After `goc_close` wakes parked fibers, those fibers are re-enqueued on pool threads and will resume shortly. A resumed fiber may call `goc_take` or `goc_put` on the same channel pointer — the first thing those functions do is `uv_mutex_lock(ch->lock)`. If `goc_close` had already freed the mutex, that call would crash. The mutex must remain valid until the pool is fully drained and all workers are joined (Step 2). Only at that point is it guaranteed that no fiber can reach the channel's lock again.
 
 ### Parked Entry (`goc_entry`)
@@ -598,16 +600,20 @@ typedef struct goc_pool {
        in-flight fibers have completed before joining worker threads. */
     pthread_mutex_t drain_mutex;
     pthread_cond_t  drain_cond;
-    size_t          active_count;   /* number of fiber entries currently running or queued
-                                       to run; incremented by post_to_run_queue, decremented
-                                       both when a fiber yields (MCO_SUSPENDED) and when it
-                                       exits (MCO_DEAD) — post_to_run_queue re-increments on
-                                       every reschedule, so the count stays accurate across
-                                       multiple yield/resume cycles */
+    size_t          active_count;   /* fibers currently queued or executing; incremented
+                                       by post_to_run_queue, decremented unconditionally
+                                       after every mco_resume (yield or exit).  Used for
+                                       internal scheduling accounting only. */
+    size_t          live_count;     /* fibers still alive on this pool; incremented by
+                                       post_to_run_queue, decremented only when
+                                       mco_status == MCO_DEAD.  This is the correct drain
+                                       signal: a parked fiber (MCO_SUSPENDED) still has
+                                       live_count > 0 even though active_count has already
+                                       been decremented to 0. */
 } goc_pool;
 ```
 
-> **`drain_cond` is signalled only on `MCO_DEAD`.** Decrementing `active_count` on yield is an accounting detail — the fiber is immediately re-queued via `post_to_run_queue`, which re-increments it. The drain condition (`active_count == 0`) is only ever permanently satisfied when all fibers have exited. This is intentional: `goc_pool_destroy` waits for full completion, not just quiescence.
+> **`drain_cond` is signalled only on `MCO_DEAD`.** `active_count` is decremented on every yield or exit, but the broadcast fires only when a fiber actually dies. `goc_pool_destroy` and `goc_pool_destroy_timeout` wait on `live_count == 0`, not `active_count == 0` — a parked fiber (MCO_SUSPENDED) has already decremented `active_count` to zero while still being alive, so using `active_count` as the drain signal would cause a premature return while fibers are merely blocked on a channel.
 
 The default pool is created by `goc_init` with `max(4, hardware_concurrency)` worker threads. This can be overridden by setting the `GOC_POOL_THREADS` environment variable before calling `goc_init`.
 
@@ -626,36 +632,37 @@ while not shutdown:
     mco_resume(coro)                   /* run fiber until next mco_yield or return */
     GC_remove_roots(&entry, &entry + 1)
     lock(drain_mutex); active_count--; unlock(drain_mutex)
-    /* The decrement is always committed and the lock released before checking MCO_DEAD.
-       mco_destroy and the broadcast are separate subsequent actions, never nested inside
-       the decrement lock — this avoids holding drain_mutex across mco_destroy. */
+    /* active_count is decremented unconditionally.  The lock is released before
+       checking MCO_DEAD to avoid holding drain_mutex across mco_destroy. */
     if mco_status(coro) == MCO_DEAD:
         mco_destroy(coro)
-        lock(drain_mutex); signal(drain_cond); unlock(drain_mutex)
+        lock(drain_mutex); live_count--; broadcast(drain_cond); unlock(drain_mutex)
     /* if MCO_SUSPENDED: the fiber yielded and is parked on a channel.
-       active_count has already been decremented above.  wake() →
-       post_to_run_queue() will re-increment it when the fiber is rescheduled.
-       The drain_cond is not signalled here because the fiber is still live —
-       the zero check inside goc_pool_destroy will not be reached spuriously
-       because post_to_run_queue increments before the fiber can be seen by
-       the drain-wait. */
+       active_count has been decremented but live_count has NOT — the fiber is
+       still alive.  wake() → post_to_run_queue() will re-increment both counts
+       when the fiber is rescheduled.  drain_cond is not broadcast here:
+       live_count > 0 still holds, so goc_pool_destroy / goc_pool_destroy_timeout
+       will not see a spurious drain-complete. */
 ```
 
 > **Why `coro` is snapshotted before `mco_resume`.** When a fiber suspends inside `goc_take`, it stack-allocates a `goc_entry` (the parking entry) on its own coroutine stack and parks. The pool worker's `entry` pointer therefore points into the fiber's stack for the duration of that park. If the fiber is immediately re-scheduled on the same resume call (i.e. it runs to completion without yielding again), minicoro recycles the stack — and the memory `entry` pointed at is gone by the time `mco_resume` returns. Reading `entry->coro` after the resume is therefore a use-after-free and a potential segfault. The `mco_coro` object itself is minicoro heap-allocated and remains valid until `mco_destroy`, so snapshotting `coro = entry->coro` *before* the resume is always safe and eliminates the hazard entirely.
 
-`active_count` tracks the number of fiber entries that are either queued in the run queue or currently executing on a worker thread. It does **not** count fibers that are parked waiting for a channel event — those are suspended and invisible to the pool until `wake()` re-enqueues them.
+`active_count` tracks fiber entries currently queued in the run queue or executing on a worker thread. It does **not** count fibers parked on a channel — those have already been decremented and are invisible to the pool until `wake()` re-enqueues them. `active_count` is an internal scheduling counter only.
+
+`live_count` tracks all fibers that are alive on the pool, whether running, queued, or parked. It is the correct drain signal. A fiber that yields and parks on a channel has `active_count` decremented but `live_count` unchanged — it is still alive and will be re-enqueued when woken.
 
 The invariant is:
 
-- `post_to_run_queue` increments `active_count` before pushing to the run queue.
+- `post_to_run_queue` increments **both** `active_count` and `live_count` before pushing to the run queue.
 - After `mco_resume` returns, the worker always decrements `active_count` — whether the fiber yielded (`MCO_SUSPENDED`) or exited (`MCO_DEAD`).
-- `goc_pool_destroy`'s drain-wait sees `active_count == 0` only when no fiber is queued or running. Parked fibers have already been decremented; if any of them is later woken, `post_to_run_queue` increments again before the fiber is visible to any worker.
+- `live_count` is decremented **only** when `mco_status(coro) == MCO_DEAD`. `drain_cond` is broadcast at the same time.
+- `goc_pool_destroy` and `goc_pool_destroy_timeout` wait on `live_count == 0`. This correctly waits for all fibers to exit, not merely to yield.
 
-`goc_pool_destroy` is a **blocking drain-and-join**. It waits in a loop on `drain_cond` (under `drain_mutex`), re-checking `active_count > 0` on each wake to guard against spurious wakeups, until `active_count` reaches zero, meaning every fiber that was queued or executing **on this pool** has run to completion or yielded to a channel and will never be rescheduled on this pool. Only after the drain-wait completes does it signal `shutdown = 1`, post the semaphore to unblock sleeping workers, and join all threads. It is therefore safe to call `goc_pool_destroy` while fibers are still queued or running — the call is itself the synchronisation barrier.
+`goc_pool_destroy` is a **blocking drain-and-join**. It waits in a loop on `drain_cond` (under `drain_mutex`), re-checking `live_count > 0` on each wake to guard against spurious wakeups, until `live_count` reaches zero, meaning every fiber launched on this pool has actually returned. Only then does it signal `shutdown = 1`, post the semaphore to unblock sleeping workers, and join all threads. It is safe to call `goc_pool_destroy` while fibers are still queued, running, or parked — the call is itself the synchronisation barrier.
 
-`goc_pool_destroy_timeout(pool, ms)` is the non-blocking variant. It waits on `drain_cond` with a deadline of `ms` milliseconds. If `active_count` reaches zero before the deadline it performs the same shutdown-and-join sequence as `goc_pool_destroy` and returns `GOC_DRAIN_OK`. If the deadline expires before all fibers have finished it returns `GOC_DRAIN_TIMEOUT` immediately — **the pool is not destroyed** and remains in a fully valid, running state. Worker threads continue executing and the pool may be used normally. The caller may retry `goc_pool_destroy_timeout`, call `goc_pool_destroy` for an unconditional wait, or close the channels that parked fibers are blocked on to unblock them before retrying.
+`goc_pool_destroy_timeout(pool, ms)` is the non-blocking variant. It waits on `drain_cond` with a deadline of `ms` milliseconds. If `live_count` reaches zero before the deadline it performs the same shutdown-and-join sequence as `goc_pool_destroy` and returns `GOC_DRAIN_OK`. If the deadline expires while `live_count > 0` it returns `GOC_DRAIN_TIMEOUT` immediately — **the pool is not destroyed** and remains fully valid. Worker threads continue executing. The caller may retry `goc_pool_destroy_timeout`, call `goc_pool_destroy` for an unconditional wait, or close the channels that parked fibers are blocked on to unblock them before retrying.
 
-> **Scope:** `active_count` only tracks fibers on *this specific pool*. Fibers on other pools (including the default pool) are not counted. `goc_pool_destroy` will block indefinitely if any fiber **on this pool** is parked on a channel event that will never arrive — for example, if a fiber launched via `goc_go_on(this_pool, ...)` is waiting on a channel that nothing will ever write to.
+> **Scope:** `live_count` only tracks fibers on *this specific pool*. Fibers on other pools (including the default pool) are not counted. `goc_pool_destroy` will block indefinitely if any fiber **on this pool** is parked on a channel event that will never arrive — for example, if a fiber launched via `goc_go_on(this_pool, ...)` is waiting on a channel that nothing will ever write to.
 
 
 
@@ -1206,3 +1213,4 @@ ctest --test-dir build-tsan --output-on-failure
 - Fiber Local Storage
 - Sliding buffer
 - Dropping buffer
+- Telemetry
