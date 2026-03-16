@@ -108,6 +108,7 @@ void chan_unregister(goc_chan* ch);
 
 /* pool.c → used by fiber.c, channel.c */
 void post_to_run_queue(goc_pool* pool, goc_entry* entry);
+void pool_fiber_born(goc_pool* pool);
 
 /* loop.c → used by channel.c, alts.c, timeout.c, gc.c */
 void loop_init(void);
