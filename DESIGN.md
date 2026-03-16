@@ -86,7 +86,7 @@ libgoc/
 
 minicoro is a single-header library vendored under `vendor/minicoro/`. It requires exactly one translation unit to instantiate its implementation: `src/minicoro.c` defines `MINICORO_IMPL` before including `minicoro.h`. All other files include `minicoro.h` without defining `MINICORO_IMPL`.
 
-`src/minicoro.c` is compiled **without** `-DGC_THREADS` (the flag is explicitly undefined via `-UGC_THREADS` in `CMakeLists.txt`). This isolates minicoro's `thread_local mco_current_co` TLS variable from Boehm GC's thread-startup instrumentation — see [minicoro Limitations](#minicoro-limitations) for the full rationale.
+`src/minicoro.c` has no special compile flags. minicoro never calls any GC function, and no GC-specific treatment of its translation unit is required.
 
 ---
 
@@ -101,7 +101,7 @@ The project uses CMake (≥ 3.16). `CMakeLists.txt` defines two primary targets:
 
 Dependencies are resolved via `pkg-config` (libuv as `libuv`, Boehm GC as `bdw-gc-threaded` — **no fallback**; configure fails loudly if the threaded variant is absent) and CMake's `find_package` (pthreads / pthreads4w on Windows). minicoro is instantiated via `src/minicoro.c` (which defines `MINICORO_IMPL`) and its header is available to all targets via `target_include_directories` pointing at `vendor/minicoro/`.
 
-> **`minicoro.c` and `-DGC_THREADS`:** `src/minicoro.c` is compiled with `-UGC_THREADS` via `set_source_files_properties` in `CMakeLists.txt`, explicitly removing the `GC_THREADS` definition that is otherwise applied to every other source file. This is required because Boehm GC compiled with `GC_THREADS` wraps `pthread_create` and calls `GC_call_with_stack_base` during thread startup. If minicoro's `static MCO_THREAD_LOCAL mco_current_co` TLS variable is initialised in the same GC-instrumented context, the GC's TLS walk can fault before that variable is set up, producing a SIGSEGV inside `GC_call_with_stack_base` (observed as a crash during `goc_in_fiber()` in P1.4). Compiling minicoro in an isolated, GC-unaware TU eliminates this hazard. minicoro never calls any GC function, so `-DGC_THREADS` is meaningless to it regardless.
+> **Boehm GC thread registration:** When compiled with `-DGC_THREADS`, Boehm GC wraps `pthread_create` so that every new thread is automatically registered via `GC_call_with_stack_base`. Pool worker threads are created after `GC_INIT()` and `GC_allow_register_threads()`, so the GC pthread wrapper handles their registration automatically. Pool workers must **not** call `GC_register_my_thread` / `GC_unregister_my_thread` manually — doing so double-registers the thread, corrupts the GC's internal thread table, and produces a SIGSEGV inside `GC_call_with_stack_base` on thread startup (observed as a crash during P1.4). Manual registration is only appropriate for threads created before `GC_INIT()` or outside the GC's pthread wrapper, which does not apply to any thread in libgoc.
 
 > **Why `bdw-gc-threaded` is required:** libgoc compiles with `-DGC_THREADS` and calls `GC_allow_register_threads()`, `GC_register_my_thread()`, and `GC_unregister_my_thread()` on every pool worker. These symbols are only present in a Boehm GC build compiled with `--enable-threads`. Linking against a non-threaded build causes `GC_INIT()` to malfunction or segfault at runtime. The `bdw-gc-threaded` pkg-config module is the explicitly thread-safe variant and is the only acceptable dependency. If it is not present, CMake will fail at configure time with a clear error. See `README.md` for per-platform Boehm GC installation instructions.
 
