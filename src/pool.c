@@ -167,10 +167,6 @@ static goc_entry* runq_pop(goc_runq* q) {
 static void* pool_worker_fn(void* arg) {
     goc_pool* pool = (goc_pool*)arg;
 
-    struct GC_stack_base sb;
-    GC_get_stack_base(&sb);
-    GC_register_my_thread(&sb);
-
     while (!atomic_load_explicit(&pool->shutdown, memory_order_acquire)) {
         uv_sem_wait(&pool->work_sem);
 
@@ -216,7 +212,6 @@ static void* pool_worker_fn(void* arg) {
         }
     }
 
-    GC_unregister_my_thread();
     return NULL;
 }
 
