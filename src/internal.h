@@ -153,8 +153,17 @@ static inline int chan_put_to_taker(goc_chan* ch, void* val) {
         pp = &(*pp)->next;
     goc_entry* e = *pp;
     if (!e) return 0;
+    /* Save e->next before calling wake(). For GOC_FIBER entries, wake() calls
+     * post_to_run_queue, which may allow a pool thread to resume the waiting
+     * fiber immediately. That fiber's stack frame — which contains the
+     * stack-allocated goc_entry (from goc_take's slow path) — is then
+     * deallocated as the coroutine unwinds past mco_yield. Reading e->next
+     * after wake() would therefore be a use-after-free. Snapshotting next
+     * here, before wake(), is safe because e->next is only ever written under
+     * ch->lock, which we still hold. */
+    goc_entry* next = e->next;
     wake(ch, e, val);
-    *pp = e->next;   /* splice: removes e and all skipped cancelled entries before it */
+    *pp = next;
     return 1;
 }
 
@@ -165,8 +174,14 @@ static inline int chan_take_from_putter(goc_chan* ch, void** out) {
     goc_entry* e = *pp;
     if (!e) return 0;
     *out = e->put_val;
+    /* Save e->next before calling wake() for the same reason as chan_put_to_taker:
+     * wake() may resume the parked fiber immediately on another pool thread,
+     * freeing the stack frame that contains the stack-allocated goc_entry.
+     * e->put_val is read above (before wake), which is safe. e->next must be
+     * snapshotted here, also before wake(), while ch->lock is still held. */
+    goc_entry* next = e->next;
     wake(ch, e, NULL);
-    *pp = e->next;   /* splice: removes e and all skipped cancelled entries before it */
+    *pp = next;
     return 1;
 }
 
