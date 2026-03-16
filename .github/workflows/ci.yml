@@ -36,7 +36,7 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y libuv1-dev pkg-config build-essential \
-            libatomic-ops-dev
+            libatomic-ops-dev gdb
 
       - name: Cache Boehm GC
         id: cache-bdwgc
@@ -86,4 +86,3 @@ jobs:
         run: ctest --test-dir build --output-on-failure
         env:
           LD_LIBRARY_PATH: ${{ env.BDWGC_PREFIX }}/lib
-
