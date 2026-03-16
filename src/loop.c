@@ -167,14 +167,7 @@ static void on_shutdown_signal(uv_async_t *h)
 static void *loop_thread_fn(void *arg)
 {
     (void)arg;
-
-    struct GC_stack_base sb;
-    GC_get_stack_base(&sb);
-    GC_register_my_thread(&sb);
-
     while (uv_run(g_loop, UV_RUN_ONCE)) {}
-
-    GC_unregister_my_thread();
     return NULL;
 }
 
@@ -205,8 +198,9 @@ void loop_init(void)
     /* 5. Initialise the MPSC callback queue. */
     cb_queue_init();
 
-    /* 6. Spawn the loop thread. */
-    pthread_create(&g_loop_thread, NULL, loop_thread_fn, NULL);
+    /* 6. Spawn the loop thread via GC_pthread_create so the GC wrapper
+     *    registers the thread automatically (consistent with pool workers). */
+    GC_pthread_create(&g_loop_thread, NULL, loop_thread_fn, NULL);
 }
 
 void loop_shutdown(void)
@@ -215,7 +209,7 @@ void loop_shutdown(void)
     uv_async_send(g_shutdown_async);
 
     /* Wait for the loop thread to finish. */
-    pthread_join(g_loop_thread, NULL);
+    GC_pthread_join(g_loop_thread, NULL);
 
     /* All handles are closed; the loop should be idle. */
     assert(uv_loop_close(g_loop) == 0);
