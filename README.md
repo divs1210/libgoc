@@ -326,7 +326,7 @@ typedef enum {
 
 | Function | Signature | Description |
 |---|---|---|
-| `goc_pool_make` | `goc_pool* goc_pool_make(size_t threads)` | Create a pool with `threads` worker threads. Workers register with Boehm GC on start and unregister on exit. |
+| `goc_pool_make` | `goc_pool* goc_pool_make(size_t threads)` | Create a pool with `threads` worker threads. Worker thread registration with Boehm GC is handled automatically via `GC_pthread_create` / `GC_pthread_join` — do not register or unregister threads manually. |
 | `goc_pool_destroy` | `void goc_pool_destroy(goc_pool* pool)` | Wait for all in-flight fibers on the pool to complete naturally, then drain the run queue, join all worker threads, and release pool resources. Blocks indefinitely if any fiber is parked on a channel event that never arrives. Safe to call while fibers are still queued or running — the drain is the synchronisation barrier. |
 | `goc_pool_destroy_timeout` | `goc_drain_result_t goc_pool_destroy_timeout(goc_pool* pool, uint64_t ms)` | Like `goc_pool_destroy`, but returns `GOC_DRAIN_OK` if the drain completes within `ms` milliseconds, or `GOC_DRAIN_TIMEOUT` if the timeout expires before all fibers have finished. On timeout the pool is **not** destroyed — worker threads continue running and the pool remains valid. The caller may retry later or take other action (e.g. closing channels to unblock parked fibers, then calling `goc_pool_destroy`). |
 
@@ -351,7 +351,7 @@ if (goc_pool_destroy_timeout(io_pool, 2000) == GOC_DRAIN_TIMEOUT) {
 |---|---|---|
 | `goc_scheduler` | `uv_loop_t* goc_scheduler(void)` | Return the `uv_loop_t*` owned by the runtime. Safe to call from any thread after `goc_init` returns. **Do not call `uv_run` or `uv_loop_close` on the returned pointer.** |
 
-Use `goc_scheduler` to register user-owned libuv handles on the same event loop as the runtime. All such handles **must be `malloc`-allocated** (not `goc_malloc`) and freed only inside the `uv_close` completion callback.
+Use `goc_scheduler` to register user-owned libuv handles on the same event loop as the runtime. All such handles must be freed only inside the `uv_close` completion callback. See [`goc_malloc`](#memory-allocation) for allocation requirements.
 
 ```c
 static void on_handle_closed(uv_handle_t* h) { free(h); }
@@ -368,17 +368,6 @@ uv_close((uv_handle_t*)server, on_handle_closed);
 ## Examples
 
 ### 1. Async file copy with timeout and cancellation
-
-This example ties together the key primitives: `goc_scheduler` to register
-libuv file-system handles on the runtime's event loop, `goc_go` to spawn
-fibers, `goc_put_cb` to forward results from uv loop callbacks into a fiber,
-`goc_timeout` for a deadline, and `goc_alts` to race the I/O result against
-that deadline.
-
-The file is read into a single buffer, then written out in one call. The copy
-fiber waits for each async operation to complete by blocking on a handshake
-channel; it races the final read result against a 5-second timeout using
-`goc_alts`.
 
 ```c
 #include "goc.h"
@@ -656,9 +645,8 @@ int main(void) {
 
 **A few things to keep in mind:**
 
-- `goc_init()` initialises Boehm GC internally. Do not call `GC_INIT()` before or after it.
 - `goc_malloc` is a thin wrapper around `GC_malloc`. Memory is zero-initialised.
-- **libuv handles** (`uv_timer_t`, `uv_async_t`, etc.) must still be allocated with plain `malloc` — the library's own internals hold raw pointers to them until `uv_close` completes, which would confuse the collector.
+- **libuv handles** must be allocated with plain `malloc`. See [`goc_malloc`](#memory-allocation).
 
 ---
 
@@ -761,8 +749,6 @@ ctest --test-dir build --output-on-failure -C RelWithDebInfo
 REM Or run a single phase directly
 build\RelWithDebInfo\test_p1_foundation.exe
 ```
-
-> **Note:** minicoro replaces the POSIX-specific `ucontext_t` on Windows. No additional compiler flags are needed; the build system detects the platform automatically.
 
 ---
 
