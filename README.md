@@ -203,7 +203,7 @@ int main(void) {
     /*
      * Destroy the CPU pool. 
      * Optional, shown here for completeness.
-     * All undestroyed pools are automatically cleaned up by by goc_shutdown().
+     * All undestroyed pools are automatically cleaned up by goc_shutdown().
      */
     goc_pool_destroy(cpu_pool);
 
