@@ -658,6 +658,17 @@ tar xf gc-8.2.6.tar.gz && cd gc-8.2.6
 ./configure --enable-threads=posix --enable-thread-local-alloc --enable-shared --prefix=/usr/local
 make -j$(nproc) && sudo make install && sudo ldconfig && cd ..
 
+# The source build does not always generate a bdw-gc-threaded.pc pkg-config alias.
+# Create it manually if it is missing:
+if [ ! -f /usr/local/lib/pkgconfig/bdw-gc-threaded.pc ]; then
+    sudo ln -s /usr/local/lib/pkgconfig/bdw-gc.pc /usr/local/lib/pkgconfig/bdw-gc-threaded.pc
+fi
+
+# Ensure pkg-config searches /usr/local (not on the default path on all distros):
+export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
+# To make this permanent:
+# echo 'export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH' >> ~/.bashrc
+
 # 2. Configure
 cmake -B build
 
