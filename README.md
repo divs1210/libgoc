@@ -25,6 +25,10 @@ See the [Design Doc](./DESIGN.md) for implementation details.
 
 ## Table of Contents
 
+- [Examples](#examples)
+  - [1. Ping-pong](#1-ping-pong)
+  - [2. Custom thread pool with `goc_go_on`](#2-custom-thread-pool-with-goc_go_on)
+  - [3. Using goc_malloc](#3-using-goc_malloc)
 - [Public API](#public-api)
   - [Initialisation and shutdown](#initialisation-and-shutdown)
   - [Memory allocation](#memory-allocation)
@@ -41,10 +45,6 @@ See the [Design Doc](./DESIGN.md) for implementation details.
   - [Timeout channel](#timeout-channel)
   - [Thread pool](#thread-pool)
   - [Scheduler loop access](#scheduler-loop-access)
-- [Examples](#examples)
-  - [1. Ping-pong](#1-ping-pong)
-  - [2. Custom thread pool with `goc_go_on`](#2-custom-thread-pool-with-goc_go_on)
-  - [3. Using goc_malloc](#3-using-goc_malloc)
 - [Building and Testing](#building-and-testing)
   - [Prerequisites](#prerequisites)
   - [macOS](#macos)
@@ -54,6 +54,227 @@ See the [Design Doc](./DESIGN.md) for implementation details.
   - [Shared library](#shared-library)
   - [Code coverage](#code-coverage)
   - [Sanitizers](#sanitizers)
+
+---
+
+## Examples
+
+### 1. Ping-pong
+
+Two fibers exchange a message back and forth over a pair of unbuffered channels.
+This is the canonical CSP "ping-pong" pattern — each fiber blocks on a take,
+then immediately puts to wake the other side.
+
+```c
+#include "goc.h"
+#include <stdio.h>
+
+#define N_ROUNDS 5
+
+typedef struct {
+    goc_chan* recv;   /* channel this fiber reads from  */
+    goc_chan* send;   /* channel this fiber writes to   */
+    const char* name;
+} player_args_t;
+
+static void player(void* arg) {
+    player_args_t* a = arg;
+
+    goc_val_t v;
+    while ((v = goc_take(a->recv)).ok == GOC_OK) {
+        int count = (int)(intptr_t)v.val;
+        printf("%s %d\n", a->name, count);
+        if (count >= N_ROUNDS) {
+            goc_close(a->send);
+            return;
+        }
+        goc_put(a->send, (void*)(intptr_t)(count + 1));
+    }
+}
+
+int main(void) {
+    goc_init();
+
+    goc_chan* a_to_b = goc_chan_make(0);
+    goc_chan* b_to_a = goc_chan_make(0);
+
+    player_args_t ping_args = { .recv = b_to_a, .send = a_to_b, .name = "ping" };
+    player_args_t pong_args = { .recv = a_to_b, .send = b_to_a, .name = "pong" };
+
+    goc_chan* done_ping = goc_go(player, &ping_args);
+    goc_chan* done_pong = goc_go(player, &pong_args);
+
+    /* Kick off the exchange with the first message. */
+    goc_put_sync(a_to_b, (void*)(intptr_t)1);
+
+    /* Wait for both fibers to finish. */
+    goc_take_sync(done_ping);
+    goc_take_sync(done_pong);
+
+    goc_shutdown();
+    return 0;
+}
+```
+
+**What this example demonstrates:**
+
+- `goc_chan_make(0)` — unbuffered channels enforce a synchronous rendezvous:
+  each `goc_put` blocks until the other fiber calls `goc_take`, and vice versa.
+- `goc_go` — spawns both player fibers on the default pool and returns a join
+  channel that is closed automatically when the fiber returns.
+- `goc_put_sync` — sends the opening message from the main OS thread (outside
+  any fiber) without blocking a pool worker.
+- `goc_close` — when the round limit is reached the active fiber closes the
+  forward channel, causing the partner's next `goc_take` to return
+  `GOC_CLOSED` and exit its loop cleanly.
+- `goc_take_sync` — blocks the main thread until each join channel is closed,
+  providing a simple, channel-based join without extra synchronisation.
+
+---
+
+### 2. Custom thread pool with `goc_go_on`
+
+Use `goc_pool_make` when you need workloads isolated from the default pool —
+for example, CPU-bound tasks that should not starve I/O fibers.
+
+This example fans out several independent jobs onto a dedicated pool, then
+collects all results from main using `goc_take_sync`.
+
+```c
+#include "goc.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+/* -------------------------------------------------------------------------
+ * Worker fiber: sum integers in [lo, hi) and send the result back.
+ * In a real program this would be image processing, compression, etc.
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    long      lo, hi;
+    goc_chan* result_ch;
+} worker_args_t;
+
+static void sum_range(void* arg) {
+    worker_args_t* a = arg;
+    long acc = 0;
+    for (long i = a->lo; i < a->hi; i++)
+        acc += i;
+    goc_put(a->result_ch, (void*)(intptr_t)acc);
+}
+
+/* =========================================================================
+ * main
+ * ========================================================================= */
+#define N_WORKERS 4
+#define RANGE     1000000L
+
+int main(void) {
+    goc_init();
+
+    /*
+     * A dedicated pool for CPU-bound work. The default pool (started by
+     * goc_init) is left free for I/O fibers and other goc_go calls.
+     */
+    goc_pool* cpu_pool = goc_pool_make(N_WORKERS);
+
+    goc_chan*     result_ch = goc_chan_make(0);
+    worker_args_t workers[N_WORKERS];
+    long          chunk = RANGE / N_WORKERS;
+
+    /* Fan out: spawn each worker on the CPU pool with goc_go_on. */
+    for (int i = 0; i < N_WORKERS; i++) {
+        workers[i].lo        = i * chunk;
+        workers[i].hi        = (i == N_WORKERS - 1) ? RANGE : (i + 1) * chunk;
+        workers[i].result_ch = result_ch;
+        goc_go_on(cpu_pool, sum_range, &workers[i]);
+    }
+
+    /* Fan in: collect results from the main thread with goc_take_sync. */
+    long total = 0;
+    for (int i = 0; i < N_WORKERS; i++) {
+        goc_val_t v = goc_take_sync(result_ch);
+        if (v.ok == GOC_OK) total += (long)(intptr_t)v.val;
+    }
+
+    printf("sum [0, %ld) = %ld\n", RANGE, total);
+
+    /*
+     * Destroy the CPU pool before goc_shutdown.
+     * Safe here because all workers have already sent their results,
+     * so we know they have returned.
+     */
+    goc_pool_destroy(cpu_pool);
+    goc_shutdown();
+    return 0;
+}
+```
+
+**What this example demonstrates:**
+
+- `goc_pool_make` / `goc_pool_destroy` — creates and tears down a dedicated
+  pool, isolated from the default pool started by `goc_init`.
+- `goc_go_on` — pins each worker fiber to the CPU pool.
+- Fan-out / fan-in over a shared result channel — no explicit synchronisation
+  primitives beyond channels.
+- `goc_pool_destroy` ordering — called only after all workers have returned
+  (guaranteed here because all results have been received), then
+  `goc_shutdown` tears down the rest of the runtime.
+
+---
+
+### 3. Using goc_malloc
+
+`goc_malloc` allocates memory on the Boehm GC heap. Allocations are collected
+automatically when no longer reachable — no `free` is needed. This is the
+intended allocator for language runtime objects: AST nodes, closures, heap
+values, and so on.
+
+```c
+#include "goc.h"
+#include <stdio.h>
+
+typedef struct node_t {
+    int           value;
+    struct node_t* next;
+} node_t;
+
+static void build_list(void* arg) {
+    goc_chan* result_ch = arg;
+
+    /* Build a linked list entirely on the GC heap — no free() required. */
+    node_t* head = NULL;
+    for (int i = 9; i >= 0; i--) {
+        node_t* n = goc_malloc(sizeof(node_t));
+        n->value = i;
+        n->next  = head;
+        head     = n;
+    }
+
+    goc_put(result_ch, head);
+}
+
+int main(void) {
+    goc_init();
+
+    goc_chan* result_ch = goc_chan_make(0);
+    goc_go(build_list, result_ch);
+
+    goc_val_t v = goc_take_sync(result_ch);
+    if (v.ok == GOC_OK) {
+        for (node_t* n = v.val; n; n = n->next)
+            printf("%d ", n->value);
+        printf("\n");
+    }
+
+    goc_shutdown();
+    return 0;
+}
+```
+
+**A few things to keep in mind:**
+
+- `goc_malloc` is a thin wrapper around `GC_malloc`. Memory is zero-initialised.
+- **libuv handles** must be allocated with plain `malloc`. See [`goc_malloc`](#memory-allocation).
 
 ---
 
@@ -362,227 +583,6 @@ uv_tcp_init(goc_scheduler(), server);
 // ... later, to tear down:
 uv_close((uv_handle_t*)server, on_handle_closed);
 ```
-
----
-
-## Examples
-
-### 1. Ping-pong
-
-Two fibers exchange a message back and forth over a pair of unbuffered channels.
-This is the canonical CSP "ping-pong" pattern — each fiber blocks on a take,
-then immediately puts to wake the other side.
-
-```c
-#include "goc.h"
-#include <stdio.h>
-
-#define N_ROUNDS 5
-
-typedef struct {
-    goc_chan* recv;   /* channel this fiber reads from  */
-    goc_chan* send;   /* channel this fiber writes to   */
-    const char* name;
-} player_args_t;
-
-static void player(void* arg) {
-    player_args_t* a = arg;
-
-    goc_val_t v;
-    while ((v = goc_take(a->recv)).ok == GOC_OK) {
-        int count = (int)(intptr_t)v.val;
-        printf("%s %d\n", a->name, count);
-        if (count >= N_ROUNDS) {
-            goc_close(a->send);
-            return;
-        }
-        goc_put(a->send, (void*)(intptr_t)(count + 1));
-    }
-}
-
-int main(void) {
-    goc_init();
-
-    goc_chan* a_to_b = goc_chan_make(0);
-    goc_chan* b_to_a = goc_chan_make(0);
-
-    player_args_t ping_args = { .recv = b_to_a, .send = a_to_b, .name = "ping" };
-    player_args_t pong_args = { .recv = a_to_b, .send = b_to_a, .name = "pong" };
-
-    goc_chan* done_ping = goc_go(player, &ping_args);
-    goc_chan* done_pong = goc_go(player, &pong_args);
-
-    /* Kick off the exchange with the first message. */
-    goc_put_sync(a_to_b, (void*)(intptr_t)1);
-
-    /* Wait for both fibers to finish. */
-    goc_take_sync(done_ping);
-    goc_take_sync(done_pong);
-
-    goc_shutdown();
-    return 0;
-}
-```
-
-**What this example demonstrates:**
-
-- `goc_chan_make(0)` — unbuffered channels enforce a synchronous rendezvous:
-  each `goc_put` blocks until the other fiber calls `goc_take`, and vice versa.
-- `goc_go` — spawns both player fibers on the default pool and returns a join
-  channel that is closed automatically when the fiber returns.
-- `goc_put_sync` — sends the opening message from the main OS thread (outside
-  any fiber) without blocking a pool worker.
-- `goc_close` — when the round limit is reached the active fiber closes the
-  forward channel, causing the partner's next `goc_take` to return
-  `GOC_CLOSED` and exit its loop cleanly.
-- `goc_take_sync` — blocks the main thread until each join channel is closed,
-  providing a simple, channel-based join without extra synchronisation.
-
----
-
-### 2. Custom thread pool with `goc_go_on`
-
-Use `goc_pool_make` when you need workloads isolated from the default pool —
-for example, CPU-bound tasks that should not starve I/O fibers.
-
-This example fans out several independent jobs onto a dedicated pool, then
-collects all results from main using `goc_take_sync`.
-
-```c
-#include "goc.h"
-#include <stdio.h>
-#include <stdlib.h>
-
-/* -------------------------------------------------------------------------
- * Worker fiber: sum integers in [lo, hi) and send the result back.
- * In a real program this would be image processing, compression, etc.
- * ------------------------------------------------------------------------- */
-typedef struct {
-    long      lo, hi;
-    goc_chan* result_ch;
-} worker_args_t;
-
-static void sum_range(void* arg) {
-    worker_args_t* a = arg;
-    long acc = 0;
-    for (long i = a->lo; i < a->hi; i++)
-        acc += i;
-    goc_put(a->result_ch, (void*)(intptr_t)acc);
-}
-
-/* =========================================================================
- * main
- * ========================================================================= */
-#define N_WORKERS 4
-#define RANGE     1000000L
-
-int main(void) {
-    goc_init();
-
-    /*
-     * A dedicated pool for CPU-bound work. The default pool (started by
-     * goc_init) is left free for I/O fibers and other goc_go calls.
-     */
-    goc_pool* cpu_pool = goc_pool_make(N_WORKERS);
-
-    goc_chan*     result_ch = goc_chan_make(0);
-    worker_args_t workers[N_WORKERS];
-    long          chunk = RANGE / N_WORKERS;
-
-    /* Fan out: spawn each worker on the CPU pool with goc_go_on. */
-    for (int i = 0; i < N_WORKERS; i++) {
-        workers[i].lo        = i * chunk;
-        workers[i].hi        = (i == N_WORKERS - 1) ? RANGE : (i + 1) * chunk;
-        workers[i].result_ch = result_ch;
-        goc_go_on(cpu_pool, sum_range, &workers[i]);
-    }
-
-    /* Fan in: collect results from the main thread with goc_take_sync. */
-    long total = 0;
-    for (int i = 0; i < N_WORKERS; i++) {
-        goc_val_t v = goc_take_sync(result_ch);
-        if (v.ok == GOC_OK) total += (long)(intptr_t)v.val;
-    }
-
-    printf("sum [0, %ld) = %ld\n", RANGE, total);
-
-    /*
-     * Destroy the CPU pool before goc_shutdown.
-     * Safe here because all workers have already sent their results,
-     * so we know they have returned.
-     */
-    goc_pool_destroy(cpu_pool);
-    goc_shutdown();
-    return 0;
-}
-```
-
-**What this example demonstrates:**
-
-- `goc_pool_make` / `goc_pool_destroy` — creates and tears down a dedicated
-  pool, isolated from the default pool started by `goc_init`.
-- `goc_go_on` — pins each worker fiber to the CPU pool.
-- Fan-out / fan-in over a shared result channel — no explicit synchronisation
-  primitives beyond channels.
-- `goc_pool_destroy` ordering — called only after all workers have returned
-  (guaranteed here because all results have been received), then
-  `goc_shutdown` tears down the rest of the runtime.
-
----
-
-### 3. Using goc_malloc
-
-`goc_malloc` allocates memory on the Boehm GC heap. Allocations are collected
-automatically when no longer reachable — no `free` is needed. This is the
-intended allocator for language runtime objects: AST nodes, closures, heap
-values, and so on.
-
-```c
-#include "goc.h"
-#include <stdio.h>
-
-typedef struct node_t {
-    int           value;
-    struct node_t* next;
-} node_t;
-
-static void build_list(void* arg) {
-    goc_chan* result_ch = arg;
-
-    /* Build a linked list entirely on the GC heap — no free() required. */
-    node_t* head = NULL;
-    for (int i = 9; i >= 0; i--) {
-        node_t* n = goc_malloc(sizeof(node_t));
-        n->value = i;
-        n->next  = head;
-        head     = n;
-    }
-
-    goc_put(result_ch, head);
-}
-
-int main(void) {
-    goc_init();
-
-    goc_chan* result_ch = goc_chan_make(0);
-    goc_go(build_list, result_ch);
-
-    goc_val_t v = goc_take_sync(result_ch);
-    if (v.ok == GOC_OK) {
-        for (node_t* n = v.val; n; n = n->next)
-            printf("%d ", n->value);
-        printf("\n");
-    }
-
-    goc_shutdown();
-    return 0;
-}
-```
-
-**A few things to keep in mind:**
-
-- `goc_malloc` is a thin wrapper around `GC_malloc`. Memory is zero-initialised.
-- **libuv handles** must be allocated with plain `malloc`. See [`goc_malloc`](#memory-allocation).
 
 ---
 
