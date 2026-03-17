@@ -3,9 +3,9 @@
 # libgoc
 > A Go-style CSP concurrency runtime for C: threadpools, stackful coroutines, channels, select, async I/O, and garbage collection in one coherent API.
 
-**libgoc** is a runtime library for language implementations that want a Go-style CSP concurrency system backed by a managed memory environment. It is written in plain C for maximum reach and portability.
+**libgoc** is a runtime library for C programs that want Go-style CSP concurrency backed by a managed memory environment. It is written in plain C for maximum reach and portability.
 
-The library provides stackful coroutines ("fibers"), channels, a select primitive (`goc_alts`), timeout channels, and a managed thread pool. Boehm GC is a required dependency and is wired in automatically.
+The library provides stackful coroutines ("fibers"), channels, a select primitive (`goc_alts`), timeout channels, and a managed thread pool. Boehm GC is a required dependency and is linked automatically.
 
 See the [Design Doc](./DESIGN.md) for implementation details.
 
@@ -228,8 +228,7 @@ int main(void) {
 
 `goc_malloc` allocates memory on the Boehm GC heap. Allocations are collected
 automatically when no longer reachable — no `free` is needed. This is the
-intended allocator for language runtime objects: AST nodes, closures, heap
-values, and so on.
+intended allocator for long-lived program objects: nodes, buffers, application data, and so on.
 
 ```c
 #include "goc.h"
