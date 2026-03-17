@@ -12,7 +12,7 @@ The library provides stackful coroutines ("fibers"), channels, a select primitiv
 - **C developers** who want a Go-style concurrency runtime without switching to Go.
 - **Language implementors** targeting C/C++ as a compilation target, or writing multithreaded interpreters.
 
-See the [Design Doc](./DESIGN.md) for implementation details.
+See the [Design Doc](./DESIGN.md) for implementation details and [TODO](./TODO.md) for planned future work.
 
 > **Boehm GC must be compiled with thread support.** libgoc calls `GC_allow_register_threads()` during initialisation. With `-DGC_THREADS` active, the GC's pthread wrapper automatically registers every pool worker thread and the uv loop thread via `GC_call_with_stack_base` — all threads are created with `GC_pthread_create` and must not call `GC_register_my_thread` / `GC_unregister_my_thread` manually, as doing so double-registers the thread and causes a crash. A non-threaded build of the GC (i.e. one built without `--enable-threads`) is missing the required symbols and will crash at runtime. See the per-platform instructions in [Building and Testing](#building-and-testing) for how to satisfy this requirement on each OS.
 
