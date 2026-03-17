@@ -42,7 +42,7 @@ See the [Design Doc](./DESIGN.md) for implementation details.
   - [Thread pool](#thread-pool)
   - [Scheduler loop access](#scheduler-loop-access)
 - [Examples](#examples)
-  - [1. Async file copy with timeout and cancellation](#1-async-file-copy-with-timeout-and-cancellation)
+  - [1. Ping-pong](#1-ping-pong)
   - [2. Custom thread pool with `goc_go_on`](#2-custom-thread-pool-with-goc_go_on)
   - [3. Using goc_malloc](#3-using-goc_malloc)
 - [Building and Testing](#building-and-testing)
@@ -367,140 +367,76 @@ uv_close((uv_handle_t*)server, on_handle_closed);
 
 ## Examples
 
-### 1. Async file copy with timeout and cancellation
+### 1. Ping-pong
+
+Two fibers exchange a message back and forth over a pair of unbuffered channels.
+This is the canonical CSP "ping-pong" pattern — each fiber blocks on a take,
+then immediately puts to wake the other side.
 
 ```c
 #include "goc.h"
-#include <uv.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
-/* -------------------------------------------------------------------------
- * All libuv handles must be malloc-allocated (never GC heap). Group them in
- * one struct so a single free() cleans up after uv_close completes.
- * copy_state_t itself (which wraps those handles) is goc_malloc-allocated so
- * it is collected automatically when the fiber exits.
- * ------------------------------------------------------------------------- */
-#define MAX_FILE_SIZE (4 * 1024 * 1024)   /* 4 MB for this example */
+#define N_ROUNDS 5
 
 typedef struct {
-    uv_file  src_file, dst_file;
-    uv_fs_t  open_req, read_req, write_req, close_req;
-    uv_buf_t iov;
-    char     buf[MAX_FILE_SIZE];
-    ssize_t  nbytes;
-    goc_chan* done_ch;   /* handshake channel: uv callback -> copy fiber */
-} copy_state_t;
+    goc_chan* recv;   /* channel this fiber reads from  */
+    goc_chan* send;   /* channel this fiber writes to   */
+    const char* name;
+} player_args_t;
 
-/* -------------------------------------------------------------------------
- * libuv callbacks — all run on the uv loop thread.
- * They do nothing except signal the waiting fiber via goc_put_cb.
- * ------------------------------------------------------------------------- */
-static void on_open (uv_fs_t* r) { goc_put_cb(((copy_state_t*)r->data)->done_ch,
-                                               (void*)(intptr_t)r->result, NULL, NULL); }
-static void on_read (uv_fs_t* r) { goc_put_cb(((copy_state_t*)r->data)->done_ch,
-                                               (void*)(intptr_t)r->result, NULL, NULL); }
-static void on_write(uv_fs_t* r) { goc_put_cb(((copy_state_t*)r->data)->done_ch,
-                                               (void*)(intptr_t)r->result, NULL, NULL); }
-static void on_close(uv_fs_t* r) { (void)r; }
+static void player(void* arg) {
+    player_args_t* a = arg;
 
-/* -------------------------------------------------------------------------
- * copy_fiber — does the actual work.
- * Runs on a pool thread; may call goc_take / goc_alts freely.
- * ------------------------------------------------------------------------- */
-typedef struct {
-    const char* src;
-    const char* dst;
-    goc_chan*   result_ch;  /* sends non-zero on success, zero on failure */
-} copy_args_t;
-
-static void copy_fiber(void* arg) {
-    copy_args_t*  ca = arg;
-    copy_state_t* s  = goc_malloc(sizeof(copy_state_t));
-    s->done_ch       = goc_chan_make(0);
-    s->open_req.data = s->read_req.data = s->write_req.data = s->close_req.data = s;
-
-    /* --- Open source ---------------------------------------------------- */
-    uv_fs_open(goc_scheduler(), &s->open_req, ca->src, UV_FS_O_RDONLY, 0, on_open);
-    goc_val_t v = goc_take(s->done_ch);
-    intptr_t fd = (intptr_t)v.val;
-    if (v.ok != GOC_OK || fd < 0) { fprintf(stderr, "open src: %s\n", uv_strerror((int)fd)); goto fail; }
-    s->src_file = (uv_file)fd;
-
-    /* --- Read entire file, racing against a 5-second timeout ------------ */
-    s->iov = uv_buf_init(s->buf, MAX_FILE_SIZE);
-    uv_fs_read(goc_scheduler(), &s->read_req, s->src_file, &s->iov, 1, 0, on_read);
-
-    goc_alt_op ops[] = {
-        { .ch = s->done_ch,        .op_kind = GOC_ALT_TAKE },  /* arm 0: read finished */
-        { .ch = goc_timeout(5000), .op_kind = GOC_ALT_TAKE },  /* arm 1: 5 s deadline  */
-    };
-    goc_alts_result r = goc_alts(ops, 2);
-
-    if (r.index == 1) { fprintf(stderr, "read timed out\n"); goto fail; }
-    s->nbytes = (ssize_t)(intptr_t)r.value.val;
-    if (r.value.ok != GOC_OK || s->nbytes < 0) { fprintf(stderr, "read: %s\n", uv_strerror((int)s->nbytes)); goto fail; }
-
-    uv_fs_close(goc_scheduler(), &s->close_req, s->src_file, on_close);
-
-    /* --- Open destination and write ------------------------------------- */
-    uv_fs_open(goc_scheduler(), &s->open_req, ca->dst,
-               UV_FS_O_WRONLY | UV_FS_O_CREAT | UV_FS_O_TRUNC, 0644, on_open);
-    v  = goc_take(s->done_ch);
-    fd = (intptr_t)v.val;
-    if (v.ok != GOC_OK || fd < 0) { fprintf(stderr, "open dst: %s\n", uv_strerror((int)fd)); goto fail; }
-    s->dst_file = (uv_file)fd;
-
-    s->iov = uv_buf_init(s->buf, (size_t)s->nbytes);
-    uv_fs_write(goc_scheduler(), &s->write_req, s->dst_file, &s->iov, 1, 0, on_write);
-    goc_val_t wv     = goc_take(s->done_ch);
-    intptr_t written = (intptr_t)wv.val;
-    uv_fs_close(goc_scheduler(), &s->close_req, s->dst_file, on_close);
-
-    if (wv.ok != GOC_OK || written != s->nbytes) { fprintf(stderr, "short write\n"); goto fail; }
-
-    goc_put(ca->result_ch, (void*)(intptr_t)1);
-    return;
-
-fail:
-    goc_put(ca->result_ch, (void*)(intptr_t)0);
+    goc_val_t v;
+    while ((v = goc_take(a->recv)).ok == GOC_OK) {
+        int count = (int)(intptr_t)v.val;
+        printf("%s %d\n", a->name, count);
+        if (count >= N_ROUNDS) {
+            goc_close(a->send);
+            return;
+        }
+        goc_put(a->send, (void*)(intptr_t)(count + 1));
+    }
 }
 
-/* =========================================================================
- * main
- * ========================================================================= */
-int main(int argc, char** argv) {
-    if (argc != 3) { fprintf(stderr, "usage: copy <src> <dst>\n"); return 1; }
-
+int main(void) {
     goc_init();
 
-    goc_chan*   result_ch = goc_chan_make(0);
-    copy_args_t ca = { .src = argv[1], .dst = argv[2], .result_ch = result_ch };
-    goc_go(copy_fiber, &ca);
+    goc_chan* a_to_b = goc_chan_make(0);
+    goc_chan* b_to_a = goc_chan_make(0);
 
-    /* goc_take_sync blocks the main OS thread (not a fiber). */
-    goc_val_t result = goc_take_sync(result_ch);
-    bool ok = (result.ok == GOC_OK) && (int)(intptr_t)result.val;
-    printf("copy %s\n", ok ? "succeeded" : "failed");
+    player_args_t ping_args = { .recv = b_to_a, .send = a_to_b, .name = "ping" };
+    player_args_t pong_args = { .recv = a_to_b, .send = b_to_a, .name = "pong" };
+
+    goc_chan* done_ping = goc_go(player, &ping_args);
+    goc_chan* done_pong = goc_go(player, &pong_args);
+
+    /* Kick off the exchange with the first message. */
+    goc_put_sync(a_to_b, (void*)(intptr_t)1);
+
+    /* Wait for both fibers to finish. */
+    goc_take_sync(done_ping);
+    goc_take_sync(done_pong);
 
     goc_shutdown();
-    return ok ? 0 : 1;
+    return 0;
 }
 ```
 
 **What this example demonstrates:**
 
-- `goc_scheduler()` — registers `uv_fs_t` handles on the runtime's event loop
-  for non-blocking file I/O without a second loop.
-- `goc_put_cb` — the uv loop thread wakes the copy fiber after each async
-  operation without ever blocking the event loop.
-- `goc_alts` + `goc_timeout` — the read result races a 5-second deadline;
-  a stalled disk is detected and reported rather than hanging indefinitely.
-- `goc_val_t` — `.ok` is checked after every take to distinguish a closed
-  channel from a legitimate `NULL` or zero value.
-- `goc_take` / `goc_take_sync` — `goc_take` is used inside the fiber;
-  `goc_take_sync` blocks the main OS thread outside any fiber.
+- `goc_chan_make(0)` — unbuffered channels enforce a synchronous rendezvous:
+  each `goc_put` blocks until the other fiber calls `goc_take`, and vice versa.
+- `goc_go` — spawns both player fibers on the default pool and returns a join
+  channel that is closed automatically when the fiber returns.
+- `goc_put_sync` — sends the opening message from the main OS thread (outside
+  any fiber) without blocking a pool worker.
+- `goc_close` — when the round limit is reached the active fiber closes the
+  forward channel, causing the partner's next `goc_take` to return
+  `GOC_CLOSED` and exit its loop cleanly.
+- `goc_take_sync` — blocks the main thread until each join channel is closed,
+  providing a simple, channel-based join without extra synchronisation.
 
 ---
 
@@ -651,6 +587,8 @@ int main(void) {
 ---
 
 ## Building and Testing
+
+libgoc ships with a comprehensive, phased test suite covering the full public API. See the [Testing section in the Design Doc](./DESIGN.md#testing) for a breakdown of the test phases and what each one covers.
 
 ### Prerequisites
 
