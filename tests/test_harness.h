@@ -5,11 +5,12 @@
  *   - Result counters and TEST_BEGIN / ASSERT / TEST_PASS / TEST_FAIL macros
  *     (identical to the previously duplicated harness in each test file).
  *   - install_crash_handler() — registers a SIGSEGV / SIGABRT signal handler
- *     that prints a backtrace to stderr via backtrace_symbols_fd() and
- *     re-raises the signal so the process exits with the correct status.
+ *     that (on Linux/macOS) prints a backtrace to stderr via
+ *     backtrace_symbols_fd() and re-raises the signal; on Windows a simpler
+ *     handler using signal() prints the signal number and re-raises.
  *     Call once at the top of main() before goc_init().
  *
- * Design notes:
+ * Design notes (POSIX path):
  *   backtrace() / backtrace_symbols_fd() are async-signal-safe on glibc and
  *   write directly to a file descriptor, making them safe to call from a
  *   signal handler.  The output goes to stderr (fd 2) so it is captured by
@@ -23,18 +24,30 @@
  * Compile requirements: -g -rdynamic (or -fno-omit-frame-pointer)
  *   CMakeLists.txt builds with RelWithDebInfo which includes -g.
  *   -rdynamic must be added to test executables for symbol names to appear
- *   in the backtrace; see CMakeLists.txt.
+ *   in the backtrace on Linux; see CMakeLists.txt.
  */
 
 #ifndef GOC_TEST_HARNESS_H
 #define GOC_TEST_HARNESS_H
 
-#define _GNU_SOURCE
+#if !defined(_WIN32) && !defined(__APPLE__)
+#  define _GNU_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
-#include <execinfo.h>
-#include <unistd.h>
+
+#if !defined(_WIN32)
+#  include <unistd.h>
+#endif
+
+#if defined(__has_include)
+#  if __has_include(<execinfo.h>)
+#    include <execinfo.h>
+#    define GOC_HAVE_EXECINFO 1
+#  endif
+#endif
 
 /* =========================================================================
  * Result counters
@@ -85,18 +98,36 @@ static int g_tests_failed = 0;
         goto done;                                              \
     } while (0)
 
+/* TEST_SKIP — mark a test as skipped (not run on this platform). */
+#define TEST_SKIP(reason)                                       \
+    do {                                                        \
+        printf("skip (%s)\n", (reason));                        \
+        g_tests_run--;                                          \
+        goto done;                                              \
+    } while (0)
+
 /* =========================================================================
  * Crash handler
  * ====================================================================== */
 
+#if !defined(_WIN32) && defined(GOC_HAVE_EXECINFO)
+
+/* POSIX + glibc: full backtrace via execinfo */
+
 #define GOC_BACKTRACE_MAX 64
 
 static void crash_handler(int sig) {
-    void*  frames[GOC_BACKTRACE_MAX];
-    int    n;
+    void* frames[GOC_BACKTRACE_MAX];
+    int   n;
 
-    /* Write a header to stderr.  dprintf is async-signal-safe. */
+    /* Write a header to stderr.  dprintf is async-signal-safe on Linux.
+     * On non-Linux POSIX (e.g. macOS) fprintf is used; it is not
+     * async-signal-safe but works in practice for crash diagnostics. */
+#if defined(__linux__)
     dprintf(STDERR_FILENO, "\n*** signal %d — backtrace ***\n", sig);
+#else
+    fprintf(stderr, "\n*** signal %d — backtrace ***\n", sig);
+#endif
 
     n = backtrace(frames, GOC_BACKTRACE_MAX);
     backtrace_symbols_fd(frames, n, STDERR_FILENO);
@@ -109,19 +140,31 @@ static void crash_handler(int sig) {
     raise(sig);
 }
 
-/*
- * install_crash_handler — register crash_handler for SIGSEGV and SIGABRT.
- * Call once at the top of main(), before goc_init().
- */
 static inline void install_crash_handler(void) {
     struct sigaction sa;
     sa.sa_handler = crash_handler;
     sigemptyset(&sa.sa_mask);
-    /* SA_RESETHAND: restore default after first invocation (belt-and-braces,
-     * since we also restore manually inside the handler). */
+    /* SA_RESETHAND: restore default after first invocation. */
     sa.sa_flags = SA_RESETHAND;
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGABRT, &sa, NULL);
 }
+
+#else  /* _WIN32 or no execinfo — portable fallback */
+
+/* Simple handler: print signal number and re-raise with default. */
+static void crash_handler(int sig) {
+    fprintf(stderr, "\n*** signal %d ***\n", sig);
+    fflush(stderr);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static inline void install_crash_handler(void) {
+    signal(SIGSEGV, crash_handler);
+    signal(SIGABRT, crash_handler);
+}
+
+#endif /* crash handler */
 
 #endif /* GOC_TEST_HARNESS_H */

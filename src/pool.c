@@ -324,7 +324,7 @@ goc_pool* goc_pool_make(size_t threads) {
     pool->threads = malloc(threads * sizeof(pthread_t));
 
     for (size_t i = 0; i < threads; i++) {
-        GC_pthread_create(&pool->threads[i], NULL, pool_worker_fn, pool);
+        gc_pthread_create(&pool->threads[i], NULL, pool_worker_fn, pool);
     }
 
     registry_add(pool);
@@ -359,7 +359,7 @@ void goc_pool_destroy(goc_pool* pool) {
 
     /* 4. Reap worker threads. */
     for (size_t i = 0; i < pool->thread_count; i++) {
-        GC_pthread_join(pool->threads[i], NULL);
+        gc_pthread_join(pool->threads[i], NULL);
     }
 
     /* 5. Destroy synchronisation primitives. */
@@ -430,7 +430,11 @@ goc_drain_result_t goc_pool_destroy_timeout(goc_pool* pool, uint64_t ms) {
     }
 
     for (size_t i = 0; i < pool->thread_count; i++) {
+#ifndef _WIN32
         GC_pthread_join(pool->threads[i], NULL);
+#else
+        pthread_join(pool->threads[i], NULL);
+#endif
     }
 
     uv_sem_destroy(&pool->work_sem);

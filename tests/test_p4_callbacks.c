@@ -17,18 +17,18 @@
  *   - Boehm GC        — must be the threaded variant (bdw-gc-threaded);
  *                        initialised internally by goc_init()
  *   - libuv           — event loop; drives callback delivery
- *   - POSIX semaphores — used by done_t to synchronise callbacks back to the
- *                        main test thread
+ *   - pthreads (mutex + condvar for done_t) — used to synchronise callbacks
+ *                        back to the main test thread
  *
  * Synchronisation helper — done_t:
- *   A thin wrapper around a POSIX sem_t.  Callbacks run on the libuv loop
+ *   A portable mutex+condvar semaphore.  Callbacks run on the libuv loop
  *   thread; done_t lets the main thread block until a callback has fired.
- *   Using a semaphore avoids depending on the channel machinery under test.
+ *   Using mutex+condvar avoids depending on the channel machinery under test.
  *
- *     done_init(&d)    — initialise the semaphore to 0
- *     done_signal(&d)  — post (increment) — called inside the callback
- *     done_wait(&d)    — wait (decrement) — called by the test thread
- *     done_destroy(&d) — destroy the semaphore
+ *     done_init(&d)    — initialise the mutex and condvar
+ *     done_signal(&d)  — set flag and signal — called inside the callback
+ *     done_wait(&d)    — wait until flag is set — called by the test thread
+ *     done_destroy(&d) — destroy the mutex and condvar
  *
  * Test coverage (Phase 4 — Callbacks):
  *
@@ -53,7 +53,7 @@
  *   - The test harness uses the same goto-based cleanup pattern as earlier
  *     phases; see the harness section comments for details.
  *   - Callbacks must be short and non-blocking (they run on the loop thread).
- *     Each callback sets a result field and posts a semaphore; the main thread
+ *     Each callback sets a result field and signals done_t; the main thread
  *     performs all ASSERTs after done_wait() returns.
  */
 
@@ -61,26 +61,48 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
-#include <semaphore.h>
+#include <pthread.h>
 
 #include "test_harness.h"
 #include "goc.h"
 
 /* =========================================================================
- * done_t — lightweight callback-to-main synchronisation via POSIX semaphore
+ * done_t — lightweight callback-to-main synchronisation via mutex + condvar
  *
  * Callbacks are delivered on the libuv loop thread, which is separate from
- * both the pool threads and the main test thread.  A raw semaphore lets the
- * main thread block until the callback has fired, without depending on any
- * goc_chan, goc_put, or goc_take behaviour that is itself under test.
+ * both the pool threads and the main test thread.  A portable mutex+condvar
+ * lets the main thread block until the callback has fired, without depending
+ * on any goc_chan, goc_put, or goc_take behaviour that is itself under test.
  * ====================================================================== */
 
-typedef struct { sem_t sem; } done_t;
+typedef struct {
+    pthread_mutex_t mtx;
+    pthread_cond_t  cond;
+    int             flag;
+} done_t;
 
-static void done_init(done_t* d)    { sem_init(&d->sem, 0, 0); }
-static void done_signal(done_t* d)  { sem_post(&d->sem); }
-static void done_wait(done_t* d)    { sem_wait(&d->sem); }
-static void done_destroy(done_t* d) { sem_destroy(&d->sem); }
+static void done_init(done_t* d) {
+    pthread_mutex_init(&d->mtx, NULL);
+    pthread_cond_init(&d->cond, NULL);
+    d->flag = 0;
+}
+static void done_signal(done_t* d) {
+    pthread_mutex_lock(&d->mtx);
+    d->flag = 1;
+    pthread_cond_signal(&d->cond);
+    pthread_mutex_unlock(&d->mtx);
+}
+static void done_wait(done_t* d) {
+    pthread_mutex_lock(&d->mtx);
+    while (!d->flag)
+        pthread_cond_wait(&d->cond, &d->mtx);
+    d->flag = 0;
+    pthread_mutex_unlock(&d->mtx);
+}
+static void done_destroy(done_t* d) {
+    pthread_mutex_destroy(&d->mtx);
+    pthread_cond_destroy(&d->cond);
+}
 
 /* =========================================================================
  * Phase 4 — Callbacks

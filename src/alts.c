@@ -11,7 +11,7 @@
  *   Phase 3 — Prepare park: allocate entries and the shared fired flag.
  *   Phase 4 — Acquire channel locks in ascending pointer order.
  *   Phase 5 — Re-scan under locks; return immediately if any arm fires.
- *   Phase 6 — Enqueue all entries and yield / sem_wait.
+ *   Phase 6 — Enqueue all entries and yield / goc_sync_wait.
  *   Phase 7 — On resume: cancel losers, extract winner, return result.
  */
 
@@ -19,7 +19,6 @@
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <assert.h>
-#include <semaphore.h>
 #include <uv.h>
 #include <gc.h>
 #include "minicoro.h"
@@ -27,14 +26,20 @@
 #include "channel_internal.h"
 
 /* -------------------------------------------------------------------------
- * alts_rand_seed
+ * alts_rand_seed / alts_lcg_rand
  *
- * Per-call seed for rand_r(). Using a global atomic counter avoids the
- * thread-safety problem with rand() (which shares global state) while
- * keeping the implementation simple. The shuffle is for starvation
- * avoidance, not security, so the quality of the PRNG is unimportant.
+ * Portable per-call PRNG that replaces POSIX rand_r().  Using a global
+ * atomic counter avoids the thread-safety problem with rand() (which shares
+ * global state) while keeping the implementation simple.  The shuffle is for
+ * starvation avoidance, not security, so LCG quality is perfectly adequate.
  * ------------------------------------------------------------------------- */
 static _Atomic unsigned int g_alts_rand_seed = 1;
+
+/* glibc-style LCG — same constants and bit-width as glibc rand(). */
+static unsigned int alts_lcg_rand(unsigned int *state) {
+    *state = *state * 1103515245u + 12345u;
+    return (*state >> 16u) & 0x7fffffffu;
+}
 
 /* -------------------------------------------------------------------------
  * alts_shuffle
@@ -44,13 +49,10 @@ static _Atomic unsigned int g_alts_rand_seed = 1;
  * ------------------------------------------------------------------------- */
 static void alts_shuffle(size_t *indices, size_t n) {
     if (n < 2) return;
-    /* rand_r() with a per-call seed snapshot is thread-safe. The seed is an
-     * atomic counter rather than per-fiber state; collisions between threads
-     * merely reduce shuffle variety, which is acceptable for fairness. */
     unsigned int seed = atomic_fetch_add_explicit(&g_alts_rand_seed, 1,
                                                   memory_order_relaxed);
     for (size_t i = n - 1; i > 0; i--) {
-        size_t j = (size_t)rand_r(&seed) % (i + 1);
+        size_t j = (size_t)alts_lcg_rand(&seed) % (i + 1);
         size_t tmp = indices[i];
         indices[i] = indices[j];
         indices[j] = tmp;
@@ -395,8 +397,8 @@ goc_alts_result goc_alts(goc_alt_op *ops, size_t n) {
  *
  * Same seven-phase protocol as goc_alts, but:
  *   - Must not run in fiber context.
- *   - Entries use GOC_SYNC and share a single semaphore on the OS stack.
- *   - Yield is replaced by sem_wait; sem_destroy is called after.
+ *   - Entries use GOC_SYNC and share a single goc_sync_t on the OS stack.
+ *   - Yield is replaced by goc_sync_wait; goc_sync_destroy is called after.
  * ------------------------------------------------------------------------- */
 goc_alts_result goc_alts_sync(goc_alt_op *ops, size_t n) {
     if (mco_running() != NULL) {
@@ -485,8 +487,8 @@ goc_alts_result goc_alts_sync(goc_alt_op *ops, size_t n) {
     /* ------------------------------------------------------------------ */
     /* Phase 3 — Prepare park (SYNC variant)                              */
     /* ------------------------------------------------------------------ */
-    sem_t shared_sem;
-    sem_init(&shared_sem, 0, 0);
+    goc_sync_t shared_sync;
+    goc_sync_init(&shared_sync);
 
     goc_entry **entries    = goc_malloc(n_nondefault * sizeof(goc_entry *));
     _Atomic int *fired_flag = goc_malloc(sizeof(_Atomic int));
@@ -506,7 +508,7 @@ goc_alts_result goc_alts_sync(goc_alt_op *ops, size_t n) {
         e->stack_canary_ptr = NULL;
         e->ok               = GOC_CLOSED;
         e->arm_idx          = i;
-        e->sync_sem_ptr     = &shared_sem;
+        e->sync_sem_ptr     = &shared_sync;
 
         if (ops[i].op_kind == GOC_ALT_TAKE) {
             e->result_slot = &e->cb_result;
@@ -560,7 +562,7 @@ goc_alts_result goc_alts_sync(goc_alt_op *ops, size_t n) {
                 for (size_t j = n_unique; j-- > 0; )
                     uv_mutex_unlock(sorted_chans[j]->lock);
                 if (n > GOC_ALTS_STACK_THRESHOLD) free(sorted_chans);
-                sem_destroy(&shared_sem);
+                goc_sync_destroy(&shared_sync);
                 return (goc_alts_result){ .index = i,
                                           .value = { .val = val, .ok = GOC_OK } };
             }
@@ -568,7 +570,7 @@ goc_alts_result goc_alts_sync(goc_alt_op *ops, size_t n) {
                 for (size_t j = n_unique; j-- > 0; )
                     uv_mutex_unlock(sorted_chans[j]->lock);
                 if (n > GOC_ALTS_STACK_THRESHOLD) free(sorted_chans);
-                sem_destroy(&shared_sem);
+                goc_sync_destroy(&shared_sync);
                 return (goc_alts_result){ .index = i,
                                           .value = { .val = val, .ok = GOC_OK } };
             }
@@ -576,7 +578,7 @@ goc_alts_result goc_alts_sync(goc_alt_op *ops, size_t n) {
                 for (size_t j = n_unique; j-- > 0; )
                     uv_mutex_unlock(sorted_chans[j]->lock);
                 if (n > GOC_ALTS_STACK_THRESHOLD) free(sorted_chans);
-                sem_destroy(&shared_sem);
+                goc_sync_destroy(&shared_sync);
                 return (goc_alts_result){ .index = i,
                                           .value = { .val = NULL, .ok = GOC_CLOSED } };
             }
@@ -586,7 +588,7 @@ goc_alts_result goc_alts_sync(goc_alt_op *ops, size_t n) {
                 for (size_t j = n_unique; j-- > 0; )
                     uv_mutex_unlock(sorted_chans[j]->lock);
                 if (n > GOC_ALTS_STACK_THRESHOLD) free(sorted_chans);
-                sem_destroy(&shared_sem);
+                goc_sync_destroy(&shared_sync);
                 return (goc_alts_result){ .index = i,
                                           .value = { .val = NULL, .ok = GOC_CLOSED } };
             }
@@ -594,7 +596,7 @@ goc_alts_result goc_alts_sync(goc_alt_op *ops, size_t n) {
                 for (size_t j = n_unique; j-- > 0; )
                     uv_mutex_unlock(sorted_chans[j]->lock);
                 if (n > GOC_ALTS_STACK_THRESHOLD) free(sorted_chans);
-                sem_destroy(&shared_sem);
+                goc_sync_destroy(&shared_sync);
                 return (goc_alts_result){ .index = i,
                                           .value = { .val = NULL, .ok = GOC_OK } };
             }
@@ -602,7 +604,7 @@ goc_alts_result goc_alts_sync(goc_alt_op *ops, size_t n) {
                 for (size_t j = n_unique; j-- > 0; )
                     uv_mutex_unlock(sorted_chans[j]->lock);
                 if (n > GOC_ALTS_STACK_THRESHOLD) free(sorted_chans);
-                sem_destroy(&shared_sem);
+                goc_sync_destroy(&shared_sync);
                 return (goc_alts_result){ .index = i,
                                           .value = { .val = NULL, .ok = GOC_OK } };
             }
@@ -635,19 +637,19 @@ goc_alts_result goc_alts_sync(goc_alt_op *ops, size_t n) {
     if (n > GOC_ALTS_STACK_THRESHOLD) free(sorted_chans);
 
     /* Block the OS thread until a channel fires. */
-    sem_wait(&shared_sem);
+    goc_sync_wait(&shared_sync);
 
     /* ------------------------------------------------------------------ */
     /* Phase 7 — After wake                                                */
     /* ------------------------------------------------------------------ */
 
     /*
-     * sem_destroy is safe here: wake() wins the woken CAS and completes
-     * sem_post before any other code path can post on shared_sem.  All
+     * goc_sync_destroy is safe here: wake() wins the woken CAS and completes
+     * goc_sync_post before any other code path can post on shared_sync.  All
      * losing entries either have cancelled set or lost the woken CAS, so
-     * no further sem_post on shared_sem will occur.
+     * no further goc_sync_post on shared_sync will occur.
      */
-    sem_destroy(&shared_sem);
+    goc_sync_destroy(&shared_sync);
 
     /* Cancel losers; locate winner. */
     goc_entry *winner = NULL;

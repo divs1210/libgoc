@@ -62,7 +62,18 @@ function(goc_configure_target target_name)
         PRIVATE src
                 vendor/minicoro
     )
-    target_compile_definitions(${target_name} PRIVATE GC_THREADS)
+    # GC_THREADS: enable bdwgc multi-thread support on all platforms.
+    # GC_PTHREADS: on POSIX this activates gc_pthread_redirects.h so that
+    # GC_pthread_create / GC_pthread_join are declared and defined.  On
+    # Windows, bdwgc (MSYS2 UCRT64) is compiled with Win32 threads and does
+    # not provide those symbols, so GC_PTHREADS must be omitted there;
+    # Windows threads are registered with the GC manually via
+    # GC_register_my_thread / GC_unregister_my_thread instead.
+    if(WIN32)
+        target_compile_definitions(${target_name} PRIVATE GC_THREADS)
+    else()
+        target_compile_definitions(${target_name} PRIVATE GC_THREADS GC_PTHREADS)
+    endif()
     target_link_libraries(${target_name}
         PUBLIC
             PkgConfig::LIBUV
@@ -73,7 +84,7 @@ endfunction()
 # minicoro.c must NOT be compiled with -DGC_THREADS.
 # Set globally before any add_library so it applies to all targets that
 # include this source file. Does not require TARGET_DIRECTORY (CMake 3.26+).
-set_source_files_properties(src/minicoro.c PROPERTIES COMPILE_OPTIONS "-UGC_THREADS")
+set_source_files_properties(src/minicoro.c PROPERTIES COMPILE_OPTIONS "-UGC_THREADS;-UGC_PTHREADS")
 
 # ---------------------------------------------------------------------------
 # Primary static library: goc

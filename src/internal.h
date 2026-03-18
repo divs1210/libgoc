@@ -13,12 +13,56 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdatomic.h>
-#include <semaphore.h>
+#include <pthread.h>
 #include <uv.h>
 #include <gc.h>
 #include "minicoro.h"
 #include "../include/goc.h"
 #include "config.h"
+
+/* ---------------------------------------------------------------------------
+ * goc_sync_t — portable binary semaphore (mutex + condvar)
+ *
+ * Replaces sem_t for the GOC_SYNC blocking path in goc_take_sync,
+ * goc_put_sync, and goc_alts_sync.  sem_init for unnamed POSIX semaphores
+ * returns ENOSYS on macOS (they are not supported), making sem_wait return
+ * EINVAL immediately and silently corrupting every sync call on macOS.
+ * pthread_cond_wait works correctly on Linux, macOS, and Windows (MSYS2).
+ *
+ * Semantics: single-use binary semaphore.  goc_sync_post may be called before
+ * or after goc_sync_wait; if post fires first, wait returns immediately.
+ * --------------------------------------------------------------------------- */
+
+typedef struct {
+    pthread_mutex_t mtx;
+    pthread_cond_t  cond;
+    int             ready;
+} goc_sync_t;
+
+static inline void goc_sync_init(goc_sync_t* s) {
+    pthread_mutex_init(&s->mtx, NULL);
+    pthread_cond_init(&s->cond, NULL);
+    s->ready = 0;
+}
+
+static inline void goc_sync_post(goc_sync_t* s) {
+    pthread_mutex_lock(&s->mtx);
+    s->ready = 1;
+    pthread_cond_signal(&s->cond);
+    pthread_mutex_unlock(&s->mtx);
+}
+
+static inline void goc_sync_wait(goc_sync_t* s) {
+    pthread_mutex_lock(&s->mtx);
+    while (!s->ready)
+        pthread_cond_wait(&s->cond, &s->mtx);
+    pthread_mutex_unlock(&s->mtx);
+}
+
+static inline void goc_sync_destroy(goc_sync_t* s) {
+    pthread_mutex_destroy(&s->mtx);
+    pthread_cond_destroy(&s->cond);
+}
 
 /* ---------------------------------------------------------------------------
  * Forward Declarations
@@ -77,8 +121,8 @@ struct goc_entry {
     void*              put_val;     /* value the putter wants to send */
 
     /* Sync fields (GOC_SYNC) */
-    sem_t              sync_sem;
-    sem_t*             sync_sem_ptr;   /* points to sync_sem (own) or a shared sem in goc_alts_sync */
+    goc_sync_t         sync_obj;
+    goc_sync_t*        sync_sem_ptr;   /* points to sync_obj (own) or a shared goc_sync_t in goc_alts_sync */
 };
 
 /* ---------------------------------------------------------------------------
@@ -126,5 +170,33 @@ extern _Atomic(uv_async_t*)  g_wakeup;
 
 /* Defined in fiber.c */
 extern goc_pool*             g_default_pool;
+
+/* ---------------------------------------------------------------------------
+ * Portable GC-aware pthread wrappers
+ *
+ * Use gc_pthread_create / gc_pthread_join everywhere in libgoc instead of
+ * calling GC_pthread_create / pthread_create directly.
+ *
+ * On POSIX (Linux / macOS): simple aliases for GC_pthread_create /
+ * GC_pthread_join, which register the new thread with Boehm GC automatically
+ * via GC_call_with_stack_base.  Threads must NOT call GC_register_my_thread
+ * manually on POSIX — doing so double-registers the thread and corrupts the
+ * GC's internal thread table.
+ *
+ * On Windows (MSYS2 UCRT64): bdwgc is compiled with Win32 threads and does
+ * not provide GC_pthread_create.  gc_pthread_create uses a generic trampoline
+ * that calls GC_register_my_thread before the thread body and
+ * GC_unregister_my_thread after it exits.  GC_allow_register_threads() must
+ * have been called first — goc_init() does this.
+ * --------------------------------------------------------------------------- */
+
+#ifdef _WIN32
+int gc_pthread_create(pthread_t* t, const pthread_attr_t* a,
+                      void* (*fn)(void*), void* arg);
+int gc_pthread_join(pthread_t t, void** retval);
+#else
+#  define gc_pthread_create  GC_pthread_create
+#  define gc_pthread_join    GC_pthread_join
+#endif
 
 #endif /* GOC_INTERNAL_H */

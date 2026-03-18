@@ -18,18 +18,18 @@
  *   - Boehm GC        — must be the threaded variant (bdw-gc-threaded);
  *                        initialised internally by goc_init()
  *   - libuv           — event loop; drives fiber scheduling and timers
- *   - POSIX semaphores — used by the done_t helper (see below)
+ *   - pthreads (mutex + condvar for done_t) — see below
  *
  * Synchronisation helper — done_t:
- *   A thin wrapper around a POSIX sem_t that lets the main thread (or a waiter
- *   fiber) block until a fiber signals completion.  Using a semaphore avoids
+ *   A portable mutex+condvar semaphore that lets the main thread (or a waiter
+ *   fiber) block until a fiber signals completion.  Using mutex+condvar avoids
  *   the need for a goc_chan in tests that are themselves exercising channel
  *   behaviour, keeping each test self-contained.
  *
- *     done_init(&d)    — initialise the semaphore to 0
- *     done_signal(&d)  — post (increment) — called by the fiber on exit
- *     done_wait(&d)    — wait (decrement) — called by the test thread
- *     done_destroy(&d) — destroy the semaphore
+ *     done_init(&d)    — initialise the mutex and condvar
+ *     done_signal(&d)  — set flag and signal — called by the fiber on exit
+ *     done_wait(&d)    — wait until flag is set — called by the test thread
+ *     done_destroy(&d) — destroy the mutex and condvar
  *
  * Test coverage (Phase 7 — Integration):
  *
@@ -56,28 +56,48 @@
 #include <stdbool.h>
 #include <string.h>
 #include <time.h>
-#include <semaphore.h>
-#include <sys/types.h>
-#include <sys/wait.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include "test_harness.h"
 #include "goc.h"
 
 /* =========================================================================
- * done_t — lightweight fiber-to-main synchronisation via POSIX semaphore
+ * done_t — lightweight fiber-to-main synchronisation via mutex + condvar
  *
  * Used throughout Phase 7 to let the main thread block until a target fiber
- * signals completion.  Choosing a raw semaphore rather than a goc_chan keeps
+ * signals completion.  Choosing mutex+condvar rather than a goc_chan keeps
  * each test independent of the channel machinery it is trying to verify.
  * ====================================================================== */
 
-typedef struct { sem_t sem; } done_t;
+typedef struct {
+    pthread_mutex_t mtx;
+    pthread_cond_t  cond;
+    int             flag;
+} done_t;
 
-static void done_init(done_t* d)    { sem_init(&d->sem, 0, 0); }
-static void done_signal(done_t* d)  { sem_post(&d->sem); }
-static void done_wait(done_t* d)    { sem_wait(&d->sem); }
-static void done_destroy(done_t* d) { sem_destroy(&d->sem); }
+static void done_init(done_t* d) {
+    pthread_mutex_init(&d->mtx, NULL);
+    pthread_cond_init(&d->cond, NULL);
+    d->flag = 0;
+}
+static void done_signal(done_t* d) {
+    pthread_mutex_lock(&d->mtx);
+    d->flag = 1;
+    pthread_cond_signal(&d->cond);
+    pthread_mutex_unlock(&d->mtx);
+}
+static void done_wait(done_t* d) {
+    pthread_mutex_lock(&d->mtx);
+    while (!d->flag)
+        pthread_cond_wait(&d->cond, &d->mtx);
+    d->flag = 0;
+    pthread_mutex_unlock(&d->mtx);
+}
+static void done_destroy(done_t* d) {
+    pthread_mutex_destroy(&d->mtx);
+    pthread_cond_destroy(&d->cond);
+}
 
 /* =========================================================================
  * Phase 7 — Integration
@@ -561,24 +581,29 @@ static void test_p7_5(void) {
     };
     goc_alts_result r = goc_alts_sync(ops, 2);
 
+    /* Close result_ch unconditionally — ensures that any fiber still parked
+     * as a putter (e.g., the fast fiber if the timeout won on a slow runner)
+     * receives GOC_CLOSED and exits cleanly regardless of which alts arm won.
+     * goc_close is idempotent; calling it again after the normal path is safe. */
+    goc_close(result_ch);
+
+    /* Drain all fibers before asserting so that goc_shutdown never waits on
+     * a live fiber left behind by an assertion failure jumping to done:.
+     * goc_take_sync blocks until each fiber's join channel is closed (i.e.,
+     * the fiber has returned and fiber_trampoline has called goc_close). */
+    goc_take_sync(fast_join);
+    goc_take_sync(slow_join);
+
+    /* Drain the timeout channel: the libuv timer fires at ~P7_5_TIMEOUT_MS ms
+     * from creation; by the time we reach here both worker fibers have already
+     * completed, so the timer has almost certainly fired.  If not, this call
+     * parks briefly until it does. */
+    goc_take_sync(tch);
+
     /* The fast fiber must have won: correct index and value. */
     ASSERT(r.index == 0);
     ASSERT(r.value.ok == GOC_OK);
     ASSERT((uintptr_t)r.value.val == 0xFADE);
-
-    /* Close result_ch so the slow fiber's pending goc_put sees GOC_CLOSED
-     * and exits without hanging. */
-    goc_close(result_ch);
-
-    /* Wait for both fibers to finish; neither must hang. */
-    goc_take_sync(fast_join);
-    goc_take_sync(slow_join);
-
-    /* The timeout channel was created by goc_timeout; its libuv timer will
-     * fire eventually and close tch.  We do not need to close it manually —
-     * goc_shutdown handles cleanup — but we can drain it to confirm it closes
-     * within a reasonable window (avoids a dangling timer warning). */
-    goc_take_sync(tch);
 
     TEST_PASS();
 done:;

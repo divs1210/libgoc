@@ -1,4 +1,5 @@
 [![CI](https://github.com/divs1210/libgoc/actions/workflows/ci.yml/badge.svg)](https://github.com/divs1210/libgoc/actions/workflows/ci.yml)
+[![CD](https://github.com/divs1210/libgoc/actions/workflows/cd.yml/badge.svg)](https://github.com/divs1210/libgoc/actions/workflows/cd.yml)
 
 # libgoc
 > A Go-style CSP concurrency runtime for C: threadpools, stackful coroutines, channels, select, async I/O, and garbage collection in one coherent API.
@@ -14,7 +15,7 @@ The library provides stackful coroutines ("fibers"), channels, a select primitiv
 
 See the [Design Doc](./DESIGN.md) for implementation details and [TODO](./TODO.md) for planned future work.
 
-> **Boehm GC must be compiled with thread support.** libgoc calls `GC_allow_register_threads()` during initialisation. With `-DGC_THREADS` active, the GC's pthread wrapper automatically registers every pool worker thread and the uv loop thread via `GC_call_with_stack_base` — all threads are created with `GC_pthread_create` and must not call `GC_register_my_thread` / `GC_unregister_my_thread` manually, as doing so double-registers the thread and causes a crash. A non-threaded build of the GC (i.e. one built without `--enable-threads`) is missing the required symbols and will crash at runtime. See the per-platform instructions in [Building and Testing](#building-and-testing) for how to satisfy this requirement on each OS.
+**Pre-built static libraries** for Linux (x86-64), macOS (arm64), and Windows (x86-64) are available on the [Releases page](https://github.com/divs1210/libgoc/releases).
 
 **Platform:** Linux, macOS, and Windows.
 
@@ -24,7 +25,7 @@ See the [Design Doc](./DESIGN.md) for implementation details and [TODO](./TODO.m
 |---|---|
 | `minicoro` | fiber suspend/resume (cross-platform; POSIX and Windows) |
 | `libuv` | event loop, timers, cross-thread wakeup |
-| Boehm GC | garbage collection; **must be built with `--enable-threads`**; linked automatically, initialised by `goc_init`; provides `GC_pthread_create` / `GC_pthread_join` wrappers used for libgoc worker and loop threads |
+| Boehm GC | garbage collection; **must be built with POSIX thread support** (`--enable-threads=posix`); linked automatically, initialised by `goc_init` |
 
 > See [minicoro limitations](#minicoro-limitations) in the Public API section for fiber stack constraints.
 
@@ -48,11 +49,12 @@ See the [Design Doc](./DESIGN.md) for implementation details and [TODO](./TODO.m
   - [Channel I/O — non-blocking (any context)](#channel-io--non-blocking-any-context)
   - [Channel I/O — fiber context](#channel-io--fiber-context)
   - [Channel I/O — blocking OS threads](#channel-io--blocking-os-threads)
-  - [RW mutexes](#rw-mutexes)
   - [Select (`goc_alts`)](#select-goc_alts)
   - [Timeout channel](#timeout-channel)
+  - [RW mutexes](#rw-mutexes)
   - [Thread pool](#thread-pool)
   - [Scheduler loop access](#scheduler-loop-access)
+- [Best Practices](#best-practices)
 - [Building and Testing](#building-and-testing)
   - [Prerequisites](#prerequisites)
   - [macOS](#macos)
@@ -468,41 +470,6 @@ if (result.ok == GOC_OK)
 
 ---
 
-### RW mutexes
-
-RW mutexes are channel-backed lock handles:
-
-1. Call `goc_read_lock` or `goc_write_lock` to get a per-acquisition lock channel.
-2. Call `goc_take` / `goc_take_sync` on that channel to wait until the lock is granted.
-3. Call `goc_close` on that lock channel to release the lock.
-
-Readers may hold the lock concurrently. Writers are exclusive. If a writer is queued,
-subsequent readers queue behind it (writer preference) to avoid writer starvation.
-
-| Function | Signature | Description |
-|---|---|---|
-| `goc_mutex_make` | `goc_mutex* goc_mutex_make(void)` | Create a new RW mutex. |
-| `goc_read_lock` | `goc_chan* goc_read_lock(goc_mutex* mx)` | Request a read lock; returns a lock channel to await/close. |
-| `goc_write_lock` | `goc_chan* goc_write_lock(goc_mutex* mx)` | Request a write lock; returns a lock channel to await/close. |
-
-```c
-goc_mutex* mx = goc_mutex_make();
-
-/* Read side */
-goc_chan* r = goc_read_lock(mx);
-goc_take_sync(r);      /* lock acquired */
-/* critical section */
-goc_close(r);          /* release */
-
-/* Write side */
-goc_chan* w = goc_write_lock(mx);
-goc_take_sync(w);      /* lock acquired */
-/* critical section */
-goc_close(w);          /* release */
-```
-
----
-
 ### Select (`goc_alts`)
 
 Non-deterministic choice across multiple channel operations.
@@ -578,6 +545,41 @@ if (r.index == 1)
 
 ---
 
+### RW mutexes
+
+RW mutexes are channel-backed lock handles:
+
+1. Call `goc_read_lock` or `goc_write_lock` to get a per-acquisition lock channel.
+2. Call `goc_take` / `goc_take_sync` on that channel to wait until the lock is granted.
+3. Call `goc_close` on that lock channel to release the lock.
+
+Readers may hold the lock concurrently. Writers are exclusive. If a writer is queued,
+subsequent readers queue behind it (writer preference) to avoid writer starvation.
+
+| Function | Signature | Description |
+|---|---|---|
+| `goc_mutex_make` | `goc_mutex* goc_mutex_make(void)` | Create a new RW mutex. |
+| `goc_read_lock` | `goc_chan* goc_read_lock(goc_mutex* mx)` | Request a read lock; returns a lock channel to await/close. |
+| `goc_write_lock` | `goc_chan* goc_write_lock(goc_mutex* mx)` | Request a write lock; returns a lock channel to await/close. |
+
+```c
+goc_mutex* mx = goc_mutex_make();
+
+/* Read side */
+goc_chan* r = goc_read_lock(mx);
+goc_take_sync(r);      /* lock acquired */
+/* critical section */
+goc_close(r);          /* release */
+
+/* Write side */
+goc_chan* w = goc_write_lock(mx);
+goc_take_sync(w);      /* lock acquired */
+/* critical section */
+goc_close(w);          /* release */
+```
+
+---
+
 ### Thread pool
 
 The default pool is created by `goc_init` with `max(4, hardware_concurrency)` worker threads. This can be overridden by setting the `GOC_POOL_THREADS` environment variable before calling `goc_init`.
@@ -591,7 +593,7 @@ typedef enum {
 
 | Function | Signature | Description |
 |---|---|---|
-| `goc_pool_make` | `goc_pool* goc_pool_make(size_t threads)` | Create a pool with `threads` worker threads. Worker thread registration with Boehm GC is handled automatically via `GC_pthread_create` / `GC_pthread_join` — do not register or unregister threads manually. |
+| `goc_pool_make` | `goc_pool* goc_pool_make(size_t threads)` | Create a pool with `threads` worker threads. Worker thread registration with Boehm GC is handled automatically via `gc_pthread_create` / `gc_pthread_join` (on POSIX: aliases for `GC_pthread_create`/`GC_pthread_join`; on Windows: a trampoline wrapping `GC_register_my_thread`/`GC_unregister_my_thread`) — do not register or unregister threads manually. |
 | `goc_pool_destroy` | `void goc_pool_destroy(goc_pool* pool)` | Wait for all in-flight fibers on the pool to complete naturally, then drain the run queue, join all worker threads, and release pool resources. Blocks indefinitely if any fiber is parked on a channel event that never arrives. Safe to call while fibers are still queued or running — the drain is the synchronisation barrier. **Must not be called from within a worker thread that belongs to `pool`** (including from a fiber running on that pool); that path aborts with a diagnostic message. |
 | `goc_pool_destroy_timeout` | `goc_drain_result_t goc_pool_destroy_timeout(goc_pool* pool, uint64_t ms)` | Like `goc_pool_destroy`, but returns `GOC_DRAIN_OK` if the drain completes within `ms` milliseconds, or `GOC_DRAIN_TIMEOUT` if the timeout expires before all fibers have finished. On timeout the pool is **not** destroyed — worker threads continue running and the pool remains valid. The caller may retry later or take other action (e.g. closing channels to unblock parked fibers, then calling `goc_pool_destroy`). **Must not be called from within a worker thread that belongs to `pool`**; that path aborts with a diagnostic message. |
 
@@ -630,6 +632,38 @@ uv_close((uv_handle_t*)server, on_handle_closed);
 
 ---
 
+## Best Practices
+
+Used the right way, **libgoc** provides a runtime environment very similar to Go's.
+
+**The blocking versions of take/put/alts are intended only for the initial setup in the `main` function, and should not be used otherwise.**
+
+A typical program's main function should be like this:
+
+```c
+int main(void) {
+    goc_init();
+
+    // reify main thread as main fiber
+    goc_chan* join_main_fiber = goc_go(main_fiber, NULL);
+
+    // wait for main fiber to finish
+    goc_take_sync(join_main_fiber);
+
+    goc_shutdown();
+    return 0;
+}
+
+static void main_fiber(void* _ub) {
+    // User code comes here.
+    // Since this is a fiber context,
+    // async channel ops work here
+    // and in all code reachable from here
+}
+```
+
+---
+
 ## Building and Testing
 
 libgoc ships with a comprehensive, phased test suite covering the full public API. See the [Testing section in the Design Doc](./DESIGN.md#testing) for a breakdown of the test phases and what each one covers.
@@ -638,13 +672,13 @@ libgoc ships with a comprehensive, phased test suite covering the full public AP
 
 | Dependency | macOS | Linux (Debian/Ubuntu) | Linux (Fedora/RHEL) | Windows |
 |---|---|---|---|---|
-| CMake ≥ 3.20 | `brew install cmake` | `apt install cmake` | `dnf install cmake` | [cmake.org](https://cmake.org/download/) |
-| libuv | `brew install libuv` | `apt install libuv1-dev` | `dnf install libuv-devel` | vcpkg or source build |
-| Boehm GC | `brew install bdw-gc` | source build (see below) | `dnf install gc-devel` | vcpkg or source build |
-| pkg-config | `brew install pkg-config` | `apt install pkg-config` | `dnf install pkgconfig` | — |
+| CMake ≥ 3.20 | `brew install cmake` | `apt install cmake` | `dnf install cmake` | MSYS2 UCRT64 (bundled) |
+| libuv | `brew install libuv` | `apt install libuv1-dev` | `dnf install libuv-devel` | MSYS2 UCRT64 — see [Windows](#windows) |
+| Boehm GC | `brew install bdw-gc` | source build (see below) | `dnf install gc-devel` | MSYS2 UCRT64 — see [Windows](#windows) |
+| pkg-config | `brew install pkg-config` | `apt install pkg-config` | `dnf install pkgconfig` | MSYS2 UCRT64 (bundled) |
 | minicoro | vendored (submodule); instantiated via `src/minicoro.c` |
 
-A C11 compiler (clang or gcc on POSIX; MSVC or clang-cl on Windows) is required.
+A C11 compiler is required: GCC or Clang on Linux/macOS; MinGW-w64 GCC via MSYS2 UCRT64 on Windows.
 
 **Build configuration constants** (`src/config.h`):
 
@@ -659,11 +693,14 @@ A C11 compiler (clang or gcc on POSIX; MSVC or clang-cl on Windows) is required.
 
 ### macOS
 
-> **Boehm GC:** Homebrew's `bdw-gc` formula is built with thread support unconditionally and ships a `bdw-gc-threaded.pc` pkg-config alias. No extra steps are needed — the `brew install` command below is sufficient.
-
 ```sh
 # 1. Install dependencies (Homebrew)
 brew install cmake libuv bdw-gc pkg-config
+
+# Homebrew's bdw-gc does not ship a bdw-gc-threaded.pc pkg-config alias.
+# Create it once in the global Homebrew pkgconfig directory:
+PKGDIR="$(brew --prefix)/lib/pkgconfig"
+[ -f "$PKGDIR/bdw-gc-threaded.pc" ] || cp "$PKGDIR/bdw-gc.pc" "$PKGDIR/bdw-gc-threaded.pc"
 
 # 2. Configure
 cmake -B build
@@ -724,24 +761,29 @@ ctest --test-dir build --output-on-failure
 
 ### Windows
 
-> **Boehm GC:** vcpkg's `bdw-gc` port is built with `GC_THREADS` enabled. The `vcpkg install` command below is sufficient — no manual source build is required.
+libgoc uses `pthread.h` and C11 `_Atomic` directly. These are not available in MSVC builds or in the Win32-threads build of bdwgc that vcpkg produces. The recommended approach for Windows is **MSYS2/MinGW-w64 (UCRT64)**, which provides a POSIX-compatible GCC toolchain with full C11 support and a bdwgc package built with POSIX thread support.
 
-```bat
-REM 1. Install dependencies via vcpkg (or adjust paths as needed)
-vcpkg install libuv bdw-gc
+```sh
+# 1. Install MSYS2 from https://www.msys2.org/, then in a UCRT64 shell:
+pacman -S mingw-w64-ucrt-x86_64-gcc \
+          mingw-w64-ucrt-x86_64-cmake \
+          mingw-w64-ucrt-x86_64-libuv \
+          mingw-w64-ucrt-x86_64-gc \
+          mingw-w64-ucrt-x86_64-pkg-config
 
-REM 2. Configure (pass vcpkg toolchain if using vcpkg)
-cmake -B build -DCMAKE_TOOLCHAIN_FILE=<vcpkg-root>/scripts/buildsystems/vcpkg.cmake
+# 2. Create the bdw-gc-threaded pkg-config alias if it is missing
+PKGDIR="/ucrt64/lib/pkgconfig"
+[ -f "$PKGDIR/bdw-gc-threaded.pc" ] || cp "$PKGDIR/bdw-gc.pc" "$PKGDIR/bdw-gc-threaded.pc"
 
-REM 3. Build
-cmake --build build --config RelWithDebInfo
+# 3. Configure and build everything (library + tests)
+cmake -B build
+cmake --build build --parallel $(nproc)
 
-REM 4. Run tests
-ctest --test-dir build --output-on-failure -C RelWithDebInfo
-
-REM Or run a single phase directly
-build\RelWithDebInfo\test_p1_foundation.exe
+# 4. Run tests
+ctest --test-dir build --output-on-failure
 ```
+
+> **Tests:** Phases P1–P7 and P9 run normally on Windows. Phase 8 (safety tests) requires `fork()`/`waitpid()` to isolate processes that call `abort()` — these POSIX APIs are not available in MinGW. The P8 test binary builds successfully but all 11 tests report `skip` at runtime.
 
 ---
 

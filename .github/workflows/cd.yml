@@ -1,0 +1,209 @@
+name: CD
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'CMakeLists.txt'
+      - 'vendor/**'
+      - '.github/workflows/cd.yml'
+
+jobs:
+  tag:
+    name: Create Release Tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.create_tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create and push tag
+        id: create_tag
+        run: |
+          TAG=$(date -u +'%Y.%m.%d.%H.%M')
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  build-linux:
+    name: Build (Linux)
+    needs: tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      BDWGC_VERSION: "8.2.6"
+      BDWGC_PREFIX: "${{ github.workspace }}/.local/bdwgc"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install apt dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y libuv1-dev pkg-config build-essential \
+            libatomic-ops-dev
+
+      - name: Cache Boehm GC
+        id: cache-bdwgc
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BDWGC_PREFIX }}
+          key: bdwgc-${{ env.BDWGC_VERSION }}-ubuntu-latest
+
+      - name: Build Boehm GC from source
+        if: steps.cache-bdwgc.outputs.cache-hit != 'true'
+        run: |
+          wget -q https://github.com/ivmai/bdwgc/releases/download/v${{ env.BDWGC_VERSION }}/gc-${{ env.BDWGC_VERSION }}.tar.gz
+          tar xf gc-${{ env.BDWGC_VERSION }}.tar.gz
+          cd gc-${{ env.BDWGC_VERSION }}
+          ./configure --enable-threads=posix --enable-thread-local-alloc \
+                      --enable-shared --prefix=${{ env.BDWGC_PREFIX }}
+          make -j$(nproc)
+          make install
+          cp ${{ env.BDWGC_PREFIX }}/lib/pkgconfig/bdw-gc.pc \
+             ${{ env.BDWGC_PREFIX }}/lib/pkgconfig/bdw-gc-threaded.pc
+
+      - name: Configure Boehm GC
+        run: |
+          echo "${{ env.BDWGC_PREFIX }}/lib" | sudo tee /etc/ld.so.conf.d/bdwgc.conf
+          sudo ldconfig
+
+      - name: Build libgoc
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target goc --parallel $(nproc)
+        env:
+          PKG_CONFIG_PATH: ${{ env.BDWGC_PREFIX }}/lib/pkgconfig
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist
+          cp build/libgoc.a dist/
+          cp include/goc.h dist/
+          cd dist
+          tar czf ../libgoc-linux-x86_64.tar.gz libgoc.a goc.h
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libgoc-linux-x86_64
+          path: libgoc-linux-x86_64.tar.gz
+
+  build-macos:
+    name: Build (macOS)
+    needs: tag
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Homebrew dependencies
+        run: brew install cmake libuv bdw-gc pkg-config
+
+      - name: Set up bdw-gc-threaded pkg-config alias
+        run: |
+          GLOBAL_PKGDIR="$(brew --prefix)/lib/pkgconfig"
+          if [ ! -f "$GLOBAL_PKGDIR/bdw-gc-threaded.pc" ]; then
+            cp "$GLOBAL_PKGDIR/bdw-gc.pc" "$GLOBAL_PKGDIR/bdw-gc-threaded.pc"
+          fi
+
+      - name: Build libgoc
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target goc --parallel $(sysctl -n hw.ncpu)
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist
+          cp build/libgoc.a dist/
+          cp include/goc.h dist/
+          cd dist
+          tar czf ../libgoc-macos-arm64.tar.gz libgoc.a goc.h
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libgoc-macos-arm64
+          path: libgoc-macos-arm64.tar.gz
+
+  build-windows:
+    name: Build (Windows)
+    needs: tag
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-libuv
+            mingw-w64-ucrt-x86_64-gc
+            mingw-w64-ucrt-x86_64-pkg-config
+
+      - name: Set up bdw-gc-threaded pkg-config alias
+        shell: msys2 {0}
+        run: |
+          PKGDIR="/ucrt64/lib/pkgconfig"
+          if [ ! -f "$PKGDIR/bdw-gc-threaded.pc" ]; then
+            cp "$PKGDIR/bdw-gc.pc" "$PKGDIR/bdw-gc-threaded.pc"
+          fi
+
+      - name: Build libgoc
+        shell: msys2 {0}
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target goc --parallel $(nproc)
+        timeout-minutes: 10
+
+      - name: Package artifact
+        shell: msys2 {0}
+        run: |
+          mkdir -p dist
+          cp build/libgoc.a dist/
+          cp include/goc.h dist/
+          cd dist
+          tar czf ../libgoc-windows-x86_64.tar.gz libgoc.a goc.h
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libgoc-windows-x86_64
+          path: libgoc-windows-x86_64.tar.gz
+
+  release:
+    name: Publish GitHub Release
+    needs: [tag, build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.tag.outputs.tag }}
+          name: ${{ needs.tag.outputs.tag }}
+          files: |
+            libgoc-linux-x86_64.tar.gz
+            libgoc-macos-arm64.tar.gz
+            libgoc-windows-x86_64.tar.gz

@@ -18,19 +18,20 @@
  *   - Boehm GC        — must be the threaded variant (bdw-gc-threaded);
  *                        initialised internally by goc_init()
  *   - libuv           — event loop; drives fiber scheduling
- *   - pthreads        — used in P2.3 to race two threads on goc_close()
- *   - POSIX semaphores — used by the done_t helper (see below)
+ *   - pthreads        — used in P2.3 to race two threads on goc_close();
+ *                        mutex + condvar for done_t (see below)
  *
  * Synchronisation helper — done_t:
- *   A thin wrapper around a POSIX sem_t that lets the main thread (or a
- *   waiter fiber) block until a fiber signals completion.  Using a semaphore
- *   avoids the need for a goc_chan in tests that are themselves verifying
- *   channel/fiber behaviour, keeping each test self-contained.
+ *   A portable mutex+condvar semaphore that lets the main thread (or a
+ *   waiter fiber) block until a fiber signals completion.  Using
+ *   mutex+condvar avoids the need for a goc_chan in tests that are
+ *   themselves verifying channel/fiber behaviour, keeping each test
+ *   self-contained.
  *
- *     done_init(&d)    — initialise the semaphore to 0
- *     done_signal(&d)  — post (increment) — called by the fiber on exit
- *     done_wait(&d)    — wait (decrement) — called by the test thread
- *     done_destroy(&d) — destroy the semaphore
+ *     done_init(&d)    — initialise the mutex and condvar
+ *     done_signal(&d)  — set flag and signal — called by the fiber on exit
+ *     done_wait(&d)    — wait until flag is set — called by the test thread
+ *     done_destroy(&d) — destroy the mutex and condvar
  *
  * Test coverage (Phase 2 — Channels and fiber launch):
  *
@@ -64,9 +65,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
-#include <semaphore.h>
-#include <sys/types.h>
-#include <sys/wait.h>
 #include <unistd.h>
 #include <pthread.h>
 
@@ -74,20 +72,42 @@
 #include "goc.h"
 
 /* =========================================================================
- * done_t — lightweight fiber-to-main synchronisation via POSIX semaphore
+ * done_t — lightweight fiber-to-main synchronisation via mutex + condvar
  *
  * Used throughout Phase 2 to let the main thread (or a waiter fiber) block
  * until a target fiber signals that it has completed a particular step.
- * Choosing a raw semaphore rather than a goc_chan keeps each test independent
+ * Choosing mutex+condvar rather than a goc_chan keeps each test independent
  * of the channel machinery it is trying to verify.
  * ====================================================================== */
 
-typedef struct { sem_t sem; } done_t;
+typedef struct {
+    pthread_mutex_t mtx;
+    pthread_cond_t  cond;
+    int             flag;
+} done_t;
 
-static void done_init(done_t* d)   { sem_init(&d->sem, 0, 0); }
-static void done_signal(done_t* d) { sem_post(&d->sem); }
-static void done_wait(done_t* d)   { sem_wait(&d->sem); }
-static void done_destroy(done_t* d){ sem_destroy(&d->sem); }
+static void done_init(done_t* d) {
+    pthread_mutex_init(&d->mtx, NULL);
+    pthread_cond_init(&d->cond, NULL);
+    d->flag = 0;
+}
+static void done_signal(done_t* d) {
+    pthread_mutex_lock(&d->mtx);
+    d->flag = 1;
+    pthread_cond_signal(&d->cond);
+    pthread_mutex_unlock(&d->mtx);
+}
+static void done_wait(done_t* d) {
+    pthread_mutex_lock(&d->mtx);
+    while (!d->flag)
+        pthread_cond_wait(&d->cond, &d->mtx);
+    d->flag = 0;
+    pthread_mutex_unlock(&d->mtx);
+}
+static void done_destroy(done_t* d) {
+    pthread_mutex_destroy(&d->mtx);
+    pthread_cond_destroy(&d->cond);
+}
 
 /* =========================================================================
  * Phase 2 — Channels and fiber launch

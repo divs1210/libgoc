@@ -28,6 +28,7 @@
 17. [Initialization Sequence](#initialization-sequence)
 18. [Shutdown Sequence](#shutdown-sequence)
 19. [Testing](#testing)
+20. [CI/CD](#cicd)
 
 ---
 
@@ -37,7 +38,7 @@
 |---|---|
 | `minicoro` | fiber suspend/resume (cross-platform; POSIX and Windows) |
 | `libuv` | event loop, timers, cross-thread signalling |
-| Boehm GC (bdw-gc) | garbage collection; **must be built with `--enable-threads`**; hard dependency, initialised by `goc_init`; owns thread pool worker creation via `GC_pthread_create` / `GC_pthread_join` |
+| Boehm GC (bdw-gc) | garbage collection; **must be built with `--enable-threads`**; hard dependency, initialised by `goc_init`; thread pool workers and the uv loop thread are registered with the collector on creation and unregistered on exit |
 
 ---
 
@@ -105,7 +106,7 @@ A CMake function `goc_configure_target(<target>)` centralises the options shared
 
 Dependencies are resolved via `pkg-config` (libuv as `libuv`, Boehm GC as `bdw-gc-threaded` — **no fallback**; configure fails loudly if the threaded variant is absent). minicoro is instantiated via `src/minicoro.c` (which defines `MINICORO_IMPL`) and its header is available to all targets via `target_include_directories` pointing at `vendor/minicoro/`.
 
-> **Boehm GC thread registration:** libgoc compiles with `-DGC_THREADS` and requires a Boehm GC built with `--enable-threads` (the `bdw-gc-threaded` pkg-config module). Linking against a non-threaded build causes `GC_INIT()` to malfunction or segfault at runtime; CMake will fail at configure time if the threaded variant is absent. See `README.md` for per-platform installation instructions. At runtime, all threads — pool workers and the uv loop thread — are created via `GC_pthread_create`, which wraps the thread start with `GC_call_with_stack_base` so each thread is automatically registered with the collector. **No thread created by libgoc calls `GC_register_my_thread` / `GC_unregister_my_thread` manually** — doing so double-registers the thread, corrupts the GC's internal thread table, and produces a SIGSEGV inside `GC_call_with_stack_base` on thread startup (observed as a crash during P1.4).
+> **Boehm GC thread registration:** libgoc compiles with `-DGC_THREADS` and requires a Boehm GC built with `--enable-threads` (the `bdw-gc-threaded` pkg-config module). Linking against a non-threaded build causes `GC_INIT()` to malfunction or segfault at runtime; CMake will fail at configure time if the threaded variant is absent. See `README.md` for per-platform installation instructions. All threads are created via `gc_pthread_create` (defined in `src/internal.h`). On POSIX (Linux/macOS), `gc_pthread_create` is an alias for `GC_pthread_create`, which wraps the thread start with `GC_call_with_stack_base` so each thread is automatically registered with the collector; no manual `GC_register_my_thread` call is needed or permitted on POSIX (it would double-register and corrupt the GC's internal thread table). On Windows, bdwgc (MSYS2 UCRT64) is compiled with Win32 threads and does not provide `GC_pthread_create`; `gc_pthread_create` is implemented in `gc.c` as a thin wrapper around `pthread_create` that passes a trampoline (`gc_thread_trampoline`) as the thread entry, which calls `GC_register_my_thread` at startup and `GC_unregister_my_thread` at exit.
 
 Named constants defined in `config.h`:
 - `GOC_PAGE_SIZE`
@@ -224,7 +225,7 @@ Boehm GC (bdw-gc) is a **required link-time dependency**. It is not optional and
 
 `goc_init` must be **the first call in `main()`**, before any other library or application code that could trigger GC allocation. It calls `GC_INIT()` unconditionally as its very first operation, followed immediately by `GC_allow_register_threads()` — `GC_INIT()` performs all one-time GC setup, and `GC_allow_register_threads()` enables multi-thread stack registration. **Callers must not call these functions themselves.**
 
-All threads — pool workers and the uv loop thread — are created via `GC_pthread_create`, which wraps the thread start with `GC_call_with_stack_base` so each thread is automatically registered with the collector before its body executes. No thread must call `GC_register_my_thread` / `GC_unregister_my_thread` manually — doing so double-registers the thread and corrupts the GC's internal thread table.
+On POSIX, pool workers and the uv loop thread are created via `gc_pthread_create`, which on POSIX is an alias for `GC_pthread_create` and registers each thread with the collector automatically. On Windows, `GC_pthread_create` is not available (MSYS2 bdwgc uses Win32 threads); `gc_pthread_create` calls `pthread_create` with a trampoline that manually calls `GC_register_my_thread` at startup and `GC_unregister_my_thread` at exit. On POSIX, threads must **not** call `GC_register_my_thread` manually — `GC_pthread_create` already does it; a duplicate call corrupts the GC's internal thread table.
 
 **`goc_init` must be called exactly once, as the very first call in `main()`, before any other library or application code that could trigger GC allocation. Calling it more than once is undefined behaviour.**
 
@@ -330,11 +331,11 @@ typedef struct goc_entry {
     void*  put_val;                 /* pending value for a parked GOC_CALLBACK putter */
 
     /* GOC_SYNC */
-    sem_t             sync_sem;     /* embedded semaphore for single-entry sync callers */
-    sem_t*            sync_sem_ptr; /* pointer used by wake(); always &sync_sem for plain
+    goc_sync_t        sync_obj;     /* embedded portable condvar for single-entry sync callers */
+    goc_sync_t*       sync_sem_ptr; /* pointer used by wake(); always &sync_obj for plain
                                        goc_take_sync / goc_put_sync; set to a shared stack
-                                       sem for goc_alts_sync arms so all arms post the same
-                                       semaphore without knowing whether it is embedded or shared */
+                                       goc_sync_t for goc_alts_sync arms so all arms post the
+                                       same condvar without knowing whether it is embedded or shared */
 } goc_entry;
 ```
 
@@ -523,7 +524,7 @@ There is exactly one code path for delivering a value to a callback entry: enque
 
 ### `goc_take_sync(ch)` / `goc_put_sync(ch, val)`
 
-Blocking calls for non-fiber threads (e.g. a plain `pthread` that needs to rendezvous with fiber code). Internally parks a semaphore rather than a fiber context; the calling OS thread blocks until a value is available. Calling from a fiber is a runtime invariant violation and aborts with a diagnostic message (use `goc_take`/`goc_put` there). Must not be called from a libuv callback — it would deadlock the event loop.
+Blocking calls for non-fiber threads (e.g. a plain `pthread` that needs to rendezvous with fiber code). Internally parks a `goc_sync_t` (portable mutex + condvar) rather than a fiber context; the calling OS thread blocks until a value is available. Calling from a fiber is a runtime invariant violation and aborts with a diagnostic message (use `goc_take`/`goc_put` there). Must not be called from a libuv callback — it would deadlock the event loop.
 
 `goc_put_sync` flow:
 
@@ -539,10 +540,10 @@ if parked taker:
     deliver value directly, wake taker
     uv_mutex_unlock → return GOC_OK
 else:
-    allocate goc_entry (SYNC), embed semaphore
+    allocate goc_entry (SYNC), init goc_sync_t
     push onto ch->putters
     uv_mutex_unlock
-    sem_wait(entry->sync_sem)   /* block OS thread */
+    goc_sync_wait(&entry->sync_obj)   /* block OS thread */
 
     /* resumes here */
     return entry->ok            /* GOC_OK = delivered, GOC_CLOSED = channel closed */
@@ -582,7 +583,7 @@ void wake(goc_chan* ch, goc_entry* e, void* value) {
     } else {
         /* GOC_SYNC: store result and unblock the waiting OS thread */
         *e->result_slot = value;
-        sem_post(e->sync_sem_ptr);
+        goc_sync_post(e->sync_sem_ptr);
     }
 }
 ```
@@ -717,7 +718,7 @@ runq_pop(q) → goc_entry* or NULL:
     return entry
 ```
 
-All threads — pool workers and the uv loop thread — are created via `GC_pthread_create` and are automatically registered with Boehm GC. No thread calls `GC_register_my_thread` / `GC_unregister_my_thread` manually.
+All threads — pool workers and the uv loop thread — are created via `gc_pthread_create`. On POSIX (Linux/macOS), `gc_pthread_create` is a macro alias for `GC_pthread_create`, which wraps the thread start with `GC_call_with_stack_base` so each thread is automatically registered with the collector; no manual `GC_register_my_thread` / `GC_unregister_my_thread` call is needed or permitted on POSIX. On Windows, `gc_pthread_create` calls `pthread_create` with a trampoline (`gc_thread_trampoline` in `gc.c`) that calls `GC_register_my_thread` at thread start and `GC_unregister_my_thread` at thread exit.
 
 ---
 
@@ -910,9 +911,9 @@ The returned `goc_alts_result.index` is the zero-based index of the winning arm.
 4. **Acquire channel locks in ascending pointer-address order** to prevent deadlock when multiple channels are locked simultaneously.
 5. **Re-attempt under lock:** If any arm succeeds before entries are appended to any channel list, release the locks and return immediately. Do **not** write `cancelled` on the other entries — they have not been enqueued and `wake()` will never see them.
 
-   **Park:** For `goc_alts`: call `mco_yield` to suspend the fiber. For `goc_alts_sync`: block on a semaphore. Copy the fiber/semaphore context into every `entries[i]`. Set `entries[i]->arm_idx = i`.
+   **Park:** For `goc_alts`: call `mco_yield` to suspend the fiber. For `goc_alts_sync`: block on a shared `goc_sync_t` (portable mutex + condvar). Copy the fiber/condvar context into every `entries[i]`. Set `entries[i]->arm_idx = i`.
 
-   **`goc_alts_sync` semaphore teardown:** After `sem_wait` returns, call `sem_destroy(&shared_sem)` before returning. This is safe: `wake` wins the `woken` CAS and completes `sem_post` before any other path can call `sem_post` on the same semaphore. All other entries either have their `cancelled` flag set or lose the `woken` CAS, so no additional `sem_post` on `shared_sem` will occur after `sem_wait` unblocks. `sem_destroy` may therefore be called immediately.
+   **`goc_alts_sync` teardown:** After `goc_sync_wait` returns, call `goc_sync_destroy(&shared_sync)` before returning. This is safe: `wake` wins the `woken` CAS and completes `goc_sync_post` before any other path can call `goc_sync_post` on the same object. All other entries either have their `cancelled` flag set or lose the `woken` CAS, so no additional `goc_sync_post` on `shared_sync` will occur after `goc_sync_wait` unblocks. `goc_sync_destroy` may therefore be called immediately.
 
 6. **On wake (park path only):** The first channel to fire performs a CAS on `fired` (0→1, `acq_rel`). The storing thread writes the delivered value into `result_slot` **before** the CAS; the resuming fiber reads `fired` with `memory_order_acquire`, guaranteeing it observes the written value. The resuming fiber then iterates all entries and writes `cancelled = 1` on every entry where `woken == 0` (the losers).
 
@@ -1056,7 +1057,7 @@ uv_tcp_init(goc_scheduler(), server);
 2. **`gc.c`** — Initialise the `live_channels` list: a `malloc`-allocated, dynamically grown `goc_chan**` array protected by a `uv_mutex_t` (`g_live_mutex`). Must be fully initialised before the loop thread is spawned (step 5) — the loop thread could indirectly trigger `goc_chan_make`, which acquires `g_live_mutex`. `goc_chan_make` is responsible for appending to it; `goc_close` removes entries. Required by `goc_shutdown`.
 3. **`pool.c`** — Initialise the global pool registry (a `malloc`-allocated list protected by a `uv_mutex_t`). Must be fully initialised before the loop thread is spawned (step 5). Read `GOC_POOL_THREADS` from the environment; default to `max(4, hardware_concurrency)`. Every subsequent `goc_pool_make` call appends to this registry; `goc_pool_destroy` removes the entry. `goc_shutdown` iterates the registry to drain and destroy any pools that remain at teardown time.
 4. **`mutex.c`** — Initialise the global RW-mutex registry (a `malloc`-allocated list protected by a `uv_mutex_t`). `goc_mutex_make` appends to this registry so `goc_shutdown` can destroy the internal `uv_mutex_t` lock for every live `goc_mutex`.
-5. **`loop.c`** — Call `loop_init()`. Internally this: allocates and initialises `g_loop`; malloc-allocates and initialises both `uv_async_t` handles (`g_wakeup` via atomic release store, `g_shutdown_async`); calls `cb_queue_init()` to allocate the MPSC sentinel node (must precede thread spawn and requires GC already up); then spawns the dedicated loop thread via `GC_pthread_create` so thread registration is handled by Boehm's wrapper. All shared state the loop thread can reach (`g_live_mutex`, pool registry, async handles, callback queue) is fully initialised at this point. It runs `while (uv_run(g_loop, UV_RUN_ONCE)) {}` for its entire lifetime.
+5. **`loop.c`** — Call `loop_init()`. Internally this: allocates and initialises `g_loop`; malloc-allocates and initialises both `uv_async_t` handles (`g_wakeup` via atomic release store, `g_shutdown_async`); calls `cb_queue_init()` to allocate the MPSC sentinel node (must precede thread spawn and requires GC already up); then spawns the dedicated loop thread via `gc_pthread_create` so thread registration is handled by Boehm's wrapper (on POSIX: `GC_pthread_create`; on Windows: a trampoline). All shared state the loop thread can reach (`g_live_mutex`, pool registry, async handles, callback queue) is fully initialised at this point. It runs `while (uv_run(g_loop, UV_RUN_ONCE)) {}` for its entire lifetime.
 6. **`pool.c`** — Call `goc_pool_make(N)` for the default pool, storing the result globally. This spawns the worker threads; done last so workers start only after the full runtime is up.
 
 ---
@@ -1115,9 +1116,9 @@ The test suite is split across phase files in `tests/`, each a self-contained C 
 ### Design
 
 - **Harness**: `tests/test_harness.h` provides shared `TEST_BEGIN` / `ASSERT` / `TEST_PASS` / `TEST_FAIL` macros with `goto done` cleanup — no `setjmp`. All phase test files include this header instead of duplicating the macros.
-- **Crash handler**: `test_harness.h` also provides `install_crash_handler()`, which registers a `SIGSEGV` and `SIGABRT` signal handler. The handler calls `backtrace_symbols_fd()` to print a full backtrace to `stderr`, then re-raises the signal with the default disposition restored so the process exits with the correct signal status. `install_crash_handler()` is called as the first statement of `main()` in each phase binary, before `goc_init()`. This approach is used in preference to core dumps because GitHub Actions runners do not reliably write core files to disk (apport and systemd-coredump intercept them at the kernel level), whereas `stderr` output is always captured by CTest `--output-on-failure`. Test executables are linked with `-rdynamic` so that `backtrace_symbols_fd()` can resolve function names; without it, frames appear as raw addresses only.
+- **Crash handler**: `test_harness.h` also provides `install_crash_handler()`, which registers a `SIGSEGV` and `SIGABRT` signal handler. On Linux and macOS, `sigaction` is used; on Linux the handler calls `backtrace_symbols_fd()` to print a full backtrace to `stderr` (test executables are linked with `-rdynamic` so function names resolve), and on macOS it uses `fprintf` instead of `dprintf`. On Windows, `signal()` is used as a fallback with `fprintf` to `stderr`; no backtrace is printed. In all cases the handler re-raises the signal with the default disposition restored so the process exits with the correct signal status. `install_crash_handler()` is called as the first statement of `main()` in each phase binary, before `goc_init()`. This approach is used in preference to core dumps because GitHub Actions runners do not reliably write core files to disk, whereas `stderr` output is always captured by CTest `--output-on-failure`.
 - **Isolation**: `goc_init()` and `goc_shutdown()` bracket the entire test binary — called once each in the `main()` of **each phase's test binary** before and after all tests in that phase run. Individual test functions do not call them.
-- **Synchronisation**: a `done_t` helper (a plain POSIX `sem_t` — `done_signal` calls `sem_post`, `done_wait` calls `sem_wait`) lets the main thread block until fibers finish without relying on `sleep` or a `goc_chan`.
+- **Synchronisation**: a `done_t` helper lets the main thread block until fibers finish without relying on `sleep` or a `goc_chan`. All test phases (P1–P9) use a portable `done_t` backed by `pthread_mutex_t` + `pthread_cond_t`; `done_signal` signals the condvar, `done_wait` waits on it, and `done_wait_ms` provides a timed wait. This replaces an earlier `sem_t`-based implementation that used `sem_init` / `sem_wait`, which is deprecated (and non-functional) on macOS for unnamed POSIX semaphores.
 - **GC integration**: Boehm GC is linked automatically; no hook table setup is required in tests.
 - **Crash tests**: tests that expect `abort()` (e.g. canary violation) use `fork` + `waitpid` in the test function itself (`fork_expect_sigabrt` helper). Each test forks a child; before calling `goc_init()` the child performs two setup steps:
   1. **Reset `SIGABRT` to `SIG_DFL`** — the parent installs a `crash_handler` for `SIGABRT` (via `install_crash_handler()`), which the child inherits through `fork`. When `abort()` fires on a pool worker thread, glibc's `abort` implementation blocks `SIGABRT` on the calling thread before raising it. The inherited crash handler then calls `raise(SIGABRT)` while the signal is still blocked, which interacts with `abort()`'s internal signal-mask loop and causes the child to hang rather than terminate. Resetting to `SIG_DFL` before `goc_init()` ensures `abort()` terminates the child immediately regardless of which thread calls it.
@@ -1217,7 +1218,7 @@ The test suite is split across phase files in `tests/`, each a self-contained C 
 | P7.2 | Fan-out / fan-in: 1 producer, 4 workers, result aggregation, 20 items, sum verified |
 | P7.3 | High-volume stress: 10 000 messages, sum verified |
 | P7.4 | Multi-fiber: 8 senders on 1 unbuffered channel, all IDs received exactly once |
-| P7.5 | Timeout + cancellation: slower fiber's result discarded cleanly, shutdown completes without hang |
+| P7.5 | Timeout + cancellation: slower fiber's result discarded cleanly, shutdown completes without hang. `goc_close(result_ch)` and both `goc_take_sync` fiber joins are performed **before** the result assertions so that no fiber can be left parked on an unclosed channel if a timing-sensitive assertion fails. |
 
 **Phase 8 — Safety and crash behaviour**
 
@@ -1235,6 +1236,8 @@ The test suite is split across phase files in `tests/`, each a self-contained C 
 | P8.10 | `goc_put_sync` called from within a fiber → `abort()`; verified via `fork` + `waitpid` asserting `SIGABRT` |
 | P8.11 | `goc_alts_sync` called from within a fiber → `abort()`; verified via `fork` + `waitpid` asserting `SIGABRT` |
 
+> **Windows:** All P8 tests self-skip on Windows. `fork()`/`waitpid()` are not available in MinGW; `test_p8_safety.c` detects `_WIN32` at compile time and emits a `TEST_SKIP` stub for each of the 11 tests. The binary builds and runs cleanly; tests report `skip` rather than failing.
+
 **Phase 9 — RW mutexes**
 
 | Test | Description |
@@ -1250,7 +1253,7 @@ The test suite is split across phase files in `tests/`, each a self-contained C 
 ```sh
 cmake -B build
 cmake --build build
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure --timeout 120
 # or run a single phase directly:
 ./build/test_p1_foundation
 ```
@@ -1266,3 +1269,42 @@ cmake -B build-tsan -DLIBGOC_TSAN=ON
 cmake --build build-tsan
 ctest --test-dir build-tsan --output-on-failure
 ```
+
+---
+
+## CI/CD
+
+### CI Workflow (`.github/workflows/ci.yml`)
+
+Triggered on every push or pull request that touches `src/`, `include/`, `tests/`, `CMakeLists.txt`, `vendor/`, or the workflow file itself. Changes to documentation (`README.md`, `DESIGN.md`, `TODO.md`) do **not** trigger CI.
+
+Runs a build matrix across three operating systems:
+
+| Runner | Dependencies | Build | Tests |
+|---|---|---|---|
+| `ubuntu-latest` | apt: `libuv1-dev`, `libatomic-ops-dev`; Boehm GC built from source | CMake `RelWithDebInfo` | All phases (P1–P9) via `ctest --timeout 120` |
+| `macos-latest` | Homebrew: `libuv`, `bdw-gc`, `pkg-config`; `bdw-gc-threaded.pc` alias created manually | CMake `RelWithDebInfo` | All phases (P1–P9) via `ctest --timeout 120` |
+| `windows-latest` | MSYS2 UCRT64: `gcc`, `cmake`, `libuv`, `gc`, `pkg-config` (MinGW packages) | CMake `RelWithDebInfo`, full build | P1–P7, P9 via `ctest --timeout 120`; P8 self-skips (see below) |
+
+On Linux, Boehm GC is built from source with `--enable-threads=posix` and cached between runs. A `bdw-gc-threaded.pc` alias is created from the `bdw-gc.pc` file so that CMake's `pkg_check_modules(BDWGC … bdw-gc-threaded)` finds it.
+
+On macOS, Homebrew's `bdw-gc` formula does not ship a `bdw-gc-threaded.pc` pkg-config alias; the workflow creates it in the global Homebrew `lib/pkgconfig` directory (`$(brew --prefix)/lib/pkgconfig`) where `pkg-config` searches by default.
+
+On Windows, MSYS2/MinGW-w64 (UCRT64 environment) is used instead of MSVC+vcpkg. This is required because libgoc uses `pthread.h` and C11 `_Atomic` directly — APIs that are not available in MSVC builds or in the Win32-threads build of bdwgc that vcpkg produces. MSYS2's MinGW packages provide a POSIX-compatible toolchain with full GCC C11 support and a bdwgc build compiled with pthreads. A `bdw-gc-threaded.pc` alias is created in `/ucrt64/lib/pkgconfig` before CMake runs.
+
+The test suite itself is portable to Windows with one exception: **Phase 8 (safety tests)** relies on `fork()`/`waitpid()` to isolate processes that call `abort()`. These POSIX APIs are not available in MinGW. `test_p8_safety.c` detects `_WIN32` at compile time and replaces each of the 11 P8 tests with a `TEST_SKIP` stub, so the binary still builds and runs cleanly — it just reports skipped tests rather than failing.
+
+### CD Workflow (`.github/workflows/cd.yml`)
+
+Triggered on every push to `main` that touches `src/`, `include/`, `CMakeLists.txt`, `vendor/`, or the workflow file itself. Documentation-only pushes do **not** trigger a release.
+
+**Jobs:**
+
+1. **`tag`** — Creates a UTC timestamp tag in the format `yyyy.MM.dd.HH.mm` (e.g. `2026.03.18.12.05`) and pushes it to the repository.
+
+2. **`build-linux`**, **`build-macos`**, **`build-windows`** — Run in parallel after `tag`. Each job builds the `goc` static library in `Release` mode and packages it alongside `include/goc.h`:
+   - Linux: `libgoc-linux-x86_64.tar.gz` (`libgoc.a` + `goc.h`); Boehm GC is built from source with `--enable-threads=posix` and cached; a `bdw-gc-threaded.pc` alias is baked into the cache.
+   - macOS: `libgoc-macos-arm64.tar.gz` (`libgoc.a` + `goc.h`); Homebrew dependencies are installed and a `bdw-gc-threaded.pc` alias is created in `$(brew --prefix)/lib/pkgconfig` if absent.
+   - Windows: `libgoc-windows-x86_64.tar.gz` (`libgoc.a` + `goc.h`, built via MSYS2/MinGW-w64 UCRT64); a `bdw-gc-threaded.pc` alias is created in `/ucrt64/lib/pkgconfig` if absent before CMake runs.
+
+3. **`release`** — Downloads all three artifacts and publishes a GitHub Release tagged with the timestamp tag created in step 1.
