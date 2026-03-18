@@ -17,8 +17,6 @@ See the [Design Doc](./DESIGN.md) for implementation details and [TODO](./TODO.m
 
 **Pre-built static libraries** for Linux (x86-64), macOS (arm64), and Windows (x86-64) are available on the [Releases page](https://github.com/divs1210/libgoc/releases).
 
-> **Boehm GC must be compiled with thread support.** libgoc calls `GC_allow_register_threads()` during initialisation. With `-DGC_THREADS` active, the GC's pthread wrapper automatically registers every pool worker thread and the uv loop thread via `GC_call_with_stack_base` — all threads are created with `GC_pthread_create` and must not call `GC_register_my_thread` / `GC_unregister_my_thread` manually, as doing so double-registers the thread and causes a crash. A non-threaded build of the GC (i.e. one built without `--enable-threads`) is missing the required symbols and will crash at runtime. See the per-platform instructions in [Building and Testing](#building-and-testing) for how to satisfy this requirement on each OS.
-
 **Platform:** Linux, macOS, and Windows.
 
 **Dependencies:**
@@ -27,7 +25,7 @@ See the [Design Doc](./DESIGN.md) for implementation details and [TODO](./TODO.m
 |---|---|
 | `minicoro` | fiber suspend/resume (cross-platform; POSIX and Windows) |
 | `libuv` | event loop, timers, cross-thread wakeup |
-| Boehm GC | garbage collection; **must be built with `--enable-threads`**; linked automatically, initialised by `goc_init`; provides `GC_pthread_create` / `GC_pthread_join` wrappers used for libgoc worker and loop threads |
+| Boehm GC | garbage collection; **must be built with POSIX thread support** (`--enable-threads=posix`); linked automatically, initialised by `goc_init` |
 
 > See [minicoro limitations](#minicoro-limitations) in the Public API section for fiber stack constraints.
 
@@ -641,13 +639,13 @@ libgoc ships with a comprehensive, phased test suite covering the full public AP
 
 | Dependency | macOS | Linux (Debian/Ubuntu) | Linux (Fedora/RHEL) | Windows |
 |---|---|---|---|---|
-| CMake ≥ 3.20 | `brew install cmake` | `apt install cmake` | `dnf install cmake` | [cmake.org](https://cmake.org/download/) |
-| libuv | `brew install libuv` | `apt install libuv1-dev` | `dnf install libuv-devel` | vcpkg or source build |
-| Boehm GC | `brew install bdw-gc` | source build (see below) | `dnf install gc-devel` | vcpkg or source build |
-| pkg-config | `brew install pkg-config` | `apt install pkg-config` | `dnf install pkgconfig` | — |
+| CMake ≥ 3.20 | `brew install cmake` | `apt install cmake` | `dnf install cmake` | MSYS2 UCRT64 (bundled) |
+| libuv | `brew install libuv` | `apt install libuv1-dev` | `dnf install libuv-devel` | MSYS2 UCRT64 — see [Windows](#windows) |
+| Boehm GC | `brew install bdw-gc` | source build (see below) | `dnf install gc-devel` | MSYS2 UCRT64 — see [Windows](#windows) |
+| pkg-config | `brew install pkg-config` | `apt install pkg-config` | `dnf install pkgconfig` | MSYS2 UCRT64 (bundled) |
 | minicoro | vendored (submodule); instantiated via `src/minicoro.c` |
 
-A C11 compiler (clang or gcc on POSIX; MSVC or clang-cl on Windows) is required.
+A C11 compiler is required: GCC or Clang on Linux/macOS; MinGW-w64 GCC via MSYS2 UCRT64 on Windows.
 
 **Build configuration constants** (`src/config.h`):
 
@@ -662,11 +660,14 @@ A C11 compiler (clang or gcc on POSIX; MSVC or clang-cl on Windows) is required.
 
 ### macOS
 
-> **Boehm GC:** Homebrew's `bdw-gc` formula is built with thread support unconditionally and ships a `bdw-gc-threaded.pc` pkg-config alias. No extra steps are needed — the `brew install` command below is sufficient.
-
 ```sh
 # 1. Install dependencies (Homebrew)
 brew install cmake libuv bdw-gc pkg-config
+
+# Homebrew's bdw-gc does not ship a bdw-gc-threaded.pc pkg-config alias.
+# Create it once in the global Homebrew pkgconfig directory:
+PKGDIR="$(brew --prefix)/lib/pkgconfig"
+[ -f "$PKGDIR/bdw-gc-threaded.pc" ] || cp "$PKGDIR/bdw-gc.pc" "$PKGDIR/bdw-gc-threaded.pc"
 
 # 2. Configure
 cmake -B build
