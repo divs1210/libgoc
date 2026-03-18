@@ -194,6 +194,14 @@ void goc_close(goc_chan* ch)
                     case GOC_FIBER:    post_to_run_queue(e->pool, e); break;
                     case GOC_CALLBACK: post_callback(e, NULL);        break;
                     case GOC_SYNC:     goc_sync_post(e->sync_sem_ptr);     break;
+                    }
+                }
+            }
+            e = next;
+        }
+    }
+
+    /* Wake all parked putters with GOC_CLOSED */
     {
         goc_entry* e = ch->putters;
         while (e != NULL) {
@@ -210,6 +218,14 @@ void goc_close(goc_chan* ch)
                     case GOC_FIBER:    post_to_run_queue(e->pool, e); break;
                     case GOC_CALLBACK: post_callback(e, NULL);        break;
                     case GOC_SYNC:     goc_sync_post(e->sync_sem_ptr);     break;
+                    }
+                }
+            }
+            e = next;
+        }
+    }
+
+    on_close = ch->on_close;
     on_close_ud = ch->on_close_ud;
 
     uv_mutex_unlock(ch->lock);
