@@ -158,6 +158,14 @@ jobs:
             mingw-w64-ucrt-x86_64-gc
             mingw-w64-ucrt-x86_64-pkg-config
 
+      - name: Set up bdw-gc-threaded pkg-config alias
+        shell: msys2 {0}
+        run: |
+          PKGDIR="/ucrt64/lib/pkgconfig"
+          if [ ! -f "$PKGDIR/bdw-gc-threaded.pc" ]; then
+            cp "$PKGDIR/bdw-gc.pc" "$PKGDIR/bdw-gc-threaded.pc"
+          fi
+
       - name: Build libgoc
         shell: msys2 {0}
         run: |
