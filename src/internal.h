@@ -28,6 +28,7 @@
  * --------------------------------------------------------------------------- */
 
 typedef struct goc_pool goc_pool;   /* defined in pool.c */
+typedef struct goc_entry goc_entry;
 
 /* ---------------------------------------------------------------------------
  * goc_entry_kind
