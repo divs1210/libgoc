@@ -738,11 +738,15 @@ pacman -S mingw-w64-ucrt-x86_64-gcc \
           mingw-w64-ucrt-x86_64-gc \
           mingw-w64-ucrt-x86_64-pkg-config
 
-# 2. Configure and build everything (library + tests)
+# 2. Create the bdw-gc-threaded pkg-config alias if it is missing
+PKGDIR="/ucrt64/lib/pkgconfig"
+[ -f "$PKGDIR/bdw-gc-threaded.pc" ] || cp "$PKGDIR/bdw-gc.pc" "$PKGDIR/bdw-gc-threaded.pc"
+
+# 3. Configure and build everything (library + tests)
 cmake -B build
 cmake --build build --parallel $(nproc)
 
-# 3. Run tests
+# 4. Run tests
 ctest --test-dir build --output-on-failure
 ```
 
