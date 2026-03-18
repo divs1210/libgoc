@@ -137,9 +137,8 @@ jobs:
       # _Atomic directly, and calls GC_pthread_create/GC_pthread_join — APIs
       # that are only present in POSIX (pthreads) builds of Boehm GC, not in
       # the Win32-threads build that MSVC + vcpkg produce.
-      # Tests are skipped on Windows because the test harness uses POSIX-only
-      # APIs (fork, waitpid, execinfo.h) that are not available on Windows.
-      # The library build verifies that libgoc itself compiles on Windows.
+      # P8 (safety) tests self-skip on Windows because they rely on fork/waitpid.
+      # All other test phases (P1–P7, P9) run normally.
 
       - name: Set up MSYS2 (Windows)
         if: runner.os == 'Windows'
@@ -159,5 +158,10 @@ jobs:
         shell: msys2 {0}
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          cmake --build build --target goc --parallel $(nproc)
+          cmake --build build --parallel $(nproc)
         timeout-minutes: 10
+
+      - name: Test (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: ctest --test-dir build --output-on-failure

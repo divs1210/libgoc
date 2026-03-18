@@ -735,14 +735,15 @@ pacman -S mingw-w64-ucrt-x86_64-gcc \
           mingw-w64-ucrt-x86_64-gc \
           mingw-w64-ucrt-x86_64-pkg-config
 
-# 2. Configure
+# 2. Configure and build everything (library + tests)
 cmake -B build
+cmake --build build --parallel $(nproc)
 
-# 3. Build
-cmake --build build --target goc --parallel $(nproc)
+# 3. Run tests
+ctest --test-dir build --output-on-failure
 ```
 
-> **Tests:** the test harness uses `fork`, `waitpid`, and `execinfo.h` (POSIX-only APIs not available on Windows even under MinGW). Test executables are not built or run on Windows.
+> **Tests:** Phases P1–P7 and P9 run normally on Windows. Phase 8 (safety tests) requires `fork()`/`waitpid()` to isolate processes that call `abort()` — these POSIX APIs are not available in MinGW. The P8 test binary builds successfully but all 11 tests report `skip` at runtime.
 
 ---
 

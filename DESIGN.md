@@ -1282,13 +1282,15 @@ Runs a build matrix across three operating systems:
 |---|---|---|---|
 | `ubuntu-latest` | apt: `libuv1-dev`, `libatomic-ops-dev`; Boehm GC built from source | CMake `RelWithDebInfo` | All phases (P1–P9) via `ctest` |
 | `macos-latest` | Homebrew: `libuv`, `bdw-gc`, `pkg-config`; `bdw-gc-threaded.pc` alias created manually | CMake `RelWithDebInfo` | All phases (P1–P9) via `ctest` |
-| `windows-latest` | MSYS2 UCRT64: `gcc`, `cmake`, `libuv`, `gc`, `pkg-config` (MinGW packages) | CMake `RelWithDebInfo`, `goc` target only | Skipped |
+| `windows-latest` | MSYS2 UCRT64: `gcc`, `cmake`, `libuv`, `gc`, `pkg-config` (MinGW packages) | CMake `RelWithDebInfo`, full build | P1–P7, P9 via `ctest`; P8 self-skips (see below) |
 
 On Linux, Boehm GC is built from source with `--enable-threads=posix` and cached between runs. A `bdw-gc-threaded.pc` alias is created from the `bdw-gc.pc` file so that CMake's `pkg_check_modules(BDWGC … bdw-gc-threaded)` finds it.
 
 On macOS, Homebrew's `bdw-gc` formula does not always ship a `bdw-gc-threaded.pc` pkg-config alias; the workflow creates it from `bdw-gc.pc` after installation.
 
-On Windows, MSYS2/MinGW-w64 (UCRT64 environment) is used instead of MSVC+vcpkg. This is required because libgoc uses `pthread.h` and C11 `_Atomic` directly, and calls `GC_pthread_create`/`GC_pthread_join` — APIs that are only present in POSIX (pthreads) builds of Boehm GC, not in the Win32-threads build that MSVC+vcpkg produces. MSYS2's MinGW packages provide a POSIX-compatible toolchain with full GCC C11 support and a bdwgc build compiled with pthreads. Tests are skipped because the test harness uses POSIX-only APIs (`fork`, `waitpid`, `execinfo.h`) not available on Windows even in a MinGW environment.
+On Windows, MSYS2/MinGW-w64 (UCRT64 environment) is used instead of MSVC+vcpkg. This is required because libgoc uses `pthread.h` and C11 `_Atomic` directly, and calls `GC_pthread_create`/`GC_pthread_join` — APIs that are only present in POSIX (pthreads) builds of Boehm GC, not in the Win32-threads build that MSVC+vcpkg produces. MSYS2's MinGW packages provide a POSIX-compatible toolchain with full GCC C11 support and a bdwgc build compiled with pthreads.
+
+The test suite itself is portable to Windows with one exception: **Phase 8 (safety tests)** relies on `fork()`/`waitpid()` to isolate processes that call `abort()`. These POSIX APIs are not available in MinGW. `test_p8_safety.c` detects `_WIN32` at compile time and replaces each of the 11 P8 tests with a `TEST_SKIP` stub, so the binary still builds and runs cleanly — it just reports skipped tests rather than failing.
 
 ### CD Workflow (`.github/workflows/cd.yml`)
 

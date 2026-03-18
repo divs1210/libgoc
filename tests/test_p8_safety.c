@@ -11,7 +11,7 @@
  * Run:    ctest --test-dir build --output-on-failure
  *         ./build/test_p8_safety
  *
- * Compile requirements: -std=c11 -DGC_THREADS -D_GNU_SOURCE
+ * Compile requirements: -std=c11 -DGC_THREADS
  *
  * Dependencies:
  *   - libgoc (goc.h)  — runtime under test
@@ -20,9 +20,11 @@
  *   - libuv           — event loop; drives fiber scheduling
  *   - POSIX fork / waitpid — used to isolate each abort()-inducing test in a
  *                        child process; the parent waits for the child and
- *                        verifies it was killed by SIGABRT
+ *                        verifies it was killed by SIGABRT.
+ *                        Not available on Windows — all P8 tests are skipped
+ *                        on that platform.
  *
- * Test isolation via fork:
+ * Test isolation via fork (Linux / macOS only):
  *   Each test that is expected to call abort() spawns a child with fork().
  *   The child runs goc_init(), performs the unsafe operation, and should never
  *   return — the runtime calls abort() before that is possible.  The parent
@@ -84,14 +86,19 @@
 #include <string.h>
 #include <signal.h>
 #include <semaphore.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
 #include <pthread.h>
+
+#if !defined(_WIN32)
+#  include <sys/types.h>
+#  include <sys/wait.h>
+#  include <unistd.h>
+#endif
 
 #include "test_harness.h"
 #include "goc.h"
 #include "minicoro.h"
+
+#if !defined(_WIN32)
 
 /* =========================================================================
  * fork_expect_sigabrt — helper that forks and asserts the child dies with
@@ -570,6 +577,31 @@ static void test_p8_11(void) {
     TEST_PASS();
 done:;
 }
+
+#else  /* _WIN32 — fork/waitpid not available; skip all P8 tests */
+
+#define P8_SKIP(num, label) \
+    static void test_p8_##num(void) { \
+        TEST_BEGIN(label); \
+        TEST_SKIP("fork/waitpid not available on Windows"); \
+    done:; \
+    }
+
+P8_SKIP(1,  "P8.1   stack overflow: canary overwrite → abort()")
+P8_SKIP(2,  "P8.2   goc_take() from OS thread → abort()")
+P8_SKIP(3,  "P8.3   goc_put() from OS thread → abort()")
+P8_SKIP(4,  "P8.4   goc_alts() with multiple defaults → abort()")
+P8_SKIP(5,  "P8.5   goc_alts_sync() with multiple defaults → abort()")
+P8_SKIP(6,  "P8.6   goc_pool_destroy() from own pool worker → abort()")
+P8_SKIP(7,  "P8.7   goc_init() from non-main pthread → abort()")
+P8_SKIP(8,  "P8.8   goc_shutdown() from non-main pthread → abort()")
+P8_SKIP(9,  "P8.9   goc_take_sync() from fiber context → abort()")
+P8_SKIP(10, "P8.10  goc_put_sync() from fiber context → abort()")
+P8_SKIP(11, "P8.11  goc_alts_sync() from fiber context → abort()")
+
+#undef P8_SKIP
+
+#endif /* _WIN32 */
 
 /* =========================================================================
  * main

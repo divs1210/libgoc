@@ -71,7 +71,6 @@
 #include <stdbool.h>
 #include <string.h>
 #include <semaphore.h>
-#include <sys/types.h>
 #include <unistd.h>
 #include <pthread.h>
 
