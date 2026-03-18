@@ -172,6 +172,26 @@ static void *loop_thread_fn(void *arg)
 }
 
 /* --------------------------------------------------------------------------
+ * loop_thread_gc_wrapper (Windows only)
+ *
+ * On Windows, bdwgc is compiled with Win32 threads and does not provide
+ * GC_pthread_create.  Plain pthread_create is used instead, so we must
+ * register and unregister the thread with the GC manually.
+ * -------------------------------------------------------------------------- */
+
+#ifdef _WIN32
+static void *loop_thread_gc_wrapper(void *arg)
+{
+    struct GC_stack_base sb;
+    GC_get_stack_base(&sb);
+    GC_register_my_thread(&sb);
+    void *ret = loop_thread_fn(arg);
+    GC_unregister_my_thread();
+    return ret;
+}
+#endif
+
+/* --------------------------------------------------------------------------
  * loop_init / loop_shutdown — internal (declared in internal.h)
  * -------------------------------------------------------------------------- */
 
@@ -198,20 +218,23 @@ void loop_init(void)
     /* 5. Initialise the MPSC callback queue. */
     cb_queue_init();
 
-    /* 6. Spawn the loop thread.  On POSIX, GC_pthread_create registers the
-     *    thread with the GC automatically.  On Windows, bdwgc uses Win32
-     *    thread hooks so plain pthread_create (which calls CreateThread
-     *    internally) is sufficient — GC_pthread_create is not available in
-     *    the Win32-threads build of bdwgc shipped by MSYS2 UCRT64.
+    /* 6. Spawn the loop thread.
      *
-     *    NOTE: Pool workers and the loop thread must NOT call
-     *    GC_register_my_thread manually — doing so double-registers the
-     *    thread and corrupts the GC's internal thread table (observed as
-     *    SIGSEGV in GC_call_with_stack_base during P1.4). */
+     * On POSIX: GC_pthread_create registers the thread with bdwgc
+     * automatically.  Pool workers and the loop thread must NOT call
+     * GC_register_my_thread manually on POSIX — GC_pthread_create already
+     * does it; a manual call would double-register and corrupt the GC's
+     * internal thread table (observed as SIGSEGV in GC_call_with_stack_base
+     * during P1.4).
+     *
+     * On Windows: bdwgc (MSYS2 UCRT64) is compiled with Win32 threads and
+     * does not provide GC_pthread_create.  We use plain pthread_create and
+     * let loop_thread_gc_wrapper call GC_register_my_thread /
+     * GC_unregister_my_thread manually. */
 #ifndef _WIN32
     GC_pthread_create(&g_loop_thread, NULL, loop_thread_fn, NULL);
 #else
-    pthread_create(&g_loop_thread, NULL, loop_thread_fn, NULL);
+    pthread_create(&g_loop_thread, NULL, loop_thread_gc_wrapper, NULL);
 #endif
 }
 
