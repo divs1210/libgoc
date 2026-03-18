@@ -324,7 +324,11 @@ goc_pool* goc_pool_make(size_t threads) {
     pool->threads = malloc(threads * sizeof(pthread_t));
 
     for (size_t i = 0; i < threads; i++) {
+#ifndef _WIN32
         GC_pthread_create(&pool->threads[i], NULL, pool_worker_fn, pool);
+#else
+        pthread_create(&pool->threads[i], NULL, pool_worker_fn, pool);
+#endif
     }
 
     registry_add(pool);

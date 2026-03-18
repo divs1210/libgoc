@@ -85,7 +85,6 @@
 #include <stdbool.h>
 #include <string.h>
 #include <signal.h>
-#include <semaphore.h>
 #include <pthread.h>
 
 #if !defined(_WIN32)
@@ -229,20 +228,15 @@ static void p8_1_child_fn(void* arg) {
      * After wake(), pool_worker_fn re-queues overflow_fiber and on the next
      * iteration checks the canary → abort() → SIGABRT kills the child.
      *
-     * The main thread parks on a semaphore that is never posted.  When the
-     * pool worker calls abort(), glibc raises SIGABRT on that thread; with
-     * SIG_DFL (restored in fork_expect_sigabrt before goc_init) this
-     * terminates the entire process.  The parent's waitpid then sees
-     * WIFSIGNALED(...SIGABRT).
+     * The main thread blocks in pause(); abort() from the pool worker sends
+     * SIGABRT to the whole process, which with SIG_DFL terminates it.
      */
     goc_chan* ch = goc_chan_make(0);
     goc_go(overflow_fiber, ch);
     goc_go(sender_fiber,   ch);
 
     /* Block the main thread; abort() from the pool worker kills the process. */
-    sem_t blocker;
-    sem_init(&blocker, 0, 0);
-    sem_wait(&blocker);
+    pause(); /* blocked until a signal — abort() terminates the whole process */
     /* Unreachable. */
 }
 
@@ -361,9 +355,7 @@ static void p8_4_child_fn(void* arg) {
     goc_go(p8_4_alts_fiber, NULL);
 
     /* Block the main thread; abort() from the fiber kills the process. */
-    sem_t blocker;
-    sem_init(&blocker, 0, 0);
-    sem_wait(&blocker);
+    pause(); /* blocked until a signal — abort() terminates the whole process */
     /* Unreachable. */
 }
 
@@ -429,9 +421,7 @@ static void p8_6_child_fn(void* arg) {
     goc_go_on(pool, p8_6_destroy_self_fiber, pool);
 
     /* Block main thread; abort() from worker should kill the process. */
-    sem_t blocker;
-    sem_init(&blocker, 0, 0);
-    sem_wait(&blocker);
+    pause(); /* blocked until a signal — abort() terminates the whole process */
     /* Unreachable. */
 }
 
