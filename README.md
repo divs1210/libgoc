@@ -54,6 +54,7 @@ See the [Design Doc](./DESIGN.md) for implementation details and [TODO](./TODO.m
   - [RW mutexes](#rw-mutexes)
   - [Thread pool](#thread-pool)
   - [Scheduler loop access](#scheduler-loop-access)
+- [Best Practices](#best-practices)
 - [Building and Testing](#building-and-testing)
   - [Prerequisites](#prerequisites)
   - [macOS](#macos)
@@ -627,6 +628,38 @@ uv_tcp_init(goc_scheduler(), server);
 
 // ... later, to tear down:
 uv_close((uv_handle_t*)server, on_handle_closed);
+```
+
+---
+
+## Best Practices
+
+Used the right way, **libgoc** provides a runtime environment very similar to Go's.
+
+**The blocking versions of take/put/alts are intended only for the initial setup in the `main` function, and should not be used otherwise.**
+
+A typical program's main function should be like this:
+
+```c
+int main(void) {
+    goc_init();
+
+    // reify main thread as main fiber
+    goc_chan* join_main_fiber = goc_go(main_fiber, NULL);
+
+    // wait for main fiber to finish
+    goc_take_sync(join_main_fiber);
+
+    goc_shutdown();
+    return 0;
+}
+
+static void main_fiber(void* _ub) {
+    // User code comes here.
+    // Since this is a fiber context,
+    // async channel ops work here
+    // and in all code reachable from here
+}
 ```
 
 ---

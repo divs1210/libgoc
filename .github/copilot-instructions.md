@@ -3,3 +3,4 @@
     2. if the build process / CI / CD need updating.
     3. if the code can be refactored to be simpler
 2. Whenever you make any change in the repo, see if the docs (especially README.md, DESIGN.md, TODO.md) need updating.
+3. Don't run builds, tests, or linters locally before pushing code. Let the CI do it. If the CI fails, fix it in a new commit and push again.
