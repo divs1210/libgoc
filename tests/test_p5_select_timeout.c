@@ -916,16 +916,20 @@ static void test_p5_13(void) {
 
     ASSERT(v.ok == GOC_CLOSED);
 
-    uint64_t elapsed_ms =
-        (uint64_t)(t1.tv_sec  - t0.tv_sec)  * 1000ULL +
-        (uint64_t)(t1.tv_nsec - t0.tv_nsec) / 1000000ULL;
+    /* Use signed arithmetic so that when tv_nsec wraps (t1.tv_nsec <
+     * t0.tv_nsec, which happens when the measurement straddles a second
+     * boundary), the negative nanosecond delta is correctly borrowed from the
+     * second difference rather than wrapping to a huge uint64_t value. */
+    int64_t elapsed_ms =
+        (int64_t)(t1.tv_sec  - t0.tv_sec)  * 1000LL +
+        (int64_t)(t1.tv_nsec - t0.tv_nsec) / 1000000LL;
 
     /* Must have waited at least the deadline (allow 5 ms early-fire tolerance
      * for clock resolution and scheduler jitter). */
-    ASSERT(elapsed_ms + 5 >= timeout_ms);
+    ASSERT(elapsed_ms + 5 >= (int64_t)timeout_ms);
 
     /* Must not have hung indefinitely (upper bound: 10× deadline). */
-    ASSERT(elapsed_ms < timeout_ms * 10);
+    ASSERT(elapsed_ms < (int64_t)(timeout_ms * 10));
 
     TEST_PASS();
 done:;
