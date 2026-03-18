@@ -16,7 +16,6 @@
 #include <stdio.h>
 #include <assert.h>
 #include <stdatomic.h>
-#include <semaphore.h>
 #include <uv.h>
 #include <gc.h>
 #include "minicoro.h"
@@ -69,7 +68,7 @@ void wake(goc_chan* ch, goc_entry* e, void* value)
         post_callback(e, value);
         break;
     case GOC_SYNC:
-        sem_post(e->sync_sem_ptr);
+        goc_sync_post(e->sync_sem_ptr);
         break;
     }
 }
@@ -194,15 +193,7 @@ void goc_close(goc_chan* ch)
                     switch (e->kind) {
                     case GOC_FIBER:    post_to_run_queue(e->pool, e); break;
                     case GOC_CALLBACK: post_callback(e, NULL);        break;
-                    case GOC_SYNC:     sem_post(e->sync_sem_ptr);     break;
-                    }
-                }
-            }
-            e = next;
-        }
-    }
-
-    /* Wake all parked putters with GOC_CLOSED */
+                    case GOC_SYNC:     goc_sync_post(e->sync_sem_ptr);     break;
     {
         goc_entry* e = ch->putters;
         while (e != NULL) {
@@ -218,15 +209,7 @@ void goc_close(goc_chan* ch)
                     switch (e->kind) {
                     case GOC_FIBER:    post_to_run_queue(e->pool, e); break;
                     case GOC_CALLBACK: post_callback(e, NULL);        break;
-                    case GOC_SYNC:     sem_post(e->sync_sem_ptr);     break;
-                    }
-                }
-            }
-            e = next;
-        }
-    }
-
-    on_close = ch->on_close;
+                    case GOC_SYNC:     goc_sync_post(e->sync_sem_ptr);     break;
     on_close_ud = ch->on_close_ud;
 
     uv_mutex_unlock(ch->lock);
@@ -405,21 +388,21 @@ goc_val_t goc_take_sync(goc_chan* ch)
         return (goc_val_t){ NULL, GOC_CLOSED };
     }
 
-    /* Slow path: park via semaphore */
+    /* Slow path: park via condvar */
     goc_entry e = { 0 };
     e.kind         = GOC_SYNC;
     e.result_slot  = &e.cb_result;
     e.ok           = GOC_CLOSED;
-    sem_init(&e.sync_sem, 0, 0);
-    e.sync_sem_ptr = &e.sync_sem;
+    goc_sync_init(&e.sync_obj);
+    e.sync_sem_ptr = &e.sync_obj;
 
     goc_entry** pp = &ch->takers;
     while (*pp) pp = &(*pp)->next;
     *pp = &e;
 
     uv_mutex_unlock(ch->lock);
-    sem_wait(&e.sync_sem);
-    sem_destroy(&e.sync_sem);
+    goc_sync_wait(&e.sync_obj);
+    goc_sync_destroy(&e.sync_obj);
 
     return (goc_val_t){ e.cb_result, e.ok };
 }
@@ -461,21 +444,21 @@ goc_status_t goc_put_sync(goc_chan* ch, void* val)
         return GOC_OK;
     }
 
-    /* Slow path: park via semaphore */
+    /* Slow path: park via condvar */
     goc_entry e = { 0 };
     e.kind         = GOC_SYNC;
     e.put_val      = val;
     e.ok           = GOC_CLOSED;
-    sem_init(&e.sync_sem, 0, 0);
-    e.sync_sem_ptr = &e.sync_sem;
+    goc_sync_init(&e.sync_obj);
+    e.sync_sem_ptr = &e.sync_obj;
 
     goc_entry** pp = &ch->putters;
     while (*pp) pp = &(*pp)->next;
     *pp = &e;
 
     uv_mutex_unlock(ch->lock);
-    sem_wait(&e.sync_sem);
-    sem_destroy(&e.sync_sem);
+    goc_sync_wait(&e.sync_obj);
+    goc_sync_destroy(&e.sync_obj);
 
     return e.ok;
 }
