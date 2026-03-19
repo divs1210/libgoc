@@ -63,7 +63,7 @@ libgoc/
 │   ├── internal.h         # Internal types, helpers, and cross-module declarations
 │   ├── chan_type.h         # Authoritative struct goc_chan definition (included where concrete channel fields are accessed)
 │   ├── channel_internal.h  # Channel-only internals and inline channel helpers
-│   └── config.h           # Build configuration (PAGE_SIZE, stack defaults, etc.)
+│   └── config.h           # Build configuration constants (thresholds, etc.)
 ├── tests/
 │   ├── test_harness.h              # Shared harness macros + SIGSEGV/SIGABRT crash handler
 │   ├── test_p1_foundation.c        # Phase 1 — Foundation
@@ -76,6 +76,10 @@ libgoc/
 │   ├── test_p8_safety.c            # Phase 8 — Safety and crash behaviour
 │   └── test_p9_mutexes.c           # Phase 9 — RW mutexes
 ├── bench/                           # Benchmarks (see bench/README.md)
+│   ├── go/                          # Go benchmark sources
+│   ├── libgoc/                      # C benchmark sources
+│   ├── go.mod
+│   └── README.md
 ├── vendor/
 │   └── minicoro/
 │       └── minicoro.h     # Vendored header — fiber suspend/resume (header-only)
@@ -112,7 +116,6 @@ Dependencies are resolved via `pkg-config` (libuv as `libuv`, Boehm GC as `bdw-g
 > **Boehm GC thread registration:** libgoc compiles with `-DGC_THREADS` and requires a Boehm GC built with `--enable-threads` (the `bdw-gc-threaded` pkg-config module). Linking against a non-threaded build causes `GC_INIT()` to malfunction or segfault at runtime; CMake will fail at configure time if the threaded variant is absent. See `README.md` for per-platform installation instructions. All threads are created via `gc_pthread_create` (defined in `src/internal.h`). On POSIX (Linux/macOS), `gc_pthread_create` is an alias for `GC_pthread_create`, which wraps the thread start with `GC_call_with_stack_base` so each thread is automatically registered with the collector; no manual `GC_register_my_thread` call is needed or permitted on POSIX (it would double-register and corrupt the GC's internal thread table). On Windows, bdwgc (MSYS2 UCRT64) is compiled with Win32 threads and does not provide `GC_pthread_create`; `gc_pthread_create` is implemented in `gc.c` as a thin wrapper around `pthread_create` that passes a trampoline (`gc_thread_trampoline`) as the thread entry, which calls `GC_register_my_thread` at startup and `GC_unregister_my_thread` at exit.
 
 Named constants defined in `config.h`:
-- `GOC_DEFAULT_STACK_SIZE 65536` (64 KB per spec)
 - `GOC_DEAD_COUNT_THRESHOLD 8`
 - `GOC_ALTS_STACK_THRESHOLD 8` (maximum number of `goc_alts` arms for which the channel-pointer scratch buffer is stack-allocated rather than `malloc`-allocated; avoids a heap allocation for the common case of a small select)
 
@@ -245,6 +248,18 @@ All GC-managed structs are allocated via `goc_malloc` — on the GC heap, so poi
 
 **Exception:** libuv handles (`uv_timer_t`, `uv_mutex_t` internals, `uv_async_t`) are allocated with plain `malloc` and freed explicitly. See [libuv Role](#libuv-role) above.
 
+### Portable Semaphore (`goc_sync_t`)
+
+```c
+typedef struct {
+    pthread_mutex_t mtx;
+    pthread_cond_t  cond;
+    int             ready;
+} goc_sync_t;
+```
+
+A single-use binary semaphore backed by a `pthread_mutex_t` + `pthread_cond_t` pair. Used by the `GOC_SYNC` blocking path in `goc_take_sync`, `goc_put_sync`, and `goc_alts_sync` instead of `sem_t`, which is non-functional for unnamed POSIX semaphores on macOS (`sem_init` returns `ENOSYS`). `goc_sync_post` may be called before or after `goc_sync_wait`; if post fires first, wait returns immediately. Defined in `src/internal.h`.
+
 ### Value (`goc_val_t`)
 
 ```c
@@ -279,6 +294,8 @@ struct goc_chan {
     int          closed;
     size_t       dead_count;  /* cancelled entries still physically on takers/putters lists */
     _Atomic int  close_guard; /* 0 = open; CAS 0→1 to become the sole teardown owner */
+    void       (*on_close)(void*);  /* optional callback invoked when the channel is closed */
+    void*        on_close_ud;       /* user data forwarded to on_close */
 };
 ```
 
@@ -338,6 +355,36 @@ typedef struct goc_entry {
                                        goc_take_sync / goc_put_sync; set to a shared stack
                                        goc_sync_t for goc_alts_sync arms so all arms post the
                                        same condvar without knowing whether it is embedded or shared */
+
+    /* Yield-gate: guards the race between wake() and mco_yield().
+     *
+     * There is a brief window between when a parking fiber releases ch->lock
+     * (or the alts lock set) and when it actually calls mco_yield. If wake()
+     * calls post_to_run_queue during that window, a pool worker calls
+     * mco_resume on a MCO_RUNNING coroutine — mco_resume silently returns
+     * MCO_NOT_SUSPENDED, the entry is consumed, and the fiber hangs after
+     * calling mco_yield with nobody left to resume it.
+     *
+     * Protocol (GOC_FIBER entries only):
+     *   `parked` lives on the fiber's initial goc_entry (accessible via
+     *   mco_get_user_data(e->coro)).  Values:
+     *     0 = parking in progress (fiber set it just before releasing locks;
+     *         mco_yield has not yet returned on the pool worker side)
+     *     1 = fiber is safely MCO_SUSPENDED (pool_worker_fn set it after
+     *         mco_resume returned)
+     *
+     *   Fiber (goc_take / goc_put / goc_alts slow path):
+     *     Sets fiber_entry->parked = 0 while still holding the channel lock(s),
+     *     then releases the lock(s) and calls mco_yield.
+     *
+     *   pool_worker_fn (after mco_resume returns):
+     *     Sets fiber_entry->parked = 1.
+     *
+     *   wake() and goc_close() (GOC_FIBER case):
+     *     Spin with sched_yield() while fiber_entry->parked == 0 before
+     *     calling post_to_run_queue.  Guarantees the coroutine is truly
+     *     MCO_SUSPENDED before any worker calls mco_resume. */
+    _Atomic int       parked;       /* per-fiber yield-gate; see protocol above */
 } goc_entry;
 ```
 
@@ -349,7 +396,7 @@ typedef struct goc_entry {
 
 Each fiber stack is created and managed by minicoro. Stack allocation, alignment, and guard-page setup are handled internally by minicoro — libgoc does not call `posix_memalign` or `mprotect` directly for fiber stacks.
 
-Per-fiber stack size is fixed at the default defined in `config.h` (`GOC_DEFAULT_STACK_SIZE`, 64 KB). Avoid large stack allocations and deep recursion inside fiber entry functions — see [minicoro Limitations](#minicoro-limitations).
+Per-fiber stack size uses minicoro's default (passed as `0` to `mco_desc_init`), which adapts to the active allocator. Avoid large stack allocations and deep recursion inside fiber entry functions — see [minicoro Limitations](#minicoro-limitations).
 
 **Canary-based stack overflow detection.** libgoc writes a sentinel canary word at the lowest address of each fiber stack immediately after `mco_create` returns. The worker loop checks the canary *before* every `mco_resume` call. If the canary has been overwritten, the runtime calls `abort()` with a diagnostic message identifying the corrupted fiber. This converts the silent heap corruption that minicoro would otherwise allow into a deterministic, debuggable crash. The canary is stored in `goc_entry` alongside the coroutine handle:
 
@@ -1033,6 +1080,7 @@ uv_loop_t*    goc_scheduler(void);
 | `chan_take_from_putter` | `static inline int chan_take_from_putter(goc_chan*, void**)` | `channel_internal.h` — requires `struct goc_chan` in scope via `chan_type.h`; snapshots `e->next` before `wake()` to avoid UAF on stack-allocated entries |
 | `chan_put_to_taker` | `static inline int chan_put_to_taker(goc_chan*, void*)` | `channel_internal.h` — requires `struct goc_chan` in scope via `chan_type.h`; snapshots `e->next` before `wake()` to avoid UAF on stack-allocated entries |
 | `chan_put_to_buffer` | `static inline int chan_put_to_buffer(goc_chan*, void*)` | `channel_internal.h` — requires `struct goc_chan` in scope via `chan_type.h` |
+| `chan_set_on_close` | `void chan_set_on_close(goc_chan* ch, void (*on_close)(void*), void* ud)` | `channel.c` (declared in `channel_internal.h`) — registers a one-shot callback invoked when the channel is closed; if the channel is already closed at call time the callback fires immediately |
 
 > **Note:** `chan_register` and `chan_unregister` are *defined* in `gc.c` but *called* from `channel.c` (`goc_chan_make` calls `chan_register`; `goc_close` calls `chan_unregister`). The inline ring-buffer helpers live in `channel_internal.h`, which includes both `chan_type.h` and `internal.h`. Files that need channel internals should include `channel_internal.h` (or `chan_type.h` directly when only the concrete channel layout is needed).
 
