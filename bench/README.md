@@ -42,14 +42,14 @@ make -C libgoc run
 ### Go
 
 ```sh
-$ make -C go run
+$ GOMAXPROCS=1 make -C go run
 go run .
-GOMAXPROCS=16
-Channel ping-pong: 200000 round trips in 144.297139ms (1386029 round trips/s)
-Ring benchmark: 500000 hops across 128 tasks in 368.671869ms (1356220 hops/s)
-Selective receive / fan-out / fan-in: 200000 messages with 8 workers in 479.445303ms (417149 msg/s)
-Spawn idle tasks: 200000 goroutines in 770.926955ms (259428 tasks/s)
-Prime sieve: 2262 primes up to 20000 in 171.285332ms (13206 primes/s)
+GOMAXPROCS=1
+Channel ping-pong: 200000 round trips in 83.536181ms (2394172 round trips/s)
+Ring benchmark: 500000 hops across 128 tasks in 212.876426ms (2348781 hops/s)
+Selective receive / fan-out / fan-in: 200000 messages with 8 workers in 313.193185ms (638583 msg/s)
+Spawn idle tasks: 200000 goroutines in 937.685245ms (213291 tasks/s)
+Prime sieve: 2262 primes up to 20000 in 1.137687991s (1988 primes/s)
 ```
 
 ### libgoc
