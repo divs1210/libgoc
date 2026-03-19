@@ -7,7 +7,7 @@
 
 // Helpers
 // =======
-
+static goc_pool* single_threaded_pool = NULL;
 
 
 // Benchmarks
@@ -61,8 +61,8 @@ static void bench_ping_pong(size_t ping_rounds) {
     ping_pong_args_t args_ba = { .recv = b, .send = a, .rounds = ping_rounds };
     ping_pong_args_t args_ab = { .recv = a, .send = b, .rounds = ping_rounds };
 
-    goc_chan* j1 = goc_go(player_fn, &args_ba);
-    goc_chan* j2 = goc_go(player_fn, &args_ab);
+    goc_chan* j1 = goc_go_on(single_threaded_pool, player_fn, &args_ba);
+    goc_chan* j2 = goc_go_on(single_threaded_pool, player_fn, &args_ab);
 
     uint64_t t0 = uv_hrtime();
     goc_put_sync(a, (void*)(uintptr_t)0);
@@ -102,7 +102,9 @@ static void bench_ping_pong(size_t ping_rounds) {
 int main(void) {
     goc_init();
 
-    size_t ping_rounds    = 200000;
+    single_threaded_pool = goc_pool_make(1);
+
+    size_t ping_rounds       = 200000;
     // size_t ring_nodes     = 128;
     // size_t ring_hops      = 500000;
     // size_t select_workers = 8;
