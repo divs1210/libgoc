@@ -134,7 +134,7 @@ typedef struct {
     size_t total;
 } fan_in_args_t;
 
-static void fan_in_select(void* arg) {
+static void fan_in_collector(void* arg) {
     fan_in_args_t* a = arg;
     goc_alt_op* ops = goc_malloc(sizeof(goc_alt_op) * a->out_count);
 
@@ -171,7 +171,7 @@ static void bench_select_fan(size_t workers, size_t tasks) {
         .out_count = workers,
         .total = tasks,
     };
-    goc_chan* collector_done = goc_go(fan_in_select, &collector);
+    goc_chan* collector_done = goc_go(fan_in_collector, &collector);
 
     uint64_t start = uv_hrtime();
     for (size_t i = 0; i < tasks; i++) {

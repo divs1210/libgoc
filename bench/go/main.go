@@ -23,7 +23,7 @@ func main() {
 
 	pingPong(*pingRounds)
 	ringBenchmark(*ringNodes, *ringHops)
-	selectFanIn(*selectWorkers, *selectTasks)
+	fanInBenchmark(*selectWorkers, *selectTasks)
 	spawnIdle(*spawnCount)
 	primeSieve(*primeMax)
 }
@@ -97,7 +97,7 @@ func ringBenchmark(nodes, hops int) {
 	fmt.Printf("Ring benchmark: %d hops across %d tasks in %s (%.0f hops/s)\n", hops, nodes, duration, rate)
 }
 
-func selectFanIn(workers, tasks int) {
+func fanInBenchmark(workers, tasks int) {
 	if workers < 1 {
 		return
 	}
