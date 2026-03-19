@@ -24,11 +24,18 @@ make run-all
 
 ## Benchmarks Included
 
-Currently enabled (working):
 1. **Channel ping-pong** — Two fibers pass a message back and forth
 2. **Ring benchmark** — Token passing around a ring of fibers
+3. **Selective receive / fan-out / fan-in** — Producer-consumer with select
+4. **Spawn idle tasks** — Fiber creation and join overhead
+5. **Prime sieve** — Concurrent prime pipeline
 
-Additional benchmarks (selective receive, spawn idle, prime sieve) are available but currently disabled due to implementation issues.
+The spawn-idle benchmark defaults to 50,000 fibers to avoid exhausting per-fiber
+stack mappings on typical Linux configurations. Override it with:
+
+```sh
+GOC_BENCH_SPAWN_COUNT=200000 make run
+```
 
 ## Output Format
 

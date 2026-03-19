@@ -27,6 +27,7 @@
  * wake
  *
  * Called under ch->lock. Unified wakeup path for a single parked entry.
+ * Returns true when the entry is claimed and scheduled, false otherwise.
  * Steps:
  *   1. Acquire-load e->cancelled; if set → ch->dead_count++; return.
  *   2. CAS e->woken 0→1 (acq_rel); if fails → ch->dead_count++; return.
@@ -41,16 +42,16 @@
  * MCO_DEAD; calling post_to_run_queue on them would resume a dead coroutine
  * and produce a SIGSEGV.
  * -------------------------------------------------------------------------- */
-void wake(goc_chan* ch, goc_entry* e, void* value)
+bool wake(goc_chan* ch, goc_entry* e, void* value)
 {
     if (atomic_load_explicit(&e->cancelled, memory_order_acquire)) {
         ch->dead_count++;
-        return;
+        return false;
     }
 
     if (!try_claim_wake(e)) {
         ch->dead_count++;
-        return;
+        return false;
     }
 
     if (e->result_slot != NULL)
@@ -79,6 +80,8 @@ void wake(goc_chan* ch, goc_entry* e, void* value)
         goc_sync_post(e->sync_sem_ptr);
         break;
     }
+
+    return true;
 }
 
 /* --------------------------------------------------------------------------

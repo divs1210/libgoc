@@ -95,7 +95,7 @@ struct goc_entry {
     goc_entry_kind     kind;
     _Atomic int        cancelled;       /* set to 1 to cancel this entry (alts loser path) */
     _Atomic int        woken;           /* CAS 0→1 to claim wake; only one winner */
-    _Atomic int*       fired;           /* pointer to the shared fired flag for goc_alts */
+    _Atomic int*       fired;           /* shared fired flag for goc_alts; NULL otherwise */
     struct goc_entry*  next;            /* intrusive linked list (takers / putters) */
 
     /* Fiber / pool context */
@@ -200,6 +200,15 @@ void pool_fiber_born(goc_pool* pool);
 
 /* channel.c — inline helper for common atomic CAS pattern */
 static inline bool try_claim_wake(goc_entry* e) {
+    if (e->fired != NULL) {
+        int expected_fired = 0;
+        if (!atomic_compare_exchange_strong_explicit(
+                e->fired, &expected_fired, 1,
+                memory_order_acq_rel, memory_order_acquire)) {
+            return false;
+        }
+    }
+
     int expected = 0;
     return atomic_compare_exchange_strong_explicit(
         &e->woken, &expected, 1,
