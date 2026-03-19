@@ -204,9 +204,7 @@ static void* pool_worker_fn(void* arg) {
         GC_add_roots(&entry, &entry + 1);
 
         /* Canary check — abort on stack overflow before corrupting anything. */
-        if (*entry->stack_canary_ptr != GOC_STACK_CANARY) {
-            abort();
-        }
+        goc_stack_canary_check(entry->stack_canary_ptr);
 
         /* Save the coroutine handle before resuming.  If this is a parking
          * entry (stack-allocated inside goc_take on the fiber's own stack),

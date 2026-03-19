@@ -279,7 +279,7 @@ goc_val_t goc_take(goc_chan* ch)
     e.pool             = ((goc_entry*)mco_get_user_data(mco_running()))->pool;
     e.result_slot      = &local_result;
     e.ok               = GOC_CLOSED;   /* default; overwritten by wake on success */
-    e.stack_canary_ptr = (uint32_t*)e.coro->stack_base;
+    goc_stack_canary_init(&e);
 
     /* Append to takers list */
     goc_entry** pp = &ch->takers;
@@ -356,7 +356,7 @@ goc_status_t goc_put(goc_chan* ch, void* val)
     e.pool             = ((goc_entry*)mco_get_user_data(mco_running()))->pool;
     e.put_val          = val;
     e.ok               = GOC_CLOSED;   /* default; overwritten by wake on success */
-    e.stack_canary_ptr = (uint32_t*)e.coro->stack_base;
+    goc_stack_canary_init(&e);
 
     /* Append to putters list */
     goc_entry** pp = &ch->putters;

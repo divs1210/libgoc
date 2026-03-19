@@ -165,6 +165,28 @@ struct goc_entry {
 #define GOC_STACK_CANARY  0xDEADC0DEu
 
 /* ---------------------------------------------------------------------------
+ * Conditional Stack Protection Macros
+ *
+ * With virtual memory allocator (LIBGOC_VMEM_ENABLED), stack overflow
+ * protection is unnecessary since stacks can grow dynamically. These macros
+ * compile to no-ops to avoid overhead and potential bugs with virtual stacks.
+ *
+ * With fixed-size stacks, full protection is enabled to catch overflows.
+ * --------------------------------------------------------------------------- */
+
+#ifdef LIBGOC_VMEM_ENABLED
+    /* Virtual memory mode: no stack boundaries to protect */
+    #define goc_stack_canary_init(entry)  do { (entry)->stack_canary_ptr = NULL; } while(0)
+    #define goc_stack_canary_set(ptr)     do { (void)(ptr); } while(0)
+    #define goc_stack_canary_check(ptr)   do { (void)(ptr); } while(0)
+#else
+    /* Fixed stack mode: enable overflow protection */
+    #define goc_stack_canary_init(entry)  do { (entry)->stack_canary_ptr = (uint32_t*)(entry)->coro->stack_base; } while(0)
+    #define goc_stack_canary_set(ptr)     do { *(ptr) = GOC_STACK_CANARY; } while(0)
+    #define goc_stack_canary_check(ptr)   do { if (*(ptr) != GOC_STACK_CANARY) abort(); } while(0)
+#endif
+
+/* ---------------------------------------------------------------------------
  * Internal Function Declarations (cross-module)
  * --------------------------------------------------------------------------- */
 

@@ -398,16 +398,19 @@ Each fiber stack is created and managed by minicoro. Stack allocation, alignment
 
 Per-fiber stack size uses minicoro's default (passed as `0` to `mco_desc_init`), which adapts to the active allocator. Avoid large stack allocations and deep recursion inside fiber entry functions — see [minicoro Limitations](#minicoro-limitations).
 
-**Canary-based stack overflow detection.** libgoc writes a sentinel canary word at the lowest address of each fiber stack immediately after `mco_create` returns. The worker loop checks the canary *before* every `mco_resume` call. If the canary has been overwritten, the runtime calls `abort()` with a diagnostic message identifying the corrupted fiber. This converts the silent heap corruption that minicoro would otherwise allow into a deterministic, debuggable crash. The canary is stored in `goc_entry` alongside the coroutine handle:
+**Conditional stack overflow detection.** When virtual memory is disabled (`-DLIBGOC_VMEM=OFF`), libgoc writes a sentinel canary word at the lowest address of each fiber stack immediately after `mco_create` returns. The worker loop checks the canary *before* every `mco_resume` call. If the canary has been overwritten, the runtime calls `abort()` with a diagnostic message identifying the corrupted fiber. This converts silent heap corruption into a deterministic, debuggable crash.
+
+With virtual memory enabled (default), stacks can grow dynamically and overflow detection is disabled for performance. The canary logic compiles to no-ops via conditional macros in `src/internal.h`. Stack protection is only meaningful with fixed-size stacks.
 
 ```c
-/* written once in fiber.c immediately after mco_create */
+/* Non-virtual memory mode: canary protection enabled */
+#ifndef LIBGOC_VMEM_ENABLED
 entry->stack_canary_ptr = (uint32_t*)entry->coro->stack_base;
 *entry->stack_canary_ptr = GOC_STACK_CANARY;   /* e.g. 0xDEADC0DE */
 
-/* checked in pool.c before every mco_resume */
 if (*entry->stack_canary_ptr != GOC_STACK_CANARY)
     abort();   /* stack overflow detected — terminate immediately */
+#endif
 mco_resume(entry->coro);
 ```
 
@@ -493,7 +496,7 @@ libgoc uses [minicoro](https://github.com/edubart/minicoro) for all fiber switch
 
 **C++ exceptions are not supported.** The C++ exception mechanism maintains internal unwinding state that is not preserved across a coroutine context switch. Throwing an exception that propagates across a `mco_yield` / `mco_resume` boundary is undefined behaviour and will typically corrupt the exception handler chain or crash. In mixed C/C++ codebases all fiber entry functions must be declared `extern "C"` and must not allow any C++ exception to escape them.
 
-**Stack overflow aborts the process.** libgoc writes a canary value at the low end of each fiber stack on creation and validates it on every resume. If the canary has been overwritten, the runtime calls `abort()` immediately with a diagnostic message. This turns silent heap corruption into a deterministic, debuggable crash. Stack overflow is still a programming error — avoid large stack-allocated buffers and deep recursion inside fibers. If a fiber is known to need more stack space, restructure the work to use `goc_malloc`-allocated buffers on the GC heap instead.
+**Stack management.** By default, libgoc enables minicoro's virtual memory allocator for dynamic stack growth. When virtual memory is disabled (`-DLIBGOC_VMEM=OFF`), libgoc uses fixed-size stacks with canary-based overflow detection. If stack overflow is detected, the runtime calls `abort()` immediately with a diagnostic message. Avoid large stack-allocated buffers and deep recursion inside fibers regardless of stack mode — use `goc_malloc`-allocated buffers on the GC heap for large data.
 
 **`src/minicoro.c` must be compiled without `-DGC_THREADS`.** minicoro declares a `static MCO_THREAD_LOCAL mco_current_co` variable (a `thread_local` TLS slot) to track the running coroutine per thread. When Boehm GC is compiled with `GC_THREADS` it wraps `pthread_create` and invokes `GC_call_with_stack_base` during thread startup, which walks TLS descriptors. If minicoro's TLS block is visible to that walk before `mco_current_co` is initialised on a new thread, the GC faults with a SIGSEGV inside its own startup code — even if no minicoro function has yet been called. The fix is to compile `src/minicoro.c` in its own isolated translation unit with `-UGC_THREADS`, which `CMakeLists.txt` enforces via `set_source_files_properties`. minicoro never calls any GC function, so the flag is irrelevant to its correctness regardless.
 

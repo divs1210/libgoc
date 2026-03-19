@@ -253,7 +253,7 @@ goc_alts_result goc_alts(goc_alt_op *ops, size_t n) {
         e->next            = NULL;
         e->pool            = pool;
         e->coro            = running;
-        e->stack_canary_ptr = (uint32_t *)running->stack_base;
+        goc_stack_canary_init(e);
         e->ok              = GOC_CLOSED; /* safe default; overwritten on wake */
         e->arm_idx         = i;
 
@@ -489,7 +489,7 @@ goc_alts_result goc_alts_sync(goc_alt_op *ops, size_t n) {
         e->next             = NULL;
         e->pool             = NULL;
         e->coro             = NULL;
-        e->stack_canary_ptr = NULL;
+        e->stack_canary_ptr = NULL;  /* sync entries don't have fiber stacks */
         e->ok               = GOC_CLOSED;
         e->arm_idx          = i;
         e->sync_sem_ptr     = &shared_sync;
