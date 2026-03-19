@@ -4,7 +4,7 @@ run:
 	go run .
 
 build:
-	go build -o bench-go .
+	go build -ldflags="-s -w" -o bench-go .
 
 clean:
 	rm -f bench-go
