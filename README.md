@@ -649,10 +649,7 @@ int main(void) {
     goc_init();
 
     // reify main thread as main fiber
-    goc_chan* join_main_fiber = goc_go(main_fiber, NULL);
-
-    // wait for main fiber to finish
-    goc_take_sync(join_main_fiber);
+    goc_go(main_fiber, NULL);
 
     goc_shutdown();
     return 0;
