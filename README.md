@@ -692,7 +692,6 @@ A C11 compiler is required: GCC or Clang on Linux/macOS; MinGW-w64 GCC via MSYS2
 
 | Constant | Default | Description |
 |---|---|---|
-| `GOC_PAGE_SIZE` | platform | Memory page size used for stack alignment |
 | `GOC_DEFAULT_STACK_SIZE` | `65536` | Per-fiber stack size (64 KB) |
 | `GOC_DEAD_COUNT_THRESHOLD` | `8` | Dead-entry compaction threshold for channel waiter lists |
 | `GOC_ALTS_STACK_THRESHOLD` | `8` | Max `goc_alts` arms before scratch buffer moves to heap |

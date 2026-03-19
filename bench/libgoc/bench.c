@@ -71,7 +71,7 @@ static void bench_ping_pong(size_t ping_rounds) {
     uint64_t t1 = uv_hrtime();
 
     double s    = (double)(t1 - t0) / 1e9;
-    double rate = (double)ping_rounds / s;
+    double rate = (double)(ping_rounds) / s;
     printf("Channel ping-pong: %zu round trips in %.3fs (%.0f round trips/s)\n",
            ping_rounds, s, rate);
 }
@@ -102,7 +102,7 @@ static void bench_ping_pong(size_t ping_rounds) {
 int main(void) {
     goc_init();
 
-    const size_t ping_rounds = 3000;
+    size_t ping_rounds = 3000;
     bench_ping_pong(ping_rounds);
 
     goc_shutdown();
