@@ -103,12 +103,12 @@ int main(void) {
     goc_init();
 
     size_t ping_rounds    = 200000;
-    size_t ring_nodes     = 128;
-    size_t ring_hops      = 500000;
-    size_t select_workers = 8;
-    size_t select_tasks   = 200000;
-    size_t spawn_count    = 200000;
-    size_t prime_max      = 20000;
+    // size_t ring_nodes     = 128;
+    // size_t ring_hops      = 500000;
+    // size_t select_workers = 8;
+    // size_t select_tasks   = 200000;
+    // size_t spawn_count    = 200000;
+    // size_t prime_max      = 20000;
 
     bench_ping_pong(ping_rounds);
 
