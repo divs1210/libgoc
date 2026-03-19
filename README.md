@@ -56,6 +56,7 @@ See the [Design Doc](./DESIGN.md) for implementation details and [TODO](./TODO.m
   - [Thread pool](#thread-pool)
   - [Scheduler loop access](#scheduler-loop-access)
 - [Best Practices](#best-practices)
+- [Benchmarks](#benchmarks)
 - [Building and Testing](#building-and-testing)
   - [Prerequisites](#prerequisites)
   - [macOS](#macos)
@@ -364,8 +365,8 @@ goc_close(ch);
 
 | Function | Signature | Description |
 |---|---|---|
-| `goc_go` | `goc_chan* goc_go(void (*fn)(void*), void* arg)` | Spawn a fiber on the default pool with the default 64 KB stack. Returns a **join channel** that is closed automatically when the fiber returns. Pass the join channel as an arm to `goc_alts` or call `goc_take`/`goc_take_sync` on it to await fiber completion. The join channel may be ignored if no join is needed. |
-| `goc_go_on` | `goc_chan* goc_go_on(goc_pool* pool, void (*fn)(void*), void* arg)` | Spawn on a specific pool with the default stack size. Returns a join channel with the same semantics as `goc_go`. |
+| `goc_go` | `goc_chan* goc_go(void (*fn)(void*), void* arg)` | Spawn a fiber on the default pool. Stack is managed by minicoro. Returns a **join channel** that is closed automatically when the fiber returns. Pass the join channel as an arm to `goc_alts` or call `goc_take`/`goc_take_sync` on it to await fiber completion. The join channel may be ignored if no join is needed. |
+| `goc_go_on` | `goc_chan* goc_go_on(goc_pool* pool, void (*fn)(void*), void* arg)` | Spawn on a specific pool. Stack is managed by minicoro. Returns a join channel with the same semantics as `goc_go`. |
 
 ```c
 typedef struct { goc_chan* ch; int n; } args_t;
@@ -392,7 +393,7 @@ libgoc uses [minicoro](https://github.com/edubart/minicoro) for fiber switching.
 
 **C++ exceptions are not supported.** Throwing a C++ exception that unwinds across a `mco_yield` / `mco_resume` boundary is undefined behaviour — the exception mechanism's internal state is not preserved across a coroutine switch. In mixed C/C++ codebases, all fiber entry functions must be declared `extern "C"` and must not allow any C++ exception to propagate out of them.
 
-**Stack overflow aborts the process.** libgoc writes a canary value at the low end of each fiber stack on creation and validates it on every resume. If the canary has been overwritten, the runtime calls `abort()` immediately with a diagnostic message. This turns silent heap corruption into a deterministic, debuggable crash. Stack overflow is still a programming error — avoid large stack-allocated buffers and deep recursion inside fibers. If a fiber is known to need more stack space, restructure the work to use `goc_malloc`-allocated buffers on the GC heap instead.
+**Stack management.** By default, libgoc uses minicoro's virtual memory allocator, which allows fiber stacks to grow dynamically and eliminates stack overflow concerns. When virtual memory is disabled (`-DLIBGOC_VMEM=OFF`), libgoc uses canary-protected stacks with overflow detection. If stack overflow is detected, the runtime calls `abort()` immediately with a diagnostic message. This turns silent heap corruption into a deterministic, debuggable crash. Avoid large stack-allocated buffers and deep recursion inside fibers; use `goc_malloc`-allocated buffers on the GC heap for large data instead.
 
 **`src/minicoro.c` must be compiled without `-DGC_THREADS`.** The build system enforces this with `-UGC_THREADS` on that translation unit. This avoids a TLS interaction between minicoro and Boehm's thread wrapper during thread startup.
 
@@ -413,6 +414,8 @@ static void on_put_done(goc_status_t ok, void* ud) {
     (void)ok; (void)ud;  // GC-allocated; no free needed even if channel closed
 }
 
+// on_read runs on the libuv loop thread — goc_put_cb is safe to call here.
+// The callback (on_put_done) will also be invoked on the loop thread.
 static void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
     if (nread <= 0) return;
     my_msg_t* msg = goc_malloc(sizeof(my_msg_t));
@@ -583,7 +586,7 @@ goc_close(w);          /* release */
 
 ### Thread pool
 
-The default pool is created by `goc_init` with `max(4, hardware_concurrency)` worker threads. This can be overridden by setting the `GOC_POOL_THREADS` environment variable before calling `goc_init`.
+The default pool is created by `goc_init` with `max(4, hardware_concurrency)` worker threads. This can be overridden by setting the `GOC_POOL_THREADS` environment variable to a positive integer before calling `goc_init`. Invalid values (non-numeric, zero, or negative) are silently ignored and the default is used.
 
 ```c
 typedef enum {
@@ -665,6 +668,12 @@ static void main_fiber(void* _ub) {
 
 ---
 
+## Benchmarks
+
+Benchmark suites for Go and libgoc live under [`bench/`](./bench/README.md). They are separate from the library build and CI, and are intended for performance exploration only.
+
+---
+
 ## Building and Testing
 
 libgoc ships with a comprehensive, phased test suite covering the full public API. See the [Testing section in the Design Doc](./DESIGN.md#testing) for a breakdown of the test phases and what each one covers.
@@ -685,8 +694,6 @@ A C11 compiler is required: GCC or Clang on Linux/macOS; MinGW-w64 GCC via MSYS2
 
 | Constant | Default | Description |
 |---|---|---|
-| `GOC_PAGE_SIZE` | platform | Memory page size used for stack alignment |
-| `GOC_DEFAULT_STACK_SIZE` | `65536` | Per-fiber stack size (64 KB) |
 | `GOC_DEAD_COUNT_THRESHOLD` | `8` | Dead-entry compaction threshold for channel waiter lists |
 | `GOC_ALTS_STACK_THRESHOLD` | `8` | Max `goc_alts` arms before scratch buffer moves to heap |
 
@@ -800,6 +807,25 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 # RelWithDebInfo (default)
 cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 ```
+
+---
+
+### Virtual memory allocator
+
+libgoc uses minicoro's virtual memory allocator by default, which enables dynamic stack growth and eliminates stack overflow concerns for most applications. This can be disabled for debugging or profiling if needed.
+
+```sh
+# Default: virtual memory enabled (recommended)
+cmake -B build
+
+# Disable virtual memory (canary-protected stacks)
+cmake -B build -DLIBGOC_VMEM=OFF
+```
+
+With virtual memory disabled (`-DLIBGOC_VMEM=OFF`), fibers use canary-protected stacks with overflow detection. Stack overflow will abort the process with a diagnostic message. This mode is useful for:
+- Debugging stack usage patterns
+- Profiling with deterministic memory layout
+- Environments without virtual memory support
 
 ---
 

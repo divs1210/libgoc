@@ -12,6 +12,7 @@ endif()
 # Build options
 # ---------------------------------------------------------------------------
 option(LIBGOC_SHARED   "Build a shared library (libgoc.so / .dylib / .dll)" OFF)
+option(LIBGOC_VMEM     "Use minicoro virtual memory allocator (recommended)" ON)
 option(LIBGOC_ASAN     "Build an instrumented copy of goc with AddressSanitizer" OFF)
 option(LIBGOC_TSAN     "Build an instrumented copy of goc with ThreadSanitizer" OFF)
 option(LIBGOC_COVERAGE "Instrument goc and tests for code coverage" OFF)
@@ -84,13 +85,22 @@ endfunction()
 # minicoro.c must NOT be compiled with -DGC_THREADS.
 # Set globally before any add_library so it applies to all targets that
 # include this source file. Does not require TARGET_DIRECTORY (CMake 3.26+).
-set_source_files_properties(src/minicoro.c PROPERTIES COMPILE_OPTIONS "-UGC_THREADS;-UGC_PTHREADS")
+if(LIBGOC_VMEM)
+    set_source_files_properties(src/minicoro.c PROPERTIES COMPILE_OPTIONS "-UGC_THREADS;-UGC_PTHREADS;-DMCO_USE_VMEM_ALLOCATOR")
+else()
+    set_source_files_properties(src/minicoro.c PROPERTIES COMPILE_OPTIONS "-UGC_THREADS;-UGC_PTHREADS")
+endif()
 
 # ---------------------------------------------------------------------------
 # Primary static library: goc
 # ---------------------------------------------------------------------------
 add_library(goc STATIC ${GOC_SOURCES})
 goc_configure_target(goc)
+
+# Pass virtual memory flag to source code
+if(LIBGOC_VMEM)
+    target_compile_definitions(goc PRIVATE LIBGOC_VMEM_ENABLED)
+endif()
 
 # ---------------------------------------------------------------------------
 # Optional shared library: goc_shared  (-DLIBGOC_SHARED=ON)
@@ -99,6 +109,9 @@ if(LIBGOC_SHARED)
     add_library(goc_shared SHARED ${GOC_SOURCES})
     goc_configure_target(goc_shared)
     set_target_properties(goc_shared PROPERTIES OUTPUT_NAME goc)
+    if(LIBGOC_VMEM)
+        target_compile_definitions(goc_shared PRIVATE LIBGOC_VMEM_ENABLED)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -109,6 +122,9 @@ if(LIBGOC_ASAN)
     goc_configure_target(goc_asan)
     target_compile_options(goc_asan PRIVATE -fsanitize=address -fno-omit-frame-pointer)
     target_link_options(goc_asan INTERFACE -fsanitize=address)
+    if(LIBGOC_VMEM)
+        target_compile_definitions(goc_asan PRIVATE LIBGOC_VMEM_ENABLED)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -119,6 +135,9 @@ if(LIBGOC_TSAN)
     goc_configure_target(goc_tsan)
     target_compile_options(goc_tsan PRIVATE -fsanitize=thread)
     target_link_options(goc_tsan INTERFACE -fsanitize=thread)
+    if(LIBGOC_VMEM)
+        target_compile_definitions(goc_tsan PRIVATE LIBGOC_VMEM_ENABLED)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

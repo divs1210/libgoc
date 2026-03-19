@@ -22,12 +22,18 @@ on:
 
 jobs:
   test:
-    name: Build & Test
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          # Virtual memory mode (recommended) - all platforms
+          - { os: ubuntu-latest,  mode: "vmem",   cmake_flags: "",                   name: "Ubuntu (vmem)" }
+          - { os: macos-latest,   mode: "vmem",   cmake_flags: "",                   name: "macOS (vmem)" }
+          - { os: windows-latest, mode: "vmem",   cmake_flags: "",                   name: "Windows (vmem)" }
+          # Canary mode - Ubuntu only (for stack protection validation)
+          - { os: ubuntu-latest,  mode: "canary", cmake_flags: "-DLIBGOC_VMEM=OFF", name: "Ubuntu (canary)" }
 
     env:
       BDWGC_VERSION: "8.2.6"
@@ -89,7 +95,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           set -x
-          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo ${{ matrix.cmake_flags }}
           cmake --build build --parallel $(nproc)
         timeout-minutes: 2
         env:
@@ -100,6 +106,7 @@ jobs:
         run: ctest --test-dir build --output-on-failure --timeout 120
         env:
           LD_LIBRARY_PATH: ${{ env.BDWGC_PREFIX }}/lib
+          LIBGOC_TEST_MODE: ${{ matrix.mode }}
 
       # ---- macOS -------------------------------------------------------
 
@@ -125,13 +132,15 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           set -x
-          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo ${{ matrix.cmake_flags }}
           cmake --build build --parallel $(sysctl -n hw.ncpu)
         timeout-minutes: 5
 
       - name: Test (macOS)
         if: runner.os == 'macOS'
         run: ctest --test-dir build --output-on-failure --timeout 120
+        env:
+          LIBGOC_TEST_MODE: ${{ matrix.mode }}
 
       # ---- Windows -----------------------------------------------------
       # Uses MSYS2/MinGW-w64 (UCRT64) to provide a POSIX-compatible toolchain
@@ -168,7 +177,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo ${{ matrix.cmake_flags }}
           cmake --build build --parallel $(nproc)
         timeout-minutes: 10
 
@@ -176,3 +185,5 @@ jobs:
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: ctest --test-dir build --output-on-failure --timeout 120
+        env:
+          LIBGOC_TEST_MODE: ${{ matrix.mode }}

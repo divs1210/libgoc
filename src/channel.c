@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <assert.h>
 #include <stdatomic.h>
+#include <sched.h>
 #include <uv.h>
 #include <gc.h>
 #include "minicoro.h"
@@ -47,10 +48,7 @@ void wake(goc_chan* ch, goc_entry* e, void* value)
         return;
     }
 
-    int expected = 0;
-    if (!atomic_compare_exchange_strong_explicit(
-            &e->woken, &expected, 1,
-            memory_order_acq_rel, memory_order_acquire)) {
+    if (!try_claim_wake(e)) {
         ch->dead_count++;
         return;
     }
@@ -61,9 +59,19 @@ void wake(goc_chan* ch, goc_entry* e, void* value)
     e->ok = GOC_OK;
 
     switch (e->kind) {
-    case GOC_FIBER:
+    case GOC_FIBER: {
+        /* Spin until the fiber has truly called mco_yield (parked == 1).
+         * There is a brief window between when the parking fiber releases
+         * ch->lock and when it calls mco_yield.  Calling post_to_run_queue
+         * during that window causes a pool worker to call mco_resume on a
+         * MCO_RUNNING coroutine, which silently fails, leaving the fiber
+         * permanently suspended with no one to resume it (hang). */
+        goc_entry* fe = (goc_entry*)mco_get_user_data(e->coro);
+        while (atomic_load_explicit(&fe->parked, memory_order_acquire) == 0)
+            sched_yield();
         post_to_run_queue(e->pool, e);
         break;
+    }
     case GOC_CALLBACK:
         post_callback(e, value);
         break;
@@ -149,6 +157,44 @@ void chan_set_on_close(goc_chan* ch, void (*on_close)(void*), void* ud)
         on_close(ud);
 }
 
+/* -------------------------------------------------------------------------
+ * wake_all_parked_entries — Wake all entries in a waiter list with GOC_CLOSED
+ *
+ * Called by goc_close() to wake all parked entries. Skips cancelled entries
+ * (goc_alts losers whose coroutines are already MCO_DEAD).
+ * ---------------------------------------------------------------------- */
+static void wake_all_parked_entries(goc_entry* head) {
+    goc_entry* e = head;
+    while (e != NULL) {
+        /* Snapshot next before any dispatch: for GOC_FIBER entries,
+         * post_to_run_queue may allow a pool thread to resume the fiber
+         * immediately, which can cause the entry to be freed (if it was
+         * stack-allocated in goc_take) or collected (if GC-heap allocated
+         * in goc_alts).  Reading e->next after dispatch is use-after-free. */
+        goc_entry* next = e->next;
+        /* Skip cancelled entries (goc_alts losers): their coroutine is
+         * already dead; calling post_to_run_queue on it would resume a
+         * MCO_DEAD coro and crash.  This mirrors the same guard in wake(). */
+        if (!atomic_load_explicit(&e->cancelled, memory_order_acquire)) {
+            if (try_claim_wake(e)) {
+                e->ok = GOC_CLOSED;
+                switch (e->kind) {
+                case GOC_FIBER: {
+                    goc_entry* fe = (goc_entry*)mco_get_user_data(e->coro);
+                    while (atomic_load_explicit(&fe->parked, memory_order_acquire) == 0)
+                        sched_yield();
+                    post_to_run_queue(e->pool, e);
+                    break;
+                }
+                case GOC_CALLBACK: post_callback(e, NULL);        break;
+                case GOC_SYNC:     goc_sync_post(e->sync_sem_ptr);     break;
+                }
+            }
+        }
+        e = next;
+    }
+}
+
 /* --------------------------------------------------------------------------
  * goc_close
  *
@@ -171,59 +217,10 @@ void goc_close(goc_chan* ch)
     ch->closed = 1;
 
     /* Wake all parked takers with GOC_CLOSED */
-    {
-        goc_entry* e = ch->takers;
-        while (e != NULL) {
-            /* Snapshot next before any dispatch: for GOC_FIBER entries,
-             * post_to_run_queue may allow a pool thread to resume the fiber
-             * immediately, which can cause the entry to be freed (if it was
-             * stack-allocated in goc_take) or collected (if GC-heap allocated
-             * in goc_alts).  Reading e->next after dispatch is use-after-free.
-             * This mirrors the same fix in chan_put_to_taker. */
-            goc_entry* next = e->next;
-            /* Skip cancelled entries (goc_alts losers): their coroutine is
-             * already dead; calling post_to_run_queue on it would resume a
-             * MCO_DEAD coro and crash.  This mirrors the same guard in wake(). */
-            if (!atomic_load_explicit(&e->cancelled, memory_order_acquire)) {
-                int exp = 0;
-                if (atomic_compare_exchange_strong_explicit(
-                        &e->woken, &exp, 1,
-                        memory_order_acq_rel, memory_order_acquire)) {
-                    e->ok = GOC_CLOSED;
-                    switch (e->kind) {
-                    case GOC_FIBER:    post_to_run_queue(e->pool, e); break;
-                    case GOC_CALLBACK: post_callback(e, NULL);        break;
-                    case GOC_SYNC:     goc_sync_post(e->sync_sem_ptr);     break;
-                    }
-                }
-            }
-            e = next;
-        }
-    }
+    wake_all_parked_entries(ch->takers);
 
     /* Wake all parked putters with GOC_CLOSED */
-    {
-        goc_entry* e = ch->putters;
-        while (e != NULL) {
-            /* Same next-snapshot fix as the takers loop above. */
-            goc_entry* next = e->next;
-            /* Same cancelled guard as the takers loop above. */
-            if (!atomic_load_explicit(&e->cancelled, memory_order_acquire)) {
-                int exp = 0;
-                if (atomic_compare_exchange_strong_explicit(
-                        &e->woken, &exp, 1,
-                        memory_order_acq_rel, memory_order_acquire)) {
-                    e->ok = GOC_CLOSED;
-                    switch (e->kind) {
-                    case GOC_FIBER:    post_to_run_queue(e->pool, e); break;
-                    case GOC_CALLBACK: post_callback(e, NULL);        break;
-                    case GOC_SYNC:     goc_sync_post(e->sync_sem_ptr);     break;
-                    }
-                }
-            }
-            e = next;
-        }
-    }
+    wake_all_parked_entries(ch->putters);
 
     on_close = ch->on_close;
     on_close_ud = ch->on_close_ud;
@@ -247,10 +244,9 @@ goc_val_t goc_take(goc_chan* ch)
 
     uv_mutex_lock(ch->lock);
 
-    /* FIX: compact_dead_entries must be called under the lock — it mutates
-     * ch->takers, ch->putters, and ch->dead_count. The threshold check uses
-     * the current value of dead_count, which is now read while holding the
-     * lock and therefore consistent. */
+    /* Amortized cleanup: compact dead entries every GOC_DEAD_COUNT_THRESHOLD
+     * cancelled entries to prevent waiter list bloat. Must be called under
+     * ch->lock since it mutates ch->takers and ch->putters. */
     if (ch->dead_count >= GOC_DEAD_COUNT_THRESHOLD)
         compact_dead_entries(ch);
 
@@ -283,12 +279,19 @@ goc_val_t goc_take(goc_chan* ch)
     e.pool             = ((goc_entry*)mco_get_user_data(mco_running()))->pool;
     e.result_slot      = &local_result;
     e.ok               = GOC_CLOSED;   /* default; overwritten by wake on success */
-    e.stack_canary_ptr = (uint32_t*)e.coro->stack_base;
+    goc_stack_canary_init(&e);
 
     /* Append to takers list */
     goc_entry** pp = &ch->takers;
     while (*pp) pp = &(*pp)->next;
     *pp = &e;
+
+    /* Set parked = 0 on the fiber's initial entry while ch->lock is still held.
+     * wake() and goc_close() will spin until pool_worker_fn sets it back to 1
+     * after mco_resume returns, guaranteeing the coroutine is truly
+     * MCO_SUSPENDED before any worker calls mco_resume on it. */
+    goc_entry* fiber_entry = (goc_entry*)mco_get_user_data(mco_running());
+    atomic_store_explicit(&fiber_entry->parked, 0, memory_order_release);
 
     void* stack_base = e.coro->stack_base;
     void* stack_top  = (char*)stack_base + e.coro->stack_size;
@@ -296,6 +299,7 @@ goc_val_t goc_take(goc_chan* ch)
 
     uv_mutex_unlock(ch->lock);
     mco_yield(mco_running());
+    /* pool_worker_fn has set fiber_entry->parked = 1 by this point */
 
     GC_remove_roots(stack_base, stack_top);
 
@@ -314,10 +318,9 @@ goc_status_t goc_put(goc_chan* ch, void* val)
 
     uv_mutex_lock(ch->lock);
 
-    /* FIX: compact_dead_entries must be called under the lock — it mutates
-     * ch->takers, ch->putters, and ch->dead_count. The threshold check uses
-     * the current value of dead_count, which is now read while holding the
-     * lock and therefore consistent. */
+    /* Amortized cleanup: compact dead entries every GOC_DEAD_COUNT_THRESHOLD
+     * cancelled entries to prevent waiter list bloat. Must be called under
+     * ch->lock since it mutates ch->takers and ch->putters. */
     if (ch->dead_count >= GOC_DEAD_COUNT_THRESHOLD)
         compact_dead_entries(ch);
 
@@ -353,12 +356,16 @@ goc_status_t goc_put(goc_chan* ch, void* val)
     e.pool             = ((goc_entry*)mco_get_user_data(mco_running()))->pool;
     e.put_val          = val;
     e.ok               = GOC_CLOSED;   /* default; overwritten by wake on success */
-    e.stack_canary_ptr = (uint32_t*)e.coro->stack_base;
+    goc_stack_canary_init(&e);
 
     /* Append to putters list */
     goc_entry** pp = &ch->putters;
     while (*pp) pp = &(*pp)->next;
     *pp = &e;
+
+    /* Same yield-gate as goc_take slow path. */
+    goc_entry* fiber_entry = (goc_entry*)mco_get_user_data(mco_running());
+    atomic_store_explicit(&fiber_entry->parked, 0, memory_order_release);
 
     void* stack_base = e.coro->stack_base;
     void* stack_top  = (char*)stack_base + e.coro->stack_size;
@@ -366,6 +373,7 @@ goc_status_t goc_put(goc_chan* ch, void* val)
 
     uv_mutex_unlock(ch->lock);
     mco_yield(mco_running());
+    /* pool_worker_fn has set fiber_entry->parked = 1 by this point */
 
     GC_remove_roots(stack_base, stack_top);
 

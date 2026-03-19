@@ -13,6 +13,10 @@
  *   Phase 5 — Re-scan under locks; return immediately if any arm fires.
  *   Phase 6 — Enqueue all entries and yield / goc_sync_wait.
  *   Phase 7 — On resume: cancel losers, extract winner, return result.
+ *
+ * Phase 1 and Phase 2 are shared between both functions via helper functions
+ * to reduce code duplication while preserving the distinct behavior needed
+ * for fiber vs OS thread contexts.
  */
 
 #include <stdio.h>
@@ -57,6 +61,86 @@ static void alts_shuffle(size_t *indices, size_t n) {
         indices[i] = indices[j];
         indices[j] = tmp;
     }
+}
+
+/* -------------------------------------------------------------------------
+ * alts_build_index_array — Phase 1 helper: Build shuffled index array
+ *
+ * Builds a shuffled array of non-default arm indices and validates that
+ * at most one default arm is provided. Returns the number of non-default
+ * arms and sets default_idx to the default arm index (if any).
+ * ------------------------------------------------------------------------- */
+static size_t alts_build_index_array(goc_alt_op *ops, size_t n, size_t *indices,
+                                     size_t *default_idx, const char *func_name) {
+    *default_idx = (size_t)-1;
+    size_t n_nondefault = 0;
+    size_t n_default = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        if (ops[i].op_kind == GOC_ALT_DEFAULT) {
+            n_default++;
+            if (n_default > 1) {
+                fprintf(stderr, "%s: more than one default arm provided (got %zu)\n", func_name, n_default);
+                abort();
+            }
+            *default_idx = i;
+        } else {
+            indices[n_nondefault++] = i;
+        }
+    }
+
+    alts_shuffle(indices, n_nondefault);
+    return n_nondefault;
+}
+
+/* -------------------------------------------------------------------------
+ * alts_try_immediate — Phase 2 helper: Try immediate operations
+ *
+ * Attempts each arm without parking. Returns immediately if any arm can
+ * complete without blocking. Returns {(size_t)-1, {NULL, GOC_EMPTY}} if
+ * no arm is immediately ready.
+ * ------------------------------------------------------------------------- */
+static goc_alts_result alts_try_immediate(goc_alt_op *ops, size_t *indices, size_t n_nondefault) {
+    for (size_t si = 0; si < n_nondefault; si++) {
+        size_t    i  = indices[si];
+        goc_chan *ch = ops[i].ch;
+
+        if (ops[i].op_kind == GOC_ALT_TAKE) {
+            uv_mutex_lock(ch->lock);
+            void *val = NULL;
+            if (chan_take_from_buffer(ch, &val)) {
+                uv_mutex_unlock(ch->lock);
+                return (goc_alts_result){ .index = i, .value = { .val = val, .ok = GOC_OK } };
+            }
+            if (chan_take_from_putter(ch, &val)) {
+                uv_mutex_unlock(ch->lock);
+                return (goc_alts_result){ .index = i, .value = { .val = val, .ok = GOC_OK } };
+            }
+            if (ch->closed && ch->buf_count == 0) {
+                uv_mutex_unlock(ch->lock);
+                return (goc_alts_result){ .index = i, .value = { .val = NULL, .ok = GOC_CLOSED } };
+            }
+            uv_mutex_unlock(ch->lock);
+        } else { /* GOC_ALT_PUT */
+            uv_mutex_lock(ch->lock);
+            if (ch->closed) {
+                uv_mutex_unlock(ch->lock);
+                return (goc_alts_result){ .index = i, .value = { .val = NULL, .ok = GOC_CLOSED } };
+            }
+            if (chan_put_to_buffer(ch, ops[i].put_val)) {
+                uv_mutex_unlock(ch->lock);
+                return (goc_alts_result){ .index = i, .value = { .val = NULL, .ok = GOC_OK } };
+            }
+            if (chan_put_to_taker(ch, ops[i].put_val)) {
+                uv_mutex_unlock(ch->lock);
+                return (goc_alts_result){ .index = i, .value = { .val = NULL, .ok = GOC_OK } };
+            }
+            uv_mutex_unlock(ch->lock);
+        }
+    }
+
+    /* No arm immediately ready */
+    return (goc_alts_result){ .index = (size_t)-1, .value = { .val = NULL, .ok = GOC_EMPTY } };
 }
 
 /* -------------------------------------------------------------------------
@@ -128,79 +212,20 @@ goc_alts_result goc_alts(goc_alt_op *ops, size_t n) {
 
     /* ------------------------------------------------------------------ */
     /* Phase 1 — Shuffle                                                    */
-    /* Build a shuffled index array.  A GOC_ALT_DEFAULT arm is excluded    */
-    /* from the shuffle; it is identified and placed at the end.           */
-    /* Enforce that at most one default arm is provided.                   */
     /* ------------------------------------------------------------------ */
-    size_t  default_idx  = (size_t)-1;
-    size_t  n_nondefault = 0;
-    size_t  n_default = 0;
     /* VLA: n is expected to be small (single digits in practice). A
-     * pathologically large n could overflow the fiber's 64 KB stack; callers
+     * pathologically large n could overflow the stack; callers
      * are responsible for keeping arm counts reasonable. */
     size_t  indices[n];
-
-    for (size_t i = 0; i < n; i++) {
-        if (ops[i].op_kind == GOC_ALT_DEFAULT) {
-            n_default++;
-            if (n_default > 1) {
-                fprintf(stderr, "goc_alts: more than one default arm provided (got %zu)\n", n_default);
-                abort();
-            }
-            default_idx = i;
-        } else {
-            indices[n_nondefault++] = i;
-        }
-    }
-
-    alts_shuffle(indices, n_nondefault);
+    size_t  default_idx;
+    size_t  n_nondefault = alts_build_index_array(ops, n, indices, &default_idx, "goc_alts");
 
     /* ------------------------------------------------------------------ */
-    /* Phase 2 — Non-blocking scan (no lock held between iterations)       */
+    /* Phase 2 — Non-blocking scan                                         */
     /* ------------------------------------------------------------------ */
-    for (size_t si = 0; si < n_nondefault; si++) {
-        size_t    i  = indices[si];
-        goc_chan *ch = ops[i].ch;
-
-        if (ops[i].op_kind == GOC_ALT_TAKE) {
-            uv_mutex_lock(ch->lock);
-            void *val = NULL;
-            if (chan_take_from_buffer(ch, &val)) {
-                uv_mutex_unlock(ch->lock);
-                return (goc_alts_result){ .index = i,
-                                          .value = { .val = val, .ok = GOC_OK } };
-            }
-            if (chan_take_from_putter(ch, &val)) {
-                uv_mutex_unlock(ch->lock);
-                return (goc_alts_result){ .index = i,
-                                          .value = { .val = val, .ok = GOC_OK } };
-            }
-            if (ch->closed && ch->buf_count == 0) {
-                uv_mutex_unlock(ch->lock);
-                return (goc_alts_result){ .index = i,
-                                          .value = { .val = NULL, .ok = GOC_CLOSED } };
-            }
-            uv_mutex_unlock(ch->lock);
-
-        } else { /* GOC_ALT_PUT */
-            uv_mutex_lock(ch->lock);
-            if (ch->closed) {
-                uv_mutex_unlock(ch->lock);
-                return (goc_alts_result){ .index = i,
-                                          .value = { .val = NULL, .ok = GOC_CLOSED } };
-            }
-            if (chan_put_to_taker(ch, ops[i].put_val)) {
-                uv_mutex_unlock(ch->lock);
-                return (goc_alts_result){ .index = i,
-                                          .value = { .val = NULL, .ok = GOC_OK } };
-            }
-            if (chan_put_to_buffer(ch, ops[i].put_val)) {
-                uv_mutex_unlock(ch->lock);
-                return (goc_alts_result){ .index = i,
-                                          .value = { .val = NULL, .ok = GOC_OK } };
-            }
-            uv_mutex_unlock(ch->lock);
-        }
+    goc_alts_result immediate = alts_try_immediate(ops, indices, n_nondefault);
+    if (immediate.index != (size_t)-1) {
+        return immediate;
     }
 
     /* Default arm fires if no non-default arm was immediately ready. */
@@ -228,7 +253,7 @@ goc_alts_result goc_alts(goc_alt_op *ops, size_t n) {
         e->next            = NULL;
         e->pool            = pool;
         e->coro            = running;
-        e->stack_canary_ptr = (uint32_t *)running->stack_base;
+        goc_stack_canary_init(e);
         e->ok              = GOC_CLOSED; /* safe default; overwritten on wake */
         e->arm_idx         = i;
 
@@ -266,6 +291,13 @@ goc_alts_result goc_alts(goc_alt_op *ops, size_t n) {
 
     /* ------------------------------------------------------------------ */
     /* Phase 4 — Acquire all channel locks in ascending pointer order      */
+    /*                                                                      */
+    /* DEADLOCK PREVENTION: Multiple concurrent goc_alts calls on          */
+    /* overlapping channel sets would deadlock if they acquired locks in   */
+    /* arbitrary order. We enforce a global total order by sorting         */
+    /* channel pointers (address as key). All goc_alts calls acquire       */
+    /* locks in ascending address order, ensuring no cycles can form in     */
+    /* the wait-for graph.                                                  */
     /* ------------------------------------------------------------------ */
     for (size_t i = 0; i < n_unique; i++) {
         uv_mutex_lock(sorted_chans[i]->lock);
@@ -353,6 +385,14 @@ goc_alts_result goc_alts(goc_alt_op *ops, size_t n) {
     void *stack_top  = (char *)stack_base + running->stack_size;
     GC_add_roots(stack_base, stack_top);
 
+    /* Set parked = 0 on the fiber's initial entry while all channel locks are
+     * still held.  wake() / goc_close() spin on this flag (via pool_worker_fn
+     * setting it back to 1 after mco_resume returns) to avoid resuming the
+     * coroutine before it has actually called mco_yield.  Must be set before
+     * releasing any lock so that no waker can call post_to_run_queue before
+     * we yield. */
+    atomic_store_explicit(&self->parked, 0, memory_order_release);
+
     /* Release all locks in reverse order before yielding. */
     for (size_t j = n_unique; j-- > 0; )
         uv_mutex_unlock(sorted_chans[j]->lock);
@@ -361,6 +401,7 @@ goc_alts_result goc_alts(goc_alt_op *ops, size_t n) {
 
     /* Suspend this fiber; the pool worker will resume us when a channel fires. */
     mco_yield(running);
+    /* pool_worker_fn has set self->parked = 1 by this point */
 
     /* ------------------------------------------------------------------ */
     /* Phase 7 — On resume                                                 */
@@ -408,75 +449,18 @@ goc_alts_result goc_alts_sync(goc_alt_op *ops, size_t n) {
 
     /* ------------------------------------------------------------------ */
     /* Phase 1 — Shuffle                                                    */
-    /* Enforce that at most one default arm is provided.                   */
     /* ------------------------------------------------------------------ */
-    size_t  default_idx  = (size_t)-1;
-    size_t  n_nondefault = 0;
-    size_t  n_default = 0;
     /* VLA: same size constraint as goc_alts — n should be small. */
     size_t  indices[n];
-
-    for (size_t i = 0; i < n; i++) {
-        if (ops[i].op_kind == GOC_ALT_DEFAULT) {
-            n_default++;
-            if (n_default > 1) {
-                fprintf(stderr, "goc_alts_sync: more than one default arm provided (got %zu)\n", n_default);
-                abort();
-            }
-            default_idx = i;
-        } else {
-            indices[n_nondefault++] = i;
-        }
-    }
-
-    alts_shuffle(indices, n_nondefault);
+    size_t  default_idx;
+    size_t  n_nondefault = alts_build_index_array(ops, n, indices, &default_idx, "goc_alts_sync");
 
     /* ------------------------------------------------------------------ */
     /* Phase 2 — Non-blocking scan                                         */
     /* ------------------------------------------------------------------ */
-    for (size_t si = 0; si < n_nondefault; si++) {
-        size_t    i  = indices[si];
-        goc_chan *ch = ops[i].ch;
-
-        if (ops[i].op_kind == GOC_ALT_TAKE) {
-            uv_mutex_lock(ch->lock);
-            void *val = NULL;
-            if (chan_take_from_buffer(ch, &val)) {
-                uv_mutex_unlock(ch->lock);
-                return (goc_alts_result){ .index = i,
-                                          .value = { .val = val, .ok = GOC_OK } };
-            }
-            if (chan_take_from_putter(ch, &val)) {
-                uv_mutex_unlock(ch->lock);
-                return (goc_alts_result){ .index = i,
-                                          .value = { .val = val, .ok = GOC_OK } };
-            }
-            if (ch->closed && ch->buf_count == 0) {
-                uv_mutex_unlock(ch->lock);
-                return (goc_alts_result){ .index = i,
-                                          .value = { .val = NULL, .ok = GOC_CLOSED } };
-            }
-            uv_mutex_unlock(ch->lock);
-
-        } else { /* GOC_ALT_PUT */
-            uv_mutex_lock(ch->lock);
-            if (ch->closed) {
-                uv_mutex_unlock(ch->lock);
-                return (goc_alts_result){ .index = i,
-                                          .value = { .val = NULL, .ok = GOC_CLOSED } };
-            }
-            if (chan_put_to_taker(ch, ops[i].put_val)) {
-                uv_mutex_unlock(ch->lock);
-                return (goc_alts_result){ .index = i,
-                                          .value = { .val = NULL, .ok = GOC_OK } };
-            }
-            if (chan_put_to_buffer(ch, ops[i].put_val)) {
-                uv_mutex_unlock(ch->lock);
-                return (goc_alts_result){ .index = i,
-                                          .value = { .val = NULL, .ok = GOC_OK } };
-            }
-            uv_mutex_unlock(ch->lock);
-        }
+    goc_alts_result immediate = alts_try_immediate(ops, indices, n_nondefault);
+    if (immediate.index != (size_t)-1) {
+        return immediate;
     }
 
     if (default_idx != (size_t)-1) {
@@ -505,7 +489,7 @@ goc_alts_result goc_alts_sync(goc_alt_op *ops, size_t n) {
         e->next             = NULL;
         e->pool             = NULL;
         e->coro             = NULL;
-        e->stack_canary_ptr = NULL;
+        e->stack_canary_ptr = NULL;  /* sync entries don't have fiber stacks */
         e->ok               = GOC_CLOSED;
         e->arm_idx          = i;
         e->sync_sem_ptr     = &shared_sync;
@@ -544,6 +528,13 @@ goc_alts_result goc_alts_sync(goc_alt_op *ops, size_t n) {
 
     /* ------------------------------------------------------------------ */
     /* Phase 4 — Acquire locks in ascending pointer order                  */
+    /*                                                                      */
+    /* DEADLOCK PREVENTION: Multiple concurrent goc_alts_sync calls on     */
+    /* overlapping channel sets would deadlock if they acquired locks in   */
+    /* arbitrary order. We enforce a global total order by sorting         */
+    /* channel pointers (address as key). All calls acquire locks in       */
+    /* ascending address order, ensuring no cycles can form in the         */
+    /* wait-for graph.                                                      */
     /* ------------------------------------------------------------------ */
     for (size_t i = 0; i < n_unique; i++) {
         uv_mutex_lock(sorted_chans[i]->lock);

@@ -144,8 +144,15 @@ static void registry_remove(goc_pool* pool) {
  * runq_push / runq_pop — two-lock MPMC operations
  * ---------------------------------------------------------------------- */
 
+/* -------------------------------------------------------------------------
+ * runq_push — Add entry to the tail of the FIFO run queue
+ *
+ * Thread-safe via two-lock queue (separate head and tail locks).
+ * Called by multiple threads to enqueue work.
+ * ---------------------------------------------------------------------- */
+
 static void runq_push(goc_runq* q, goc_entry* entry) {
-    goc_runq_node* node = goc_malloc(sizeof(goc_runq_node));
+    goc_runq_node* node = malloc(sizeof(goc_runq_node));
     node->entry = entry;
     node->next  = NULL;
 
@@ -154,6 +161,13 @@ static void runq_push(goc_runq* q, goc_entry* entry) {
     q->tail       = node;
     uv_mutex_unlock(&q->tail_lock);
 }
+
+/* -------------------------------------------------------------------------
+ * runq_pop — Remove entry from the head of the FIFO run queue  
+ *
+ * Thread-safe via two-lock queue design. Returns NULL if queue is empty.
+ * Called by worker threads to dequeue work.
+ * ---------------------------------------------------------------------- */
 
 static goc_entry* runq_pop(goc_runq* q) {
     uv_mutex_lock(&q->head_lock);
@@ -166,7 +180,7 @@ static goc_entry* runq_pop(goc_runq* q) {
     goc_entry* entry = next->entry;
     q->head          = next;
     uv_mutex_unlock(&q->head_lock);
-    /* sentinel (old head) is now unreachable; GC will collect it */
+    free(sentinel);  /* malloc'd in runq_push; must be freed explicitly */
     return entry;
 }
 
@@ -190,9 +204,7 @@ static void* pool_worker_fn(void* arg) {
         GC_add_roots(&entry, &entry + 1);
 
         /* Canary check — abort on stack overflow before corrupting anything. */
-        if (*entry->stack_canary_ptr != GOC_STACK_CANARY) {
-            abort();
-        }
+        goc_stack_canary_check(entry->stack_canary_ptr);
 
         /* Save the coroutine handle before resuming.  If this is a parking
          * entry (stack-allocated inside goc_take on the fiber's own stack),
@@ -206,6 +218,14 @@ static void* pool_worker_fn(void* arg) {
         mco_resume(coro);
 
         GC_remove_roots(&entry, &entry + 1);
+
+        /* If the fiber just parked (called goc_take, goc_put, or goc_alts slow
+         * path and set fiber_entry->parked = 0 before yielding), set it back
+         * to 1 now that mco_resume has returned and the coroutine is truly
+         * MCO_SUSPENDED.  This unblocks any wake() call spinning on parked==0. */
+        goc_entry* fe = (goc_entry*)mco_get_user_data(coro);
+        if (fe != NULL)
+            atomic_store_explicit(&fe->parked, 1, memory_order_release);
 
         /* Correctness invariant: every fiber that yields (MCO_SUSPENDED) must
          * be re-posted to a run queue via post_to_run_queue(), which increments
@@ -267,6 +287,13 @@ void post_to_run_queue(goc_pool* pool, goc_entry* entry) {
  * a parked fiber must still count as live even while active_count is zero.
  * ---------------------------------------------------------------------- */
 
+/* -------------------------------------------------------------------------
+ * pool_fiber_born — Increment live fiber count for drain coordination
+ *
+ * Called when a fiber is spawned to track outstanding work for pool draining.
+ * Must be paired with pool_fiber_died when the fiber completes.
+ * ---------------------------------------------------------------------- */
+
 void pool_fiber_born(goc_pool* pool) {
     pthread_mutex_lock(&pool->drain_mutex);
     pool->live_count++;
@@ -302,8 +329,10 @@ goc_pool* goc_pool_make(size_t threads) {
     goc_pool* pool = malloc(sizeof(goc_pool));
     memset(pool, 0, sizeof(goc_pool));
 
-    /* Initialise run queue with a sentinel node (GC-heap). */
-    goc_runq_node* sentinel = goc_malloc(sizeof(goc_runq_node));
+    /* Initialise run queue with a sentinel node (plain malloc — must not be
+     * GC-heap, because goc_pool is malloc'd and BDWGC won't scan its fields
+     * for GC pointers; see runq_push/runq_pop for the same reasoning). */
+    goc_runq_node* sentinel = malloc(sizeof(goc_runq_node));
     sentinel->entry = NULL;
     sentinel->next  = NULL;
     pool->runq.head = sentinel;
@@ -369,14 +398,11 @@ void goc_pool_destroy(goc_pool* pool) {
     pthread_mutex_destroy(&pool->drain_mutex);
     pthread_cond_destroy(&pool->drain_cond);
 
-    /* 6. Drain and release any remaining runq nodes.
-     *    (Entries themselves are GC-heap; only the nodes are freed.) */
+    /* 6. Drain and release any remaining runq nodes (malloc'd; must be freed). */
     goc_runq_node* n = pool->runq.head;
     while (n != NULL) {
         goc_runq_node* next = n->next;
-        /* n is GC-heap; the GC will collect it — no explicit free needed.
-         * The sentinel and any unconsumed nodes are already unreachable. */
-        (void)n;
+        free(n);
         n = next;
     }
 
@@ -443,11 +469,11 @@ goc_drain_result_t goc_pool_destroy_timeout(goc_pool* pool, uint64_t ms) {
     pthread_mutex_destroy(&pool->drain_mutex);
     pthread_cond_destroy(&pool->drain_cond);
 
-    /* Drain runq nodes (GC-heap; already unreachable after workers exit). */
+    /* Drain runq nodes (malloc'd; must be freed explicitly). */
     goc_runq_node* n = pool->runq.head;
     while (n != NULL) {
         goc_runq_node* next = n->next;
-        (void)n;
+        free(n);
         n = next;
     }
 
