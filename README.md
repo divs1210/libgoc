@@ -393,7 +393,7 @@ libgoc uses [minicoro](https://github.com/edubart/minicoro) for fiber switching.
 
 **C++ exceptions are not supported.** Throwing a C++ exception that unwinds across a `mco_yield` / `mco_resume` boundary is undefined behaviour — the exception mechanism's internal state is not preserved across a coroutine switch. In mixed C/C++ codebases, all fiber entry functions must be declared `extern "C"` and must not allow any C++ exception to propagate out of them.
 
-**Stack management.** By default, libgoc uses minicoro's virtual memory allocator, which allows fiber stacks to grow dynamically and eliminates stack overflow concerns. When virtual memory is disabled (`-DLIBGOC_VMEM=OFF`), libgoc uses fixed-size stacks with canary-based overflow detection. If stack overflow is detected, the runtime calls `abort()` immediately with a diagnostic message. This turns silent heap corruption into a deterministic, debuggable crash. Avoid large stack-allocated buffers and deep recursion inside fibers; use `goc_malloc`-allocated buffers on the GC heap for large data instead.
+**Stack management.** By default, libgoc uses minicoro's virtual memory allocator, which allows fiber stacks to grow dynamically and eliminates stack overflow concerns. When virtual memory is disabled (`-DLIBGOC_VMEM=OFF`), libgoc uses canary-protected stacks with overflow detection. If stack overflow is detected, the runtime calls `abort()` immediately with a diagnostic message. This turns silent heap corruption into a deterministic, debuggable crash. Avoid large stack-allocated buffers and deep recursion inside fibers; use `goc_malloc`-allocated buffers on the GC heap for large data instead.
 
 **`src/minicoro.c` must be compiled without `-DGC_THREADS`.** The build system enforces this with `-UGC_THREADS` on that translation unit. This avoids a TLS interaction between minicoro and Boehm's thread wrapper during thread startup.
 
@@ -818,11 +818,11 @@ libgoc uses minicoro's virtual memory allocator by default, which enables dynami
 # Default: virtual memory enabled (recommended)
 cmake -B build
 
-# Disable virtual memory (fixed-size stacks with overflow protection)
+# Disable virtual memory (canary-protected stacks)
 cmake -B build -DLIBGOC_VMEM=OFF
 ```
 
-With virtual memory disabled (`-DLIBGOC_VMEM=OFF`), fibers use fixed-size stacks with canary-based overflow detection. Stack overflow will abort the process with a diagnostic message. This mode is useful for:
+With virtual memory disabled (`-DLIBGOC_VMEM=OFF`), fibers use canary-protected stacks with overflow detection. Stack overflow will abort the process with a diagnostic message. This mode is useful for:
 - Debugging stack usage patterns
 - Profiling with deterministic memory layout
 - Environments without virtual memory support
