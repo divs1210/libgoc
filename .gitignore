@@ -51,6 +51,7 @@ Module.symvers
 
 # CMake build directory
 build/
+build-bench/
 cmake-build-*/
 
 # CMake cache

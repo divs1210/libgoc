@@ -1,0 +1,226 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"reflect"
+	"runtime"
+	"sync"
+	"time"
+)
+
+func main() {
+	pingRounds := flag.Int("ping-rounds", 200000, "ping-pong round trips")
+	ringNodes := flag.Int("ring-nodes", 128, "number of ring tasks")
+	ringHops := flag.Int("ring-hops", 500000, "token hops around the ring")
+	selectWorkers := flag.Int("select-workers", 8, "fan-out worker count")
+	selectTasks := flag.Int("select-tasks", 200000, "messages sent through fan-out/fan-in")
+	spawnCount := flag.Int("spawn-tasks", 200000, "idle tasks to spawn")
+	primeMax := flag.Int("prime-max", 20000, "upper bound for prime sieve")
+	flag.Parse()
+
+	fmt.Printf("GOMAXPROCS=%d\n", runtime.GOMAXPROCS(0))
+
+	pingPong(*pingRounds)
+	ringBenchmark(*ringNodes, *ringHops)
+	selectFanIn(*selectWorkers, *selectTasks)
+	spawnIdle(*spawnCount)
+	primeSieve(*primeMax)
+}
+
+func pingPong(rounds int) {
+	a := make(chan int)
+	b := make(chan int)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	player := func(recv <-chan int, send chan<- int) {
+		defer wg.Done()
+		for v := range recv {
+			if v >= rounds {
+				close(send)
+				return
+			}
+			send <- v + 1
+		}
+	}
+
+	go player(b, a)
+	go player(a, b)
+
+	start := time.Now()
+	a <- 0
+	wg.Wait()
+	duration := time.Since(start)
+
+	rate := float64(rounds) / duration.Seconds()
+	fmt.Printf("Channel ping-pong: %d round trips in %s (%.0f round trips/s)\n", rounds, duration, rate)
+}
+
+func ringBenchmark(nodes, hops int) {
+	if nodes < 1 {
+		return
+	}
+
+	channels := make([]chan int, nodes)
+	for i := range channels {
+		channels[i] = make(chan int)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(nodes)
+
+	for i := 0; i < nodes; i++ {
+		in := channels[i]
+		out := channels[(i+1)%nodes]
+
+		go func(in <-chan int, out chan<- int) {
+			defer wg.Done()
+			for v := range in {
+				if v == 0 {
+					close(out)
+					return
+				}
+				out <- v - 1
+			}
+			close(out)
+		}(in, out)
+	}
+
+	start := time.Now()
+	channels[0] <- hops
+	wg.Wait()
+	duration := time.Since(start)
+
+	rate := float64(hops) / duration.Seconds()
+	fmt.Printf("Ring benchmark: %d hops across %d tasks in %s (%.0f hops/s)\n", hops, nodes, duration, rate)
+}
+
+func selectFanIn(workers, tasks int) {
+	if workers < 1 {
+		return
+	}
+
+	in := make(chan int)
+	outs := make([]chan int, workers)
+
+	var workerWG sync.WaitGroup
+	workerWG.Add(workers)
+
+	for i := range outs {
+		outs[i] = make(chan int)
+		out := outs[i]
+
+		go func() {
+			defer workerWG.Done()
+			for v := range in {
+				out <- v
+			}
+		}()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		cases := make([]reflect.SelectCase, workers)
+		for i, ch := range outs {
+			cases[i] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ch)}
+		}
+
+		received := 0
+		for received < tasks {
+			idx, value, ok := reflect.Select(cases)
+			if !ok {
+				cases[idx].Chan = reflect.ValueOf((<-chan int)(nil))
+				continue
+			}
+			_ = int(value.Int())
+			received++
+		}
+		close(done)
+	}()
+
+	start := time.Now()
+	for i := 0; i < tasks; i++ {
+		in <- i
+	}
+	close(in)
+
+	<-done
+	workerWG.Wait()
+	duration := time.Since(start)
+
+	rate := float64(tasks) / duration.Seconds()
+	fmt.Printf("Selective receive / fan-out / fan-in: %d messages with %d workers in %s (%.0f msg/s)\n", tasks, workers, duration, rate)
+}
+
+func spawnIdle(count int) {
+	var wg sync.WaitGroup
+	wg.Add(count)
+
+	park := make(chan struct{})
+	start := time.Now()
+
+	for i := 0; i < count; i++ {
+		go func() {
+			defer wg.Done()
+			<-park
+		}()
+	}
+
+	close(park)
+	wg.Wait()
+	duration := time.Since(start)
+
+	rate := float64(count) / duration.Seconds()
+	fmt.Printf("Spawn idle tasks: %d goroutines in %s (%.0f tasks/s)\n", count, duration, rate)
+}
+
+func primeSieve(max int) {
+	start := time.Now()
+	count := sieve(max)
+	duration := time.Since(start)
+
+	rate := float64(count) / duration.Seconds()
+	fmt.Printf("Prime sieve: %d primes up to %d in %s (%.0f primes/s)\n", count, max, duration, rate)
+}
+
+func sieve(max int) int {
+	ch := generate(max)
+	count := 0
+
+	for {
+		prime, ok := <-ch
+		if !ok {
+			break
+		}
+		count++
+		ch = filter(ch, prime)
+	}
+
+	return count
+}
+
+func generate(max int) <-chan int {
+	out := make(chan int)
+	go func() {
+		for i := 2; i <= max; i++ {
+			out <- i
+		}
+		close(out)
+	}()
+	return out
+}
+
+func filter(in <-chan int, prime int) <-chan int {
+	out := make(chan int)
+	go func() {
+		for v := range in {
+			if v%prime != 0 {
+				out <- v
+			}
+		}
+		close(out)
+	}()
+	return out
+}

@@ -56,6 +56,7 @@ See the [Design Doc](./DESIGN.md) for implementation details and [TODO](./TODO.m
   - [Thread pool](#thread-pool)
   - [Scheduler loop access](#scheduler-loop-access)
 - [Best Practices](#best-practices)
+- [Benchmarks](#benchmarks)
 - [Building and Testing](#building-and-testing)
   - [Prerequisites](#prerequisites)
   - [macOS](#macos)
@@ -662,6 +663,12 @@ static void main_fiber(void* _ub) {
     // and in all code reachable from here
 }
 ```
+
+---
+
+## Benchmarks
+
+Benchmark suites for Go and libgoc live under [`bench/`](./bench/README.md). They are separate from the library build and CI, and are intended for performance exploration only.
 
 ---
 

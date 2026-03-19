@@ -75,6 +75,7 @@ libgoc/
 │   ├── test_p7_integration.c       # Phase 7 — Integration
 │   ├── test_p8_safety.c            # Phase 8 — Safety and crash behaviour
 │   └── test_p9_mutexes.c           # Phase 9 — RW mutexes
+├── bench/                           # Benchmarks (see bench/README.md)
 ├── vendor/
 │   └── minicoro/
 │       └── minicoro.h     # Vendored header — fiber suspend/resume (header-only)
@@ -85,6 +86,8 @@ libgoc/
 ├── TODO.md                # Planned future work
 └── LICENSE
 ```
+
+Benchmarks live in `bench/` and are documented in [bench/README.md](./bench/README.md).
 
 minicoro is a single-header library vendored under `vendor/minicoro/`. It requires exactly one translation unit to instantiate its implementation: `src/minicoro.c` defines `MINICORO_IMPL` before including `minicoro.h`. All other files include `minicoro.h` without defining `MINICORO_IMPL`.
 
