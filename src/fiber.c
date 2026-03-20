@@ -77,9 +77,8 @@ goc_chan* goc_go_on(goc_pool* pool, void (*fn)(void*), void* arg) {
      *    large numbers of fibers are created (e.g. bench_spawn_idle).
      *    Unregistered in pool.c before mco_destroy when the fiber reaches
      *    MCO_DEAD. */
-    void* fiber_stack_base = entry->coro->stack_base;
-    void* fiber_stack_top  = (char*)fiber_stack_base + entry->coro->stack_size;
-    entry->fiber_root_handle = goc_fiber_root_register(fiber_stack_base, fiber_stack_top);
+    void* fiber_stack_top  = (char*)entry->coro->stack_base + entry->coro->stack_size;
+    entry->fiber_root_handle = goc_fiber_root_register(entry->coro, fiber_stack_top, entry);
 
     /* 6. Record the canary pointer (lowest word of the fiber stack). */
     goc_stack_canary_init(entry);

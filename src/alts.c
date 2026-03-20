@@ -378,15 +378,9 @@ goc_alts_result* goc_alts(goc_alt_op *ops, size_t n) {
         goc_entry *e  = entries[si];
 
         if (ops[i].op_kind == GOC_ALT_TAKE) {
-            /* Append to ch->takers */
-            goc_entry **pp = &ch->takers;
-            while (*pp) pp = &(*pp)->next;
-            *pp = e;
+            chan_list_append(&ch->takers, &ch->takers_tail, e);
         } else {
-            /* Append to ch->putters */
-            goc_entry **pp = &ch->putters;
-            while (*pp) pp = &(*pp)->next;
-            *pp = e;
+            chan_list_append(&ch->putters, &ch->putters_tail, e);
         }
     }
 
@@ -627,13 +621,9 @@ goc_alts_result* goc_alts_sync(goc_alt_op *ops, size_t n) {
         goc_entry *e  = entries[si];
 
         if (ops[i].op_kind == GOC_ALT_TAKE) {
-            goc_entry **pp = &ch->takers;
-            while (*pp) pp = &(*pp)->next;
-            *pp = e;
+            chan_list_append(&ch->takers, &ch->takers_tail, e);
         } else {
-            goc_entry **pp = &ch->putters;
-            while (*pp) pp = &(*pp)->next;
-            *pp = e;
+            chan_list_append(&ch->putters, &ch->putters_tail, e);
         }
     }
 

@@ -242,6 +242,11 @@ static void* pool_worker_fn(void* arg) {
         if (fe != NULL)
             atomic_store_explicit(&fe->parked, 1, memory_order_release);
 
+        /* Update the cached fiber SP so the next GC cycle scans only the
+         * used portion of the stack instead of the full vmem allocation. */
+        if (mco_status(coro) == MCO_SUSPENDED && fe != NULL)
+            goc_fiber_root_update_sp(fe->fiber_root_handle, coro);
+
         /* Correctness invariant: every fiber that yields (MCO_SUSPENDED) must
          * be re-posted to a run queue via post_to_run_queue(), which increments
          * active_count before the next resume.  If a fiber yields without being

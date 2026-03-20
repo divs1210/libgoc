@@ -196,9 +196,13 @@ void chan_register(goc_chan* ch);
 void chan_unregister(goc_chan* ch);
 
 /* gc.c → used by fiber.c, pool.c */
-void* goc_fiber_root_register(void* base, void* top);
+void* goc_fiber_root_register(mco_coro* coro, void* top, goc_entry* entry);
 void  goc_fiber_root_unregister(void* handle);
+void  goc_fiber_root_update_sp(void* handle, mco_coro* coro);
 void  goc_fiber_roots_init(void);
+
+/* minicoro.c → used by gc.c (push_fiber_roots callback) */
+void* mco_get_suspended_sp(mco_coro* co);
 
 /* pool.c → used by fiber.c, channel.c */
 void post_to_run_queue(goc_pool* pool, goc_entry* entry);
