@@ -54,11 +54,8 @@ Both implementations use consistent integer millisecond formatting:
 | 1 | Channel ping-pong | ✅ | ✅ |
 | 2 | Ring | ✅ | ✅ |
 | 3 | Selective receive / fan-out / fan-in | ✅ | ✅ |
-| 4 | Spawn idle tasks | ✅ | 🚧 |
-| 5 | Prime sieve | ✅ | 🚧 |
-
-🚧 — Implemented in `bench/libgoc/bench.c` but disabled in `main()` while the
-benchmark suite is being finalised.
+| 4 | Spawn idle tasks | ✅ | ✅ |
+| 5 | Prime sieve | ✅ | ✅ |
 
 ## Runs
 
@@ -120,24 +117,32 @@ GOC_POOL_THREADS=1
 Channel ping-pong: 200000 round trips in 120ms (1658644 round trips/s)
 Ring benchmark: 500000 hops across 128 tasks in 751ms (665623 hops/s)
 Selective receive / fan-out / fan-in: 200000 messages with 8 workers in 716ms (279139 msg/s)
+Spawn idle tasks: 200000 fibers in 12043ms (16606 tasks/s)
+Prime sieve: 2262 primes up to 20000 in 234ms (9666 primes/s)
 
 === Pool Size: 2 ===
 GOC_POOL_THREADS=2
 Channel ping-pong: 200000 round trips in 294ms (679017 round trips/s)
 Ring benchmark: 500000 hops across 128 tasks in 1537ms (325279 hops/s)
 Selective receive / fan-out / fan-in: 200000 messages with 8 workers in 822ms (243094 msg/s)
+Spawn idle tasks: 200000 fibers in 15241ms (13122 tasks/s)
+Prime sieve: 2262 primes up to 20000 in 131ms (17269 primes/s)
 
 === Pool Size: 4 ===
 GOC_POOL_THREADS=4
 Channel ping-pong: 200000 round trips in 445ms (448940 round trips/s)
 Ring benchmark: 500000 hops across 128 tasks in 1839ms (271767 hops/s)
 Selective receive / fan-out / fan-in: 200000 messages with 8 workers in 921ms (216986 msg/s)
+Spawn idle tasks: 200000 fibers in 20187ms (9907 tasks/s)
+Prime sieve: 2262 primes up to 20000 in 107ms (21140 primes/s)
 
 === Pool Size: 8 ===
 GOC_POOL_THREADS=8
 Channel ping-pong: 200000 round trips in 588ms (339584 round trips/s)
 Ring benchmark: 500000 hops across 128 tasks in 2037ms (245396 hops/s)
 Selective receive / fan-out / fan-in: 200000 messages with 8 workers in 1142ms (175014 msg/s)
+Spawn idle tasks: 200000 fibers in 21354ms (9366 tasks/s)
+Prime sieve: 2262 primes up to 20000 in 97ms (23207 primes/s)
 ```
 
 ## Report
@@ -210,14 +215,12 @@ throughput is ~0.27–0.47× of Go's.  The pattern is naturally parallel (8
 sender workers feeding one consumer) and benefits from multiple OS threads
 less adversely than ping-pong or ring.
 
-**What the numbers do and do not say.**  All three benchmarks measure
-inter-fiber communication latency, not CPU computation throughput.  libgoc's
-coroutine stack model is heavier than Go's goroutine stacks (minicoro uses a
-fixed or virtual-memory-backed stack per fiber vs. Go's automatically-growing
-stacks), and the current pool scheduler lacks work-stealing.  These are known
-areas of improvement tracked in `TODO.md`.  Benchmarks 4–5 (spawn, sieve)
-are implemented in `bench/libgoc/bench.c` and will be enabled in a future
-release.
+**What the numbers do and do not say.**  All five benchmarks measure
+inter-fiber communication latency and scheduling overhead, not CPU computation
+throughput.  libgoc's coroutine stack model is heavier than Go's goroutine
+stacks (minicoro uses a fixed or virtual-memory-backed stack per fiber vs.
+Go's automatically-growing stacks), and the current pool scheduler lacks
+work-stealing.  These are known areas of improvement tracked in `TODO.md`.
 
 **Go scalability.**  Go scales well on CPU-bound workloads (spawn: 188 K/s →
 492 K/s; prime sieve: 1919/s → 14136/s from POOL=1 to POOL=8) while

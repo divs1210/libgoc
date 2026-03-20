@@ -28,16 +28,15 @@ make run-all
 
 ## Benchmarks
 
-All five benchmarks are **implemented** in `bench.c`.  Benchmarks 1–3 are
-currently enabled; benchmarks 4 and 5 are compiled but disabled in `main()`.
+All five benchmarks are **implemented and enabled** in `bench.c`.
 
 | # | Name | Status |
 |---|------|--------|
 | 1 | **Channel ping-pong** — two fibers exchange a token back and forth | ✅ enabled |
 | 2 | **Ring** — a token is forwarded around a ring of N fibers | ✅ enabled |
 | 3 | **Selective receive / fan-out / fan-in** — producer → N workers → `goc_alts` collector | ✅ enabled |
-| 4 | **Spawn idle tasks** — spawn many fibers that park immediately, then wake them | 🚧 disabled |
-| 5 | **Prime sieve** — concurrent Eratosthenes pipeline | 🚧 disabled |
+| 4 | **Spawn idle tasks** — spawn many fibers that park immediately, then wake them | ✅ enabled |
+| 5 | **Prime sieve** — concurrent Eratosthenes pipeline | ✅ enabled |
 
 ## Output Format
 
@@ -53,6 +52,8 @@ Example:
 Channel ping-pong: 200000 round trips in 120ms (1658644 round trips/s)
 Ring benchmark: 500000 hops across 128 tasks in 751ms (665623 hops/s)
 Selective receive / fan-out / fan-in: 200000 messages with 8 workers in 716ms (279139 msg/s)
+Spawn idle tasks: 200000 fibers in 12043ms (16606 tasks/s)
+Prime sieve: 2262 primes up to 20000 in 234ms (9666 primes/s)
 ```
 
 ## Multi-Pool Testing
@@ -65,12 +66,16 @@ GOC_POOL_THREADS=1
 Channel ping-pong: 200000 round trips in 120ms (1658644 round trips/s)
 Ring benchmark: 500000 hops across 128 tasks in 751ms (665623 hops/s)
 Selective receive / fan-out / fan-in: 200000 messages with 8 workers in 716ms (279139 msg/s)
+Spawn idle tasks: 200000 fibers in 12043ms (16606 tasks/s)
+Prime sieve: 2262 primes up to 20000 in 234ms (9666 primes/s)
 
 === Pool Size: 8 ===
 GOC_POOL_THREADS=8
 Channel ping-pong: 200000 round trips in 588ms (339584 round trips/s)
 Ring benchmark: 500000 hops across 128 tasks in 2037ms (245396 hops/s)
 Selective receive / fan-out / fan-in: 200000 messages with 8 workers in 1142ms (175014 msg/s)
+Spawn idle tasks: 200000 fibers in 21354ms (9366 tasks/s)
+Prime sieve: 2262 primes up to 20000 in 97ms (23207 primes/s)
 ```
 
 Note that single-threaded (pool size 1) performance can be higher than
