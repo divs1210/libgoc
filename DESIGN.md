@@ -646,34 +646,40 @@ At the **top of `goc_take` and `goc_put`**, immediately after acquiring the lock
 ## Thread Pool
 
 ```c
-typedef struct goc_pool {
-    pthread_t*      threads;
-    size_t          thread_count;
-    goc_runq        runq;           /* two-lock MPMC queue of goc_entry* */
-    uv_sem_t        work_sem;       /* signalled when runq becomes non-empty */
-    _Atomic int     shutdown;       /* set to 1 to stop workers */
+/* Per-worker state — one per OS thread in the pool. */
+typedef struct goc_worker {
+    goc_runq         runq;         /* per-worker run queue; thieves steal from head */
+    pthread_t        thread;
+    struct goc_pool* pool;
+    size_t           id;
+} goc_worker;
 
-    /* Drain synchronisation — used by goc_pool_destroy to wait until all
-       in-flight fibers have completed before joining worker threads. */
+struct goc_pool {
+    goc_worker*     workers;       /* per-worker state array (thread_count entries) */
+    size_t          thread_count;
+    uv_sem_t        work_sem;      /* global semaphore: one post per queued task */
+    _Atomic int     shutdown;
+
+    /* Drain synchronisation */
     pthread_mutex_t drain_mutex;
     pthread_cond_t  drain_cond;
-    size_t          active_count;   /* fibers currently queued or executing; incremented
-                                       by post_to_run_queue, decremented unconditionally
-                                       after every mco_resume (yield or exit).  Used for
-                                       internal scheduling accounting only. */
-    size_t          live_count;     /* fibers still alive on this pool; incremented exactly
-                                       once per fiber at birth by pool_fiber_born() (called
-                                       from goc_go_on before post_to_run_queue), decremented
-                                       only when mco_status == MCO_DEAD.  This is the correct
-                                       drain signal: a parked fiber (MCO_SUSPENDED) still has
-                                       live_count > 0 even though active_count has already
-                                       been decremented to 0.
-                                       NOTE: post_to_run_queue does NOT increment live_count.
-                                       Re-queuing a parked fiber via wake() must not inflate
-                                       it, or the count would grow unboundedly with channel
-                                       operations and goc_pool_destroy would never unblock. */
-} goc_pool;
+    size_t          active_count;  /* fibers currently queued or executing; incremented
+                                      by post_to_run_queue, decremented unconditionally
+                                      after every mco_resume (yield or exit). */
+    size_t          live_count;    /* fibers still alive on this pool; incremented exactly
+                                      once per fiber at birth by pool_fiber_born(),
+                                      decremented only when mco_status == MCO_DEAD.
+                                      NOTE: post_to_run_queue does NOT increment live_count. */
+
+    _Atomic size_t  post_counter;  /* round-robin index for non-worker postings */
+};
 ```
+
+### Work-stealing design
+
+Each worker owns a local two-lock MPMC run queue.  New work is routed to the **calling worker's own queue** when `post_to_run_queue` is called from a pool worker thread (local affinity — keeps fiber data warm in cache), or to a **round-robin selected worker** when called from an OS thread.  A thread-local pointer `tls_worker` (set at thread start) identifies the calling worker.
+
+When a worker wakes on `work_sem` and finds its own queue empty, it **steals** from every other worker in round-robin order before going back to sleep.  This eliminates the single shared-queue bottleneck present in the original design: instead of all N threads contending on one mutex pair, each push targets one worker's queue and cross-queue contention only arises during stealing.
 
 > **`drain_cond` is signalled only on `MCO_DEAD`.** `active_count` is decremented on every yield or exit, but the broadcast fires only when a fiber actually dies. `goc_pool_destroy` and `goc_pool_destroy_timeout` wait on `live_count == 0`, not `active_count == 0` — a parked fiber (MCO_SUSPENDED) has already decremented `active_count` to zero while still being alive, so using `active_count` as the drain signal would cause a premature return while fibers are merely blocked on a channel.
 
@@ -684,15 +690,19 @@ Each worker thread runs a loop:
 ```
 while not shutdown:
     wait on work_sem
-    goc_entry* entry = runq_pop()
+    entry = runq_pop(own queue)
+    if entry == NULL:
+        for i in 1 .. thread_count-1:        /* steal round-robin */
+            entry = runq_pop(workers[(id+i) % N].runq)
+            if entry != NULL: break
+    if entry == NULL:
+        continue                              /* spurious wake — work stolen by active peer */
+
     if *entry->stack_canary_ptr != GOC_STACK_CANARY:
-        abort()                        /* stack overflow — deterministic crash, not silent corruption
-                                          applies to ALL entry kinds: launch entries AND goc_alts
-                                          park entries; stack_canary_ptr must never be NULL */
+        abort()                        /* stack overflow — deterministic crash */
     mco_coro* coro = entry->coro       /* snapshot handle before resume — see note below */
 
-    /* Redirect GC stack scan to fiber stack for the duration of mco_resume.
-       See "GC Stack Bottom Redirect" below for full explanation. */
+    /* Redirect GC stack scan to fiber stack for the duration of mco_resume. */
     struct GC_stack_base orig_sb, fiber_sb
     GC_get_my_stackbottom(&orig_sb)
     fiber_sb.mem_base = coro->stack_base + coro->stack_size
@@ -700,21 +710,13 @@ while not shutdown:
 
     mco_resume(coro)                   /* run fiber until next mco_yield or return */
 
-    GC_set_stackbottom(NULL, &orig_sb) /* restore OS thread stack bottom */
+    GC_set_stackbottom(NULL, &orig_sb)
     lock(drain_mutex); active_count--; unlock(drain_mutex)
-    /* active_count is decremented unconditionally.  The lock is released before
-       checking MCO_DEAD to avoid holding drain_mutex across mco_destroy. */
     if mco_status(coro) == MCO_DEAD:
         fe = mco_get_user_data(coro)
-        goc_fiber_root_unregister(fe->fiber_root_handle)  /* unregister via push_other_roots list */
+        goc_fiber_root_unregister(fe->fiber_root_handle)
         mco_destroy(coro)
         lock(drain_mutex); live_count--; broadcast(drain_cond); unlock(drain_mutex)
-    /* if MCO_SUSPENDED: the fiber yielded and is parked on a channel.
-       active_count has been decremented but live_count has NOT — the fiber is
-       still alive.  wake() → post_to_run_queue() will re-increment active_count
-       only (not live_count) when the fiber is rescheduled.  drain_cond is not
-       broadcast here: live_count > 0 still holds, so goc_pool_destroy /
-       goc_pool_destroy_timeout will not see a spurious drain-complete. */
 ```
 
 > **Why `coro` is snapshotted before `mco_resume`.** When a fiber suspends inside `goc_take`, it stack-allocates a `goc_entry` (the parking entry) on its own coroutine stack and parks. The pool worker's `entry` pointer therefore points into the fiber's stack for the duration of that park. If the fiber is immediately re-scheduled on the same resume call (i.e. it runs to completion without yielding again), minicoro recycles the stack — and the memory `entry` pointed at is gone by the time `mco_resume` returns. Reading `entry->coro` after the resume is therefore a use-after-free and a potential segfault. The `mco_coro` object itself is minicoro heap-allocated and remains valid until `mco_destroy`, so snapshotting `coro = entry->coro` *before* the resume is always safe and eliminates the hazard entirely. See [Unified Wakeup](#unified-wakeup) for the analogous `e->next` snapshot requirement in `chan_put_to_taker` and `chan_take_from_putter`.

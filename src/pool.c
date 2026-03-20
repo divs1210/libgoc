@@ -1,8 +1,20 @@
 /*
  * src/pool.c
  *
- * Thread pool workers, run queue, pool registry, and drain logic.
- * Defines goc_pool and all pool operations.
+ * Thread pool workers, per-worker run queues, work stealing, pool registry,
+ * and drain logic.  Defines goc_pool and all pool operations.
+ *
+ * Work-stealing design
+ * --------------------
+ * Each worker thread owns a local run queue.  New work is routed to the
+ * calling worker's own queue when posted from a worker thread (local
+ * affinity), or distributed round-robin when posted from an OS thread.
+ * When a worker's queue is empty after waking on the shared semaphore, it
+ * attempts to steal tasks from every other worker in round-robin order
+ * before going back to sleep.  This eliminates the single shared-queue
+ * bottleneck: instead of all threads contending on one mutex pair, each
+ * push targets one worker's queue and cross-queue contention only arises
+ * during stealing.
  *
  * Internal symbols exposed via internal.h:
  *   pool_registry_init()
@@ -28,7 +40,8 @@
 #include "internal.h"
 
 /* -------------------------------------------------------------------------
- * Run-queue node (GC-heap so the entry pointer is visible to the collector)
+ * Run-queue node (plain malloc — must not be GC-heap because goc_pool is
+ * malloc'd and BDWGC won't scan its fields for GC pointers)
  * ---------------------------------------------------------------------- */
 
 typedef struct goc_runq_node {
@@ -38,6 +51,10 @@ typedef struct goc_runq_node {
 
 /* -------------------------------------------------------------------------
  * Two-lock MPMC run queue (Michael & Scott style)
+ *
+ * One instance per worker.  The owner pushes to the tail; thieves and the
+ * owner both pop from the head.  Head and tail locks are independent so
+ * owner-push and thief-pop do not block each other.
  * ---------------------------------------------------------------------- */
 
 typedef struct {
@@ -48,26 +65,45 @@ typedef struct {
 } goc_runq;
 
 /* -------------------------------------------------------------------------
+ * goc_worker — per-thread state owned by a pool
+ * ---------------------------------------------------------------------- */
+
+typedef struct goc_worker {
+    goc_runq         runq;   /* per-worker run queue; others steal from head */
+    pthread_t        thread; /* OS thread handle */
+    struct goc_pool* pool;   /* back-pointer to owning pool */
+    size_t           id;     /* index in pool->workers[] */
+} goc_worker;
+
+/* -------------------------------------------------------------------------
  * goc_pool — full definition (opaque outside pool.c)
  * ---------------------------------------------------------------------- */
 
 struct goc_pool {
-    pthread_t*      threads;
+    goc_worker*     workers;       /* per-worker state (thread_count entries) */
     size_t          thread_count;
-    goc_runq        runq;
-    uv_sem_t        work_sem;
+    uv_sem_t        work_sem;      /* global semaphore: one post per queued task */
     _Atomic int     shutdown;
     pthread_mutex_t drain_mutex;
     pthread_cond_t  drain_cond;
-    size_t          active_count; /* fibers currently queued or executing; decremented
-                                     unconditionally after every mco_resume (yield or exit).
-                                     Used only for internal scheduling accounting. */
-    size_t          live_count;   /* fibers still alive on this pool; incremented exactly
-                                     once per fiber at birth (pool_fiber_born), decremented
-                                     only when mco_status == MCO_DEAD.  This is the correct
-                                     drain signal: a parked fiber still has live_count > 0
-                                     even though active_count has already been decremented. */
+    size_t          active_count;  /* fibers currently queued or executing; decremented
+                                      unconditionally after every mco_resume (yield or exit).
+                                      Used only for internal scheduling accounting. */
+    size_t          live_count;    /* fibers still alive on this pool; incremented exactly
+                                      once per fiber at birth (pool_fiber_born), decremented
+                                      only when mco_status == MCO_DEAD.  This is the correct
+                                      drain signal: a parked fiber still has live_count > 0
+                                      even though active_count has already been decremented. */
+    _Atomic size_t  post_counter;  /* round-robin index for non-worker postings */
 };
+
+/* -------------------------------------------------------------------------
+ * Thread-local pointer to the current worker (NULL outside worker threads).
+ * Used by post_to_run_queue to prefer posting to the calling worker's own
+ * queue, keeping work local and reducing cross-queue contention.
+ * ---------------------------------------------------------------------- */
+
+static _Thread_local goc_worker* tls_worker = NULL;
 
 /* -------------------------------------------------------------------------
  * Pool registry (file-scope; owned entirely by pool.c)
@@ -141,6 +177,31 @@ static void registry_remove(goc_pool* pool) {
 }
 
 /* -------------------------------------------------------------------------
+ * runq_init / runq_destroy — initialise and tear down a per-worker queue
+ * ---------------------------------------------------------------------- */
+
+static void runq_init(goc_runq* q) {
+    goc_runq_node* sentinel = malloc(sizeof(goc_runq_node));
+    sentinel->entry = NULL;
+    sentinel->next  = NULL;
+    q->head = sentinel;
+    q->tail = sentinel;
+    uv_mutex_init(&q->head_lock);
+    uv_mutex_init(&q->tail_lock);
+}
+
+static void runq_destroy(goc_runq* q) {
+    uv_mutex_destroy(&q->head_lock);
+    uv_mutex_destroy(&q->tail_lock);
+    goc_runq_node* n = q->head;
+    while (n != NULL) {
+        goc_runq_node* next = n->next;
+        free(n);
+        n = next;
+    }
+}
+
+/* -------------------------------------------------------------------------
  * runq_push / runq_pop — two-lock MPMC operations
  * ---------------------------------------------------------------------- */
 
@@ -189,14 +250,33 @@ static goc_entry* runq_pop(goc_runq* q) {
  * ---------------------------------------------------------------------- */
 
 static void* pool_worker_fn(void* arg) {
-    goc_pool* pool = (goc_pool*)arg;
+    goc_worker* worker = (goc_worker*)arg;
+    goc_pool*   pool   = worker->pool;
+    size_t      id     = worker->id;
+
+    /* Publish this thread as the current worker so post_to_run_queue can
+     * target our own queue for local affinity. */
+    tls_worker = worker;
 
     while (!atomic_load_explicit(&pool->shutdown, memory_order_acquire)) {
         uv_sem_wait(&pool->work_sem);
 
-        goc_entry* entry = runq_pop(&pool->runq);
+        /* Try own queue first (likely warm in cache). */
+        goc_entry* entry = runq_pop(&worker->runq);
+
+        /* Own queue empty — steal from other workers in round-robin order. */
         if (entry == NULL) {
-            /* Spurious wake (e.g. shutdown signal); re-check loop condition. */
+            for (size_t i = 1; i < pool->thread_count; i++) {
+                size_t victim = (id + i) % pool->thread_count;
+                entry = runq_pop(&pool->workers[victim].runq);
+                if (entry != NULL)
+                    break;
+            }
+        }
+
+        if (entry == NULL) {
+            /* Spurious wake (work already stolen by an active worker, or
+             * shutdown signal); re-check loop condition. */
             continue;
         }
 
@@ -286,6 +366,11 @@ static void* pool_worker_fn(void* arg) {
 
 /* -------------------------------------------------------------------------
  * post_to_run_queue — internal; called from fiber.c and channel.c
+ *
+ * When called from a worker thread belonging to this pool, the entry is
+ * pushed to that worker's own queue (local affinity — keeps work warm in
+ * cache and avoids cross-queue contention).  Otherwise a round-robin worker
+ * is selected so that idle threads are not starved.
  * ---------------------------------------------------------------------- */
 
 void post_to_run_queue(goc_pool* pool, goc_entry* entry) {
@@ -299,7 +384,18 @@ void post_to_run_queue(goc_pool* pool, goc_entry* entry) {
      * unboundedly and goc_pool_destroy to block forever. */
     pthread_mutex_unlock(&pool->drain_mutex);
 
-    runq_push(&pool->runq, entry);
+    size_t idx;
+    goc_worker* self = tls_worker;
+    if (self != NULL && self->pool == pool) {
+        /* Posted from within a worker of this pool: use local queue. */
+        idx = self->id;
+    } else {
+        /* Posted from an OS thread: distribute round-robin. */
+        idx = atomic_fetch_add_explicit(&pool->post_counter, 1, memory_order_relaxed)
+              % pool->thread_count;
+    }
+
+    runq_push(&pool->workers[idx].runq, entry);
     uv_sem_post(&pool->work_sem);
 }
 
@@ -310,13 +406,6 @@ void post_to_run_queue(goc_pool* pool, goc_entry* entry) {
  * live_count tracks the number of fibers alive on the pool rather than
  * the number of scheduler events.  This is the only correct drain signal:
  * a parked fiber must still count as live even while active_count is zero.
- * ---------------------------------------------------------------------- */
-
-/* -------------------------------------------------------------------------
- * pool_fiber_born — Increment live fiber count for drain coordination
- *
- * Called when a fiber is spawned to track outstanding work for pool draining.
- * Must be paired with pool_fiber_died when the fiber completes.
  * ---------------------------------------------------------------------- */
 
 void pool_fiber_born(goc_pool* pool) {
@@ -336,7 +425,7 @@ void pool_fiber_born(goc_pool* pool) {
 static void pool_abort_if_called_from_worker(goc_pool* pool, const char* api_name) {
     pthread_t self = pthread_self();
     for (size_t i = 0; i < pool->thread_count; i++) {
-        if (pthread_equal(self, pool->threads[i])) {
+        if (pthread_equal(self, pool->workers[i].thread)) {
             fprintf(stderr,
                     "libgoc: %s called from within target pool worker thread; "
                     "this is unsupported and would deadlock\n",
@@ -354,16 +443,8 @@ goc_pool* goc_pool_make(size_t threads) {
     goc_pool* pool = malloc(sizeof(goc_pool));
     memset(pool, 0, sizeof(goc_pool));
 
-    /* Initialise run queue with a sentinel node (plain malloc — must not be
-     * GC-heap, because goc_pool is malloc'd and BDWGC won't scan its fields
-     * for GC pointers; see runq_push/runq_pop for the same reasoning). */
-    goc_runq_node* sentinel = malloc(sizeof(goc_runq_node));
-    sentinel->entry = NULL;
-    sentinel->next  = NULL;
-    pool->runq.head = sentinel;
-    pool->runq.tail = sentinel;
-    uv_mutex_init(&pool->runq.head_lock);
-    uv_mutex_init(&pool->runq.tail_lock);
+    pool->thread_count = threads;
+    pool->workers = malloc(threads * sizeof(goc_worker));
 
     uv_sem_init(&pool->work_sem, 0);
 
@@ -373,12 +454,14 @@ goc_pool* goc_pool_make(size_t threads) {
     pool->active_count = 0;
     pool->live_count   = 0;
     atomic_store(&pool->shutdown, 0);
-
-    pool->thread_count = threads;
-    pool->threads = malloc(threads * sizeof(pthread_t));
+    atomic_store(&pool->post_counter, 0);
 
     for (size_t i = 0; i < threads; i++) {
-        gc_pthread_create(&pool->threads[i], NULL, pool_worker_fn, pool);
+        goc_worker* w = &pool->workers[i];
+        w->pool = pool;
+        w->id   = i;
+        runq_init(&w->runq);
+        gc_pthread_create(&w->thread, NULL, pool_worker_fn, w);
     }
 
     registry_add(pool);
@@ -393,10 +476,7 @@ goc_pool* goc_pool_make(size_t threads) {
 void goc_pool_destroy(goc_pool* pool) {
     pool_abort_if_called_from_worker(pool, "goc_pool_destroy");
 
-    /* 1. Wait for all live fibers to exit (live_count reaches zero).
-     *    Parked fibers (MCO_SUSPENDED) still count as live even though
-     *    active_count may already be zero; using live_count here prevents a
-     *    premature return while fibers are merely blocked on a channel. */
+    /* 1. Wait for all live fibers to exit (live_count reaches zero). */
     pthread_mutex_lock(&pool->drain_mutex);
     while (pool->live_count > 0) {
         pthread_cond_wait(&pool->drain_cond, &pool->drain_mutex);
@@ -413,29 +493,24 @@ void goc_pool_destroy(goc_pool* pool) {
 
     /* 4. Reap worker threads. */
     for (size_t i = 0; i < pool->thread_count; i++) {
-        gc_pthread_join(pool->threads[i], NULL);
+        gc_pthread_join(pool->workers[i].thread, NULL);
     }
 
     /* 5. Destroy synchronisation primitives. */
     uv_sem_destroy(&pool->work_sem);
-    uv_mutex_destroy(&pool->runq.head_lock);
-    uv_mutex_destroy(&pool->runq.tail_lock);
     pthread_mutex_destroy(&pool->drain_mutex);
     pthread_cond_destroy(&pool->drain_cond);
 
-    /* 6. Drain and release any remaining runq nodes (malloc'd; must be freed). */
-    goc_runq_node* n = pool->runq.head;
-    while (n != NULL) {
-        goc_runq_node* next = n->next;
-        free(n);
-        n = next;
+    /* 6. Drain and release per-worker run queues. */
+    for (size_t i = 0; i < pool->thread_count; i++) {
+        runq_destroy(&pool->workers[i].runq);
     }
 
     /* 7. Remove from registry (no-op if already removed by destroy_all). */
     registry_remove(pool);
 
     /* 8. Free pool itself. */
-    free(pool->threads);
+    free(pool->workers);
     free(pool);
 }
 
@@ -482,29 +557,23 @@ goc_drain_result_t goc_pool_destroy_timeout(goc_pool* pool, uint64_t ms) {
 
     for (size_t i = 0; i < pool->thread_count; i++) {
 #ifndef _WIN32
-        GC_pthread_join(pool->threads[i], NULL);
+        GC_pthread_join(pool->workers[i].thread, NULL);
 #else
-        pthread_join(pool->threads[i], NULL);
+        pthread_join(pool->workers[i].thread, NULL);
 #endif
     }
 
     uv_sem_destroy(&pool->work_sem);
-    uv_mutex_destroy(&pool->runq.head_lock);
-    uv_mutex_destroy(&pool->runq.tail_lock);
     pthread_mutex_destroy(&pool->drain_mutex);
     pthread_cond_destroy(&pool->drain_cond);
 
-    /* Drain runq nodes (malloc'd; must be freed explicitly). */
-    goc_runq_node* n = pool->runq.head;
-    while (n != NULL) {
-        goc_runq_node* next = n->next;
-        free(n);
-        n = next;
+    for (size_t i = 0; i < pool->thread_count; i++) {
+        runq_destroy(&pool->workers[i].runq);
     }
 
     registry_remove(pool);
 
-    free(pool->threads);
+    free(pool->workers);
     free(pool);
 
     return GOC_DRAIN_OK;
