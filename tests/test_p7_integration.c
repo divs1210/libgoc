@@ -490,9 +490,7 @@ static void test_p7_4(void) {
     }
 
     /* Wait for all sender fibers to complete. */
-    for (int i = 0; i < P7_4_NSENDERS; i++) {
-        goc_take_sync(joins[i]);
-    }
+    goc_take_all_sync(joins, (size_t)P7_4_NSENDERS);
 
     goc_close(ch);
     TEST_PASS();

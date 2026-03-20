@@ -1246,6 +1246,12 @@ The test suite is split across phase files in `tests/`, each a self-contained C 
 | P3.12 | Buffered channel closed with values still in the ring: `goc_take_sync` drains all buffered values with `ok==GOC_OK` before returning `{NULL, GOC_CLOSED}` |
 | P3.13 | Buffered channel closed with values still in the ring: fiber draining with `goc_take` receives all buffered values with `ok==GOC_OK` before receiving `{NULL, GOC_CLOSED}` |
 | P3.14 | Legitimate `NULL` payload through unbuffered channel: fiber puts `NULL`, taker receives `ok==GOC_OK` and `val==NULL` |
+| P3.15 | `goc_take_all_sync` with `n==0`: no crash, returns non-NULL GC array |
+| P3.16 | `goc_take_all_sync` on pre-filled buffered channels: all results `ok==GOC_OK`, values intact, order matches channel order |
+| P3.17 | `goc_take_all_sync` on already-closed channels: all results `ok==GOC_CLOSED` |
+| P3.18 | `goc_take_all_sync` blocks until fibers send on each channel; all results `ok==GOC_OK`, values intact |
+| P3.19 | `goc_take_all` from fiber on pre-filled buffered channels: all results `ok==GOC_OK`, values intact, order matches channel order |
+| P3.20 | `goc_take_all` from fiber parks on each channel until a sender fiber delivers; all results `ok==GOC_OK`, values intact |
 
 **Phase 4 — Callbacks**
 
