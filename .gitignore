@@ -68,3 +68,6 @@ dkms.conf
 # debug information files
 *.dwo
 build_orig/
+
+# Go module cache (accidentally committed)
+root/
