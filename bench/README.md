@@ -39,14 +39,6 @@ make -C libgoc run
 make -C libgoc run-all
 ```
 
-## Output Format
-
-Both implementations use consistent integer millisecond formatting:
-
-- **Time**: Integer milliseconds (e.g., `234ms`, `1567ms`)
-- **Rates**: Floating-point operations per second (e.g., `1234567 ops/s`)
-- **Organization**: Clear section headers for multi-pool runs
-
 ## Benchmark Status
 
 | # | Benchmark | Go | libgoc |
@@ -57,8 +49,7 @@ Both implementations use consistent integer millisecond formatting:
 | 4 | Spawn idle tasks | ✅ | 🚧 |
 | 5 | Prime sieve | ✅ | 🚧 |
 
-🚧 — Implemented in `bench/libgoc/bench.c` but disabled in `main()` while the
-benchmark suite is being finalised.
+🚧 — Implemented in `bench/libgoc/bench.c` but disabled in `main()`.
 
 ## Runs
 
@@ -148,15 +139,6 @@ Throughput comparison at GOMAXPROCS / GOC_POOL_THREADS = 1 and 8
 (higher is better; libgoc results shown where available).
 
 #### Channel ping-pong (round trips/s)
-
-```
-              POOL=1            POOL=8
-Go        ██████████████████  2,280,645
-libgoc    █████████████        1,658,644   (−27% at POOL=1)
-
-Go        ██████████████████  2,257,564
-libgoc    ███                    339,584   (−85% at POOL=8)
-```
 
 ```
 Benchmark           Pool  Go (ops/s)   libgoc (ops/s)  Ratio (libgoc/Go)
