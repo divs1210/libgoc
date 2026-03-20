@@ -336,6 +336,8 @@ typedef struct goc_entry {
                                            set at launch (goc_go) AND in the goc_take / goc_put
                                            slow paths; checked before every mco_resume —
                                            abort() on mismatch */
+    void*             fiber_root_handle; /* opaque handle returned by goc_fiber_root_register;
+                                            used to unregister the stack root on fiber death */
     void**            result_slot;  /* points at a void* local on the suspended fiber's stack */
     void            (*fn)(void*);   /* fiber entry function; on GC heap, safe if caller returns early */
     void*             fn_arg;
@@ -505,6 +507,8 @@ libgoc uses [minicoro](https://github.com/edubart/minicoro) for all fiber switch
 ```
 assert(mco_running() != NULL)   /* fiber-context guard */
 uv_mutex_lock(ch)
+if dead_count >= GOC_DEAD_COUNT_THRESHOLD:
+    compact_dead_entries(ch)    /* amortised cleanup of cancelled alts entries */
 if buffered value:
     dequeue → result
     wake oldest putter if any
@@ -622,6 +626,14 @@ bool wake(goc_chan* ch, goc_entry* e, void* value) {
         *e->result_slot = value;
     e->ok = GOC_OK;
     if (e->kind == GOC_FIBER) {
+        /* Spin until the fiber has truly called mco_yield (parked == 1).
+           There is a brief window between when the parking fiber releases
+           ch->lock and when it calls mco_yield.  Calling post_to_run_queue
+           during that window causes mco_resume on a MCO_RUNNING coro, which
+           silently returns MCO_NOT_SUSPENDED and leaves the fiber permanently
+           suspended with nobody left to wake it (hang). */
+        goc_entry* fe = mco_get_user_data(e->coro);
+        while (atomic_load(&fe->parked) == 0) sched_yield();
         post_to_run_queue(e->pool, e);
     } else if (e->kind == GOC_CALLBACK) {
         post_callback(e, value);   /* posted via uv_async_send; cb fires on loop thread */
@@ -758,12 +770,12 @@ The invariant is:
 
 
 
-`runq` is a **two-lock MPMC linked queue** (Michael & Scott 1996) with a `head_lock` on the consumer side and a `tail_lock` on the producer side. Any thread (pool or loop) may push; only pool worker threads pop.
+Each worker's run queue is a **two-lock MPMC linked queue** (Michael & Scott 1996) with a `head_lock` on the consumer side and a `tail_lock` on the producer side. The owner worker pushes to the tail; both the owner and thieves pop from the head. Head and tail locks are independent, so owner-push and thief-pop do not block each other.
 
 ```c
 typedef struct goc_runq_node {
-    goc_entry*           entry;
-    struct goc_runq_node* next;   /* GC-allocated node */
+    goc_entry*            entry;
+    struct goc_runq_node* next;
 } goc_runq_node;
 
 typedef struct {
@@ -776,7 +788,7 @@ typedef struct {
 
 ```
 runq_push(q, entry):
-    node = goc_malloc(sizeof(goc_runq_node))
+    node = malloc(sizeof(goc_runq_node))   /* plain malloc — not GC heap */
     node->entry = entry; node->next = NULL
     uv_mutex_lock(&q->tail_lock)
     q->tail->next = node
@@ -791,6 +803,7 @@ runq_pop(q) → goc_entry* or NULL:
     q->head = node
     entry = node->entry
     uv_mutex_unlock(&q->head_lock)
+    free(old_head)   /* sentinel freed here; malloc'd in prior push */
     return entry
 ```
 
@@ -1132,11 +1145,11 @@ uv_tcp_init(goc_scheduler(), server);
 
 `goc_init` must be called exactly once, as the first call in `main()`. Calling it more than once is undefined behaviour. It performs the following steps:
 
-1. **`gc.c`** — Call `GC_INIT()` then `GC_allow_register_threads()` unconditionally. `GC_INIT()` performs all one-time GC setup; `GC_allow_register_threads()` enables multi-thread stack registration and must follow it. This must happen before any `goc_malloc` call.
-2. **`gc.c`** — Register the `push_fiber_roots` callback via `GC_set_push_other_roots`. This replaces per-fiber `GC_add_roots` / `GC_remove_roots` calls (which would exhaust BDW-GC's fixed root-set table) with a single callback that scans all live fiber stacks at each GC mark phase. Must run after `GC_INIT()` and before any fiber is created.
-3. **`gc.c`** — Initialise the `live_channels` list: a `malloc`-allocated, dynamically grown `goc_chan**` array protected by a `uv_mutex_t` (`g_live_mutex`). Must be fully initialised before the loop thread is spawned (step 6) — the loop thread could indirectly trigger `goc_chan_make`, which acquires `g_live_mutex`. `goc_chan_make` is responsible for appending to it; `goc_close` removes entries. Required by `goc_shutdown`.
-4. **`pool.c`** — Initialise the global pool registry (a `malloc`-allocated list protected by a `uv_mutex_t`). Must be fully initialised before the loop thread is spawned (step 6). Read `GOC_POOL_THREADS` from the environment; default to `max(4, hardware_concurrency)`. Every subsequent `goc_pool_make` call appends to this registry; `goc_pool_destroy` removes the entry. `goc_shutdown` iterates the registry to drain and destroy any pools that remain at teardown time.
-5. **`mutex.c`** — Initialise the global RW-mutex registry (a `malloc`-allocated list protected by a `uv_mutex_t`). `goc_mutex_make` appends to this registry so `goc_shutdown` can destroy the internal `uv_mutex_t` lock for every live `goc_mutex`.
+1. **`gc.c`** — Call `GC_INIT()` unconditionally. `GC_INIT()` performs all one-time GC setup and must be the very first GC call.
+2. **`gc.c`** — Register the `push_fiber_roots` callback via `GC_set_push_other_roots` (called inside `goc_fiber_roots_init`). This replaces per-fiber `GC_add_roots` / `GC_remove_roots` calls (which would exhaust BDW-GC's fixed root-set table) with a single callback that scans all live fiber stacks at each GC mark phase. Must run after `GC_INIT()` and before `GC_allow_register_threads()`.
+3. **`gc.c`** — Call `GC_allow_register_threads()` to enable multi-thread stack registration. Must follow both `GC_INIT()` and the push-roots registration. **Callers must not call these functions themselves.**
+4. **`gc.c`** — Initialise the `live_channels` list: a `malloc`-allocated, dynamically grown `goc_chan**` array protected by a `uv_mutex_t` (`g_live_mutex`). Must be fully initialised before the loop thread is spawned (step 6) — the loop thread could indirectly trigger `goc_chan_make`, which acquires `g_live_mutex`. `goc_chan_make` is responsible for appending to it; `goc_close` removes entries. Required by `goc_shutdown`.
+5. **`pool.c`** — Initialise the global pool registry (a `malloc`-allocated list protected by a `uv_mutex_t`). **`mutex.c`** — Initialise the global RW-mutex registry. Both must be fully initialised before the loop thread is spawned (step 6). Read `GOC_POOL_THREADS` from the environment; default to `max(4, hardware_concurrency)`. Every subsequent `goc_pool_make` call appends to the pool registry; `goc_pool_destroy` removes the entry. `goc_shutdown` iterates the registry to drain and destroy any pools that remain at teardown time.
 6. **`loop.c`** — Call `loop_init()`. Internally this: allocates and initialises `g_loop`; malloc-allocates and initialises both `uv_async_t` handles (`g_wakeup` via atomic release store, `g_shutdown_async`); calls `cb_queue_init()` to allocate the MPSC sentinel node (must precede thread spawn and requires GC already up); then spawns the dedicated loop thread via `gc_pthread_create` so thread registration is handled by Boehm's wrapper (on POSIX: `GC_pthread_create`; on Windows: a trampoline). All shared state the loop thread can reach (`g_live_mutex`, pool registry, async handles, callback queue) is fully initialised at this point. It runs `while (uv_run(g_loop, UV_RUN_ONCE)) {}` for its entire lifetime.
 7. **`pool.c`** — Call `goc_pool_make(N)` for the default pool, storing the result globally. This spawns the worker threads; done last so workers start only after the full runtime is up.
 
@@ -1153,11 +1166,10 @@ uv_tcp_init(goc_scheduler(), server);
 `goc_shutdown` iterates the global pool registry and calls `goc_pool_destroy` on every pool that has not already been destroyed — this includes the default pool and any user-created pools made with `goc_pool_make`. `goc_pool_destroy` waits on `drain_cond` (under `drain_mutex`) until `live_count` reaches zero — meaning every fiber has run to completion. Fibers are expected to finish naturally; `goc_shutdown` does not forcibly close channels or inject `ok==GOC_CLOSED` wakeups.
 
 Once the drain-wait completes, `goc_pool_destroy`:
-1. Logs a diagnostic if the run queue is somehow still non-empty.
-2. Sets `pool->shutdown = 1` (atomic release store).
-3. Posts one semaphore unit per worker to unblock sleeping threads.
-4. Joins every worker thread.
-5. Destroys the semaphore and drain primitives, drains and frees the run queue, and frees the pool.
+1. Sets `pool->shutdown = 1` (atomic release store).
+2. Posts one semaphore unit per worker to unblock sleeping threads.
+3. Joins every worker thread.
+4. Destroys the semaphore and drain primitives, drains and frees each worker's run queue, and frees the pool.
 
 Because all fibers have returned before `goc_pool_destroy` returns, no code path will ever call `uv_mutex_lock` on a channel lock again. Channel mutexes may therefore be destroyed immediately after this point without deferral.
 
@@ -1186,6 +1198,10 @@ Once both close callbacks have fired, the loop has no remaining active handles a
 **Step 5 — Close and free the uv loop.**
 
 `uv_loop_close(g_loop)` is called and its return value is asserted to be `0`. Because the loop thread has already exited (Step 4) and all handles were closed inside Step 3, `uv_loop_close` must succeed; a non-zero return indicates a handle was left open and is treated as a programming error. The loop is then freed and `g_loop` set to `NULL`.
+
+**Step 6 — Free fiber root nodes.**
+
+After the loop is torn down, `goc_shutdown` walks the static `fiber_root_head` linked list, calling `free` on every node, then stores `NULL` back into `fiber_root_head`. This prevents node accumulation across `goc_init`/`goc_shutdown` cycles within the same process: without the reset, a subsequent `goc_init` would inherit all dead nodes from the previous cycle, paying O(N_accumulated) per GC mark phase for no benefit.
 
 ---
 
