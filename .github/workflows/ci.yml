@@ -29,11 +29,11 @@ jobs:
       matrix:
         include:
           # Virtual memory mode (recommended) - all platforms
-          - { os: ubuntu-latest,  mode: "vmem",   cmake_flags: "",                   name: "Ubuntu (vmem)" }
-          - { os: macos-latest,   mode: "vmem",   cmake_flags: "",                   name: "macOS (vmem)" }
-          - { os: windows-latest, mode: "vmem",   cmake_flags: "",                   name: "Windows (vmem)" }
+          - { os: ubuntu-latest,  cmake_flags: "",                  name: "Ubuntu (vmem)" }
+          - { os: macos-latest,   cmake_flags: "",                  name: "macOS (vmem)" }
+          - { os: windows-latest, cmake_flags: "",                  name: "Windows (vmem)" }
           # Canary mode - Ubuntu only (for stack protection validation)
-          - { os: ubuntu-latest,  mode: "canary", cmake_flags: "-DLIBGOC_VMEM=OFF", name: "Ubuntu (canary)" }
+          - { os: ubuntu-latest,  cmake_flags: "-DLIBGOC_VMEM=OFF", name: "Ubuntu (canary)" }
 
     env:
       BDWGC_VERSION: "8.2.6"
@@ -106,7 +106,6 @@ jobs:
         run: ctest --test-dir build --output-on-failure --timeout 120
         env:
           LD_LIBRARY_PATH: ${{ env.BDWGC_PREFIX }}/lib
-          LIBGOC_TEST_MODE: ${{ matrix.mode }}
 
       # ---- macOS -------------------------------------------------------
 
@@ -139,8 +138,6 @@ jobs:
       - name: Test (macOS)
         if: runner.os == 'macOS'
         run: ctest --test-dir build --output-on-failure --timeout 120
-        env:
-          LIBGOC_TEST_MODE: ${{ matrix.mode }}
 
       # ---- Windows -----------------------------------------------------
       # Uses MSYS2/MinGW-w64 (UCRT64) to provide a POSIX-compatible toolchain
@@ -185,5 +182,3 @@ jobs:
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: ctest --test-dir build --output-on-failure --timeout 120
-        env:
-          LIBGOC_TEST_MODE: ${{ matrix.mode }}

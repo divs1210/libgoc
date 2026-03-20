@@ -1,7 +1,6 @@
 [![CI](https://github.com/divs1210/libgoc/actions/workflows/ci.yml/badge.svg)](https://github.com/divs1210/libgoc/actions/workflows/ci.yml)
 [![CD](https://github.com/divs1210/libgoc/actions/workflows/cd.yml/badge.svg)](https://github.com/divs1210/libgoc/actions/workflows/cd.yml)
-> 🚨 This library is in active development!
-> Expect rough edges and API changes.
+
 # libgoc
 > A Go-style CSP concurrency runtime for C: threadpools, stackful coroutines, channels, select, async I/O, and garbage collection in one coherent API.
 
@@ -14,11 +13,20 @@ The library provides stackful coroutines ("fibers"), channels, a select primitiv
 - **C developers** who want a Go-style concurrency runtime without switching to Go.
 - **Language implementors** targeting C/C++ as a compilation target, or writing multithreaded interpreters.
 
-See the [Design Doc](./DESIGN.md) for implementation details and [TODO](./TODO.md) for planned future work.
+**Also see:**
+- [Design Doc](./DESIGN.md)
+- [Benchmarks](/bench)
+- [TODO](./TODO.md)
 
 **Pre-built static libraries** for Linux (x86-64), macOS (arm64), and Windows (x86-64) are available on the [Releases page](https://github.com/divs1210/libgoc/releases).
 
 **Platform:** Linux, macOS, and Windows.
+
+> ⚠️ This library is in active development!
+> - API stable ✅
+> - Core functionality complete ✅
+> - Stress testing underway ⚠️
+> - Clear optimization path 📈
 
 **Dependencies:**
 
@@ -92,9 +100,9 @@ typedef struct {
 static void player(void* arg) {
     player_args_t* a = arg;
 
-    goc_val_t v;
-    while ((v = goc_take(a->recv)).ok == GOC_OK) {
-        int count = (int)(intptr_t)v.val;
+    goc_val_t* v;
+    while ((v = goc_take(a->recv))->ok == GOC_OK) {
+        int count = (int)(intptr_t)v->val;
         printf("%s %d\n", a->name, count);
         if (count >= N_ROUNDS) {
             goc_close(a->send);
@@ -204,8 +212,8 @@ int main(void) {
     /* Fan in: collect results from the main thread with goc_take_sync. */
     long total = 0;
     for (int i = 0; i < N_WORKERS; i++) {
-        goc_val_t v = goc_take_sync(result_ch);
-        if (v.ok == GOC_OK) total += (long)(intptr_t)v.val;
+        goc_val_t* v = goc_take_sync(result_ch);
+        if (v->ok == GOC_OK) total += (long)(intptr_t)v->val;
     }
 
     printf("sum [0, %ld) = %ld\n", RANGE, total);
@@ -270,9 +278,9 @@ int main(void) {
     goc_chan* result_ch = goc_chan_make(0);
     goc_go(build_list, result_ch);
 
-    goc_val_t v = goc_take_sync(result_ch);
-    if (v.ok == GOC_OK) {
-        for (node_t* n = v.val; n; n = n->next)
+    goc_val_t* v = goc_take_sync(result_ch);
+    if (v->ok == GOC_OK) {
+        for (node_t* n = v->val; n; n = n->next)
             printf("%d ", n->value);
         printf("\n");
     }
@@ -431,7 +439,7 @@ static void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
 
 | Function | Signature | Description |
 |---|---|---|
-| `goc_take_try` | `goc_val_t goc_take_try(goc_chan* ch)` | Non-blocking receive. Returns immediately from any context. Returns `{val, GOC_OK}` if a value was available, `{NULL, GOC_CLOSED}` if the channel is closed, or `{NULL, GOC_EMPTY}` if the channel is open but empty. Never suspends. |
+| `goc_take_try` | `goc_val_t* goc_take_try(goc_chan* ch)` | Non-blocking receive. Returns immediately from any context. Returns a GC-managed pointer to `{val, GOC_OK}` if a value was available, `{NULL, GOC_CLOSED}` if the channel is closed, or `{NULL, GOC_EMPTY}` if the channel is open but empty. Never suspends. |
 
 ---
 
@@ -441,15 +449,15 @@ These functions may suspend the calling fiber. **Call only from inside a fiber**
 
 | Function | Signature | Description |
 |---|---|---|
-| `goc_take` | `goc_val_t goc_take(goc_chan* ch)` | Receive the next value from `ch`. Blocks until a value is available or the channel is closed. Returns `{val, GOC_OK}` on success, `{NULL, GOC_CLOSED}` on close. Asserts that the caller is running inside a fiber — calling from a bare OS thread aborts with a clear message. |
+| `goc_take` | `goc_val_t* goc_take(goc_chan* ch)` | Receive the next value from `ch`. Blocks until a value is available or the channel is closed. Returns a GC-managed pointer to `{val, GOC_OK}` on success, `{NULL, GOC_CLOSED}` on close. Asserts that the caller is running inside a fiber — calling from a bare OS thread aborts with a clear message. |
 | `goc_put` | `goc_status_t goc_put(goc_chan* ch, void* val)` | Send `val` into `ch`. Blocks until a receiver accepts or the channel is closed. Returns `GOC_OK` on success, `GOC_CLOSED` on close. Asserts that the caller is running inside a fiber — calling from a bare OS thread aborts with a clear message. |
 
 ```c
 static void consumer(void* arg) {
     goc_chan* ch = arg;
-    goc_val_t v;
-    while ((v = goc_take(ch)).ok == GOC_OK)
-        printf("got %ld\n", (intptr_t)v.val);
+    goc_val_t* v;
+    while ((v = goc_take(ch))->ok == GOC_OK)
+        printf("got %ld\n", (intptr_t)v->val);
     // channel closed
 }
 ```
@@ -462,14 +470,14 @@ Blocks the calling OS thread (not a fiber). Calling these from a fiber is a runt
 
 | Function | Signature | Description |
 |---|---|---|
-| `goc_take_sync` | `goc_val_t goc_take_sync(goc_chan* ch)` | Receive a value, blocking the OS thread. Returns `{val, GOC_OK}` on success, `{NULL, GOC_CLOSED}` on close. |
+| `goc_take_sync` | `goc_val_t* goc_take_sync(goc_chan* ch)` | Receive a value, blocking the OS thread. Returns a GC-managed pointer to `{val, GOC_OK}` on success, `{NULL, GOC_CLOSED}` on close. |
 | `goc_put_sync` | `goc_status_t goc_put_sync(goc_chan* ch, void* val)` | Send `val`, blocking the OS thread. Returns `GOC_OK` on success, `GOC_CLOSED` on close. |
 
 ```c
 // From a plain OS thread (e.g. the application's main thread):
-goc_val_t result = goc_take_sync(result_ch);
-if (result.ok == GOC_OK)
-    process(result.val);
+goc_val_t* result = goc_take_sync(result_ch);
+if (result->ok == GOC_OK)
+    process(result->val);
 ```
 
 ---
@@ -480,8 +488,8 @@ Non-deterministic choice across multiple channel operations.
 
 | Function | Signature | Description |
 |---|---|---|
-| `goc_alts` | `goc_alts_result goc_alts(goc_alt_op* ops, size_t n)` | **Fiber context only.** Wait until one of the `n` ops fires and return its result. If a `GOC_ALT_DEFAULT` arm is present and no other arm is immediately ready, the default arm fires without suspending the fiber. |
-| `goc_alts_sync` | `goc_alts_result goc_alts_sync(goc_alt_op* ops, size_t n)` | **Blocking OS-thread context only.** Same semantics as `goc_alts` but blocks the calling OS thread instead of suspending a fiber. Calling from fiber context is a runtime error and aborts with a diagnostic message. |
+| `goc_alts` | `goc_alts_result* goc_alts(goc_alt_op* ops, size_t n)` | **Fiber context only.** Wait until one of the `n` ops fires and return a GC-managed pointer to its result. If a `GOC_ALT_DEFAULT` arm is present and no other arm is immediately ready, the default arm fires without suspending the fiber. |
+| `goc_alts_sync` | `goc_alts_result* goc_alts_sync(goc_alt_op* ops, size_t n)` | **Blocking OS-thread context only.** Same semantics as `goc_alts` but blocks the calling OS thread instead of suspending a fiber. Calling from fiber context is a runtime error and aborts with a diagnostic message. |
 
 ```c
 typedef enum {
@@ -497,7 +505,7 @@ typedef struct {
 } goc_alt_op;
 
 typedef struct {
-    size_t    index;  /* index of the winning arm in ops[] */
+    goc_chan* ch;     /* channel of the winning arm; NULL when GOC_ALT_DEFAULT fires */
     goc_val_t value;  /* received value and ok flag; value.ok==GOC_CLOSED means the channel was closed */
 } goc_alts_result;
 ```
@@ -505,13 +513,13 @@ typedef struct {
 ```c
 // Blocking select: wait for whichever channel becomes ready first
 goc_alt_op ops[] = {
-    { .ch = data_ch,   .op_kind = GOC_ALT_TAKE },   // arm 0: take from data_ch
-    { .ch = cancel_ch, .op_kind = GOC_ALT_TAKE },   // arm 1: take from cancel_ch
+    { .ch = data_ch,   .op_kind = GOC_ALT_TAKE },   // take from data_ch
+    { .ch = cancel_ch, .op_kind = GOC_ALT_TAKE },   // take from cancel_ch
 };
-goc_alts_result r = goc_alts(ops, 2);
+goc_alts_result* r = goc_alts(ops, 2);
 
-if (r.index == 0 && r.value.ok == GOC_OK)
-    process(r.value.val);
+if (r->ch == data_ch && r->value.ok == GOC_OK)
+    process(r->value.val);
 else
     return; // cancelled or channel closed
 ```
@@ -520,11 +528,11 @@ else
 // Non-blocking select with a default arm: never suspends the fiber
 goc_alt_op ops[] = {
     { .ch = data_ch, .op_kind = GOC_ALT_TAKE },
-    { .ch = NULL,    .op_kind = GOC_ALT_DEFAULT },  // arm 1: fires if data_ch is empty
+    { .ch = NULL,    .op_kind = GOC_ALT_DEFAULT },  // fires if data_ch is empty
 };
-goc_alts_result r = goc_alts(ops, 2);
+goc_alts_result* r = goc_alts(ops, 2);
 
-if (r.index == 1)
+if (r->ch == NULL)
     /* no value was ready — do something else */;
 ```
 
@@ -537,13 +545,14 @@ if (r.index == 1)
 | `goc_timeout` | `goc_chan* goc_timeout(uint64_t ms)` | Return a channel that is **closed** after `ms` milliseconds. Use as an arm in `goc_alts` to implement deadlines. |
 
 ```c
+goc_chan* tch = goc_timeout(500);
 goc_alt_op ops[] = {
-    { .ch = data_ch,           .op_kind = GOC_ALT_TAKE },
-    { .ch = goc_timeout(500),  .op_kind = GOC_ALT_TAKE },
+    { .ch = data_ch, .op_kind = GOC_ALT_TAKE },
+    { .ch = tch,     .op_kind = GOC_ALT_TAKE },
 };
-goc_alts_result r = goc_alts(ops, 2);
+goc_alts_result* r = goc_alts(ops, 2);
 
-if (r.index == 1)
+if (r->ch == tch)
     printf("timed out after 500 ms\n");
 ```
 
@@ -598,6 +607,7 @@ typedef enum {
 | Function | Signature | Description |
 |---|---|---|
 | `goc_pool_make` | `goc_pool* goc_pool_make(size_t threads)` | Create a pool with `threads` worker threads. Worker thread registration with Boehm GC is handled automatically via `gc_pthread_create` / `gc_pthread_join` (on POSIX: aliases for `GC_pthread_create`/`GC_pthread_join`; on Windows: a trampoline wrapping `GC_register_my_thread`/`GC_unregister_my_thread`) — do not register or unregister threads manually. |
+| `goc_default_pool` | `goc_pool* goc_default_pool(void)` | Return the default thread pool created by `goc_init`. The default pool is created with `max(4, hardware_concurrency)` worker threads (overridable via `GOC_POOL_THREADS`). The returned pointer is valid from `goc_init` until `goc_shutdown` returns. |
 | `goc_pool_destroy` | `void goc_pool_destroy(goc_pool* pool)` | Wait for all in-flight fibers on the pool to complete naturally, then drain the run queue, join all worker threads, and release pool resources. Blocks indefinitely if any fiber is parked on a channel event that never arrives. Safe to call while fibers are still queued or running — the drain is the synchronisation barrier. **Must not be called from within a worker thread that belongs to `pool`** (including from a fiber running on that pool); that path aborts with a diagnostic message. |
 | `goc_pool_destroy_timeout` | `goc_drain_result_t goc_pool_destroy_timeout(goc_pool* pool, uint64_t ms)` | Like `goc_pool_destroy`, but returns `GOC_DRAIN_OK` if the drain completes within `ms` milliseconds, or `GOC_DRAIN_TIMEOUT` if the timeout expires before all fibers have finished. On timeout the pool is **not** destroyed — worker threads continue running and the pool remains valid. The caller may retry later or take other action (e.g. closing channels to unblock parked fibers, then calling `goc_pool_destroy`). **Must not be called from within a worker thread that belongs to `pool`**; that path aborts with a diagnostic message. |
 

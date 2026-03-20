@@ -121,7 +121,7 @@ static void done_destroy(done_t* d) {
 typedef struct {
     goc_chan*       ch;
     done_t*         done;
-    goc_alts_result result;
+    goc_alts_result* result;
 } p5_1_args_t;
 
 /*
@@ -165,12 +165,12 @@ static void test_p5_1(void) {
 
     done_wait(&done);
 
-    ASSERT(args.result.index == 0);
-    ASSERT(args.result.value.ok == GOC_OK);
-    ASSERT((uintptr_t)args.result.value.val == 0xCAFE);
+    ASSERT(args.result->ch == args.ch);
+    ASSERT(args.result->value.ok == GOC_OK);
+    ASSERT((uintptr_t)args.result->value.val == 0xCAFE);
 
-    goc_val_t v = goc_take_sync(join);
-    ASSERT(v.ok == GOC_CLOSED);
+    goc_val_t* v = goc_take_sync(join);
+    ASSERT(v->ok == GOC_CLOSED);
 
     goc_close(ch);
     done_destroy(&done);
@@ -192,7 +192,7 @@ done:;
 typedef struct {
     goc_chan*       put_ch;
     done_t*         done;
-    goc_alts_result result;
+    goc_alts_result* result;
 } p5_2_args_t;
 
 /*
@@ -254,15 +254,15 @@ static void test_p5_2(void) {
 
     done_wait(&alts_done);
 
-    ASSERT(args.result.index == 0);
-    ASSERT(args.result.value.ok == GOC_OK);
-    ASSERT(args.result.value.val == NULL); /* put arms always return NULL val */
+    ASSERT(args.result->ch == args.put_ch);
+    ASSERT(args.result->value.ok == GOC_OK);
+    ASSERT(args.result->value.val == NULL); /* put arms always return NULL val */
 
-    goc_val_t v;
+    goc_val_t* v;
     v = goc_take_sync(taker_join);
-    ASSERT(v.ok == GOC_CLOSED);
+    ASSERT(v->ok == GOC_CLOSED);
     v = goc_take_sync(alts_join);
-    ASSERT(v.ok == GOC_CLOSED);
+    ASSERT(v->ok == GOC_CLOSED);
 
     goc_close(ch);
     done_destroy(&taker_ready);
@@ -286,7 +286,7 @@ typedef struct {
     goc_chan*       ch;
     done_t*         ready;
     done_t*         done;
-    goc_alts_result result;
+    goc_alts_result* result;
 } p5_3_args_t;
 
 static void test_p5_3_fiber_fn(void* arg) {
@@ -331,12 +331,12 @@ static void test_p5_3(void) {
 
     done_wait(&done);
 
-    ASSERT(args.result.index == 0);
-    ASSERT(args.result.value.ok == GOC_OK);
-    ASSERT((uintptr_t)args.result.value.val == 0x1234);
+    ASSERT(args.result->ch == args.ch);
+    ASSERT(args.result->value.ok == GOC_OK);
+    ASSERT((uintptr_t)args.result->value.val == 0x1234);
 
-    goc_val_t v = goc_take_sync(join);
-    ASSERT(v.ok == GOC_CLOSED);
+    goc_val_t* v = goc_take_sync(join);
+    ASSERT(v->ok == GOC_CLOSED);
 
     goc_close(ch);
     done_destroy(&ready);
@@ -354,7 +354,7 @@ typedef struct {
     goc_chan*       ch;
     done_t*         ready;
     done_t*         done;
-    goc_alts_result result;
+    goc_alts_result* result;
 } p5_4_args_t;
 
 static void test_p5_4_fiber_fn(void* arg) {
@@ -391,18 +391,18 @@ static void test_p5_4(void) {
     struct timespec ts = { .tv_sec = 0, .tv_nsec = 5000000L /* 5 ms */ };
     nanosleep(&ts, NULL);
 
-    goc_val_t v = goc_take_sync(ch);
-    ASSERT(v.ok == GOC_OK);
-    ASSERT((uintptr_t)v.val == 0x5678);
+    goc_val_t* v = goc_take_sync(ch);
+    ASSERT(v->ok == GOC_OK);
+    ASSERT((uintptr_t)v->val == 0x5678);
 
     done_wait(&done);
 
-    ASSERT(args.result.index == 0);
-    ASSERT(args.result.value.ok == GOC_OK);
-    ASSERT(args.result.value.val == NULL);
+    ASSERT(args.result->ch == args.ch);
+    ASSERT(args.result->value.ok == GOC_OK);
+    ASSERT(args.result->value.val == NULL);
 
     v = goc_take_sync(join);
-    ASSERT(v.ok == GOC_CLOSED);
+    ASSERT(v->ok == GOC_CLOSED);
 
     goc_close(ch);
     done_destroy(&ready);
@@ -419,7 +419,7 @@ done:;
 typedef struct {
     goc_chan*       ch;
     done_t*         done;
-    goc_alts_result result;
+    goc_alts_result* result;
 } p5_5_args_t;
 
 static void test_p5_5_fiber_fn(void* arg) {
@@ -453,12 +453,12 @@ static void test_p5_5(void) {
 
     done_wait(&done);
 
-    ASSERT(args.result.index == 1);           /* default arm is at index 1 */
-    ASSERT(args.result.value.ok == GOC_OK);
-    ASSERT(args.result.value.val == NULL);
+    ASSERT(args.result->ch == NULL);           /* default arm: ch is NULL */
+    ASSERT(args.result->value.ok == GOC_OK);
+    ASSERT(args.result->value.val == NULL);
 
-    goc_val_t v = goc_take_sync(join);
-    ASSERT(v.ok == GOC_CLOSED);
+    goc_val_t* v = goc_take_sync(join);
+    ASSERT(v->ok == GOC_CLOSED);
 
     goc_close(ch);
     done_destroy(&done);
@@ -474,7 +474,7 @@ done:;
 typedef struct {
     goc_chan*       ch;
     done_t*         done;
-    goc_alts_result result;
+    goc_alts_result* result;
 } p5_6_args_t;
 
 static void test_p5_6_fiber_fn(void* arg) {
@@ -510,12 +510,12 @@ static void test_p5_6(void) {
 
     done_wait(&done);
 
-    ASSERT(args.result.index == 0);            /* take arm wins, not default */
-    ASSERT(args.result.value.ok == GOC_OK);
-    ASSERT((uintptr_t)args.result.value.val == 0xABCD);
+    ASSERT(args.result->ch == args.ch);         /* take arm wins, not default */
+    ASSERT(args.result->value.ok == GOC_OK);
+    ASSERT((uintptr_t)args.result->value.val == 0xABCD);
 
-    goc_val_t v = goc_take_sync(join);
-    ASSERT(v.ok == GOC_CLOSED);
+    goc_val_t* v = goc_take_sync(join);
+    ASSERT(v->ok == GOC_CLOSED);
 
     goc_close(ch);
     done_destroy(&done);
@@ -531,7 +531,7 @@ done:;
 typedef struct {
     goc_chan*       ch;
     done_t*         done;
-    goc_alts_result result;
+    goc_alts_result* result;
 } p5_7_args_t;
 
 static void test_p5_7_fiber_fn(void* arg) {
@@ -565,11 +565,11 @@ static void test_p5_7(void) {
 
     done_wait(&done);
 
-    ASSERT(args.result.index == 0);
-    ASSERT(args.result.value.ok == GOC_CLOSED);
+    ASSERT(args.result->ch == args.ch);
+    ASSERT(args.result->value.ok == GOC_CLOSED);
 
-    goc_val_t v = goc_take_sync(join);
-    ASSERT(v.ok == GOC_CLOSED);
+    goc_val_t* v = goc_take_sync(join);
+    ASSERT(v->ok == GOC_CLOSED);
 
     done_destroy(&done);
     TEST_PASS();
@@ -585,7 +585,7 @@ typedef struct {
     goc_chan*       ch;
     done_t*         ready;
     done_t*         done;
-    goc_alts_result result;
+    goc_alts_result* result;
 } p5_8_args_t;
 
 static void test_p5_8_fiber_fn(void* arg) {
@@ -626,11 +626,11 @@ static void test_p5_8(void) {
 
     done_wait(&done);
 
-    ASSERT(args.result.index == 0);
-    ASSERT(args.result.value.ok == GOC_CLOSED);
+    ASSERT(args.result->ch == args.ch);
+    ASSERT(args.result->value.ok == GOC_CLOSED);
 
-    goc_val_t v = goc_take_sync(join);
-    ASSERT(v.ok == GOC_CLOSED);
+    goc_val_t* v = goc_take_sync(join);
+    ASSERT(v->ok == GOC_CLOSED);
 
     done_destroy(&ready);
     done_destroy(&done);
@@ -647,7 +647,7 @@ typedef struct {
     goc_chan*       ch;
     done_t*         ready;
     done_t*         done;
-    goc_alts_result result;
+    goc_alts_result* result;
 } p5_9_args_t;
 
 static void test_p5_9_fiber_fn(void* arg) {
@@ -688,11 +688,11 @@ static void test_p5_9(void) {
 
     done_wait(&done);
 
-    ASSERT(args.result.index == 0);
-    ASSERT(args.result.value.ok == GOC_CLOSED);
+    ASSERT(args.result->ch == args.ch);
+    ASSERT(args.result->value.ok == GOC_CLOSED);
 
-    goc_val_t v = goc_take_sync(join);
-    ASSERT(v.ok == GOC_CLOSED);
+    goc_val_t* v = goc_take_sync(join);
+    ASSERT(v->ok == GOC_CLOSED);
 
     done_destroy(&ready);
     done_destroy(&done);
@@ -707,21 +707,25 @@ done:;
  *
  * data_ch     — data channel that is never written to; the timeout must win
  * timeout_ms  — deadline in milliseconds passed to goc_timeout
+ * timeout_ch  — populated by the fiber with the channel returned by goc_timeout;
+ *               used by the test to compare against result->ch
  * done        — signalled when goc_alts returns
  * result      — the goc_alts_result
  */
 typedef struct {
     goc_chan*       data_ch;
     uint64_t        timeout_ms;
+    goc_chan*       timeout_ch;
     done_t*         done;
-    goc_alts_result result;
+    goc_alts_result* result;
 } p5_10_args_t;
 
 static void test_p5_10_fiber_fn(void* arg) {
     p5_10_args_t* a = (p5_10_args_t*)arg;
+    a->timeout_ch = goc_timeout(a->timeout_ms);
     goc_alt_op ops[] = {
-        { .ch = a->data_ch,              .op_kind = GOC_ALT_TAKE },
-        { .ch = goc_timeout(a->timeout_ms), .op_kind = GOC_ALT_TAKE },
+        { .ch = a->data_ch,    .op_kind = GOC_ALT_TAKE },
+        { .ch = a->timeout_ch, .op_kind = GOC_ALT_TAKE },
     };
     a->result = goc_alts(ops, 2);
     done_signal(a->done);
@@ -732,7 +736,7 @@ static void test_p5_10_fiber_fn(void* arg) {
  *
  * The fiber calls goc_alts with a take arm on an empty data channel and a take
  * arm on a goc_timeout channel (50 ms).  Nobody writes to the data channel, so
- * the timeout arm (index 1) must win after roughly 50 ms.  result.ok must be
+ * the timeout arm must win after roughly 50 ms.  result.ok must be
  * GOC_CLOSED (the timer closed the timeout channel).
  */
 static void test_p5_10(void) {
@@ -753,11 +757,11 @@ static void test_p5_10(void) {
 
     done_wait(&done);
 
-    ASSERT(args.result.index == 1);           /* timeout arm is at index 1 */
-    ASSERT(args.result.value.ok == GOC_CLOSED); /* timer fired → channel closed */
+    ASSERT(args.result->ch == args.timeout_ch);  /* timeout arm won */
+    ASSERT(args.result->value.ok == GOC_CLOSED); /* timer fired → channel closed */
 
-    goc_val_t v = goc_take_sync(join);
-    ASSERT(v.ok == GOC_CLOSED);
+    goc_val_t* v = goc_take_sync(join);
+    ASSERT(v->ok == GOC_CLOSED);
 
     goc_close(data_ch);
     done_destroy(&done);
@@ -807,14 +811,14 @@ static void test_p5_11(void) {
     goc_alt_op ops[] = {
         { .ch = ch, .op_kind = GOC_ALT_TAKE },
     };
-    goc_alts_result r = goc_alts_sync(ops, 1);
+    goc_alts_result* r = goc_alts_sync(ops, 1);
 
-    ASSERT(r.index == 0);
-    ASSERT(r.value.ok == GOC_OK);
-    ASSERT((uintptr_t)r.value.val == 0x9ABC);
+    ASSERT(r->ch == ch);
+    ASSERT(r->value.ok == GOC_OK);
+    ASSERT((uintptr_t)r->value.val == 0x9ABC);
 
-    goc_val_t v = goc_take_sync(join);
-    ASSERT(v.ok == GOC_CLOSED);
+    goc_val_t* v = goc_take_sync(join);
+    ASSERT(v->ok == GOC_CLOSED);
 
     goc_close(ch);
     TEST_PASS();
@@ -841,9 +845,9 @@ static void test_p5_12_receiver_fn(void* arg) {
         .tv_nsec = (long)(a->delay_us * 1000UL),
     };
     nanosleep(&ts, NULL);
-    goc_val_t v = goc_take(a->ch);
-    if (v.ok == GOC_OK) {
-        a->received_val = (uintptr_t)v.val;
+    goc_val_t* v = goc_take(a->ch);
+    if (v->ok == GOC_OK) {
+        a->received_val = (uintptr_t)v->val;
     }
 }
 
@@ -868,15 +872,15 @@ static void test_p5_12(void) {
     goc_alt_op ops[] = {
         { .ch = ch, .op_kind = GOC_ALT_PUT, .put_val = (void*)(uintptr_t)0xF00D },
     };
-    goc_alts_result r = goc_alts_sync(ops, 1);
+    goc_alts_result* r = goc_alts_sync(ops, 1);
 
-    ASSERT(r.index == 0);
-    ASSERT(r.value.ok == GOC_OK);
-    ASSERT(r.value.val == NULL);
+    ASSERT(r->ch == ch);
+    ASSERT(r->value.ok == GOC_OK);
+    ASSERT(r->value.val == NULL);
 
     /* Wait for the fiber to finish and confirm it received the correct value. */
-    goc_val_t v = goc_take_sync(join);
-    ASSERT(v.ok == GOC_CLOSED);
+    goc_val_t* v = goc_take_sync(join);
+    ASSERT(v->ok == GOC_CLOSED);
     ASSERT(rargs.received_val == 0xF00D);
 
     goc_close(ch);
@@ -910,11 +914,11 @@ static void test_p5_13(void) {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    goc_val_t v = goc_take_sync(tch);
+    goc_val_t* v = goc_take_sync(tch);
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
 
-    ASSERT(v.ok == GOC_CLOSED);
+    ASSERT(v->ok == GOC_CLOSED);
 
     /* Use signed arithmetic so that when tv_nsec wraps (t1.tv_nsec <
      * t0.tv_nsec, which happens when the measurement straddles a second
@@ -945,7 +949,7 @@ typedef struct {
     goc_chan*       ch2;
     done_t*         ready;
     done_t*         done;
-    goc_alts_result result;
+    goc_alts_result* result;
 } p5_14_args_t;
 
 static void test_p5_14_fiber_fn(void* arg) {
@@ -990,10 +994,10 @@ static void test_p5_14(void) {
 
     done_wait(&done);
 
-    ASSERT(args.result.value.ok == GOC_CLOSED);
+    ASSERT(args.result->value.ok == GOC_CLOSED);
 
-    goc_val_t v = goc_take_sync(join);
-    ASSERT(v.ok == GOC_CLOSED);
+    goc_val_t* v = goc_take_sync(join);
+    ASSERT(v->ok == GOC_CLOSED);
 
     done_destroy(&ready);
     done_destroy(&done);

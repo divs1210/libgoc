@@ -111,6 +111,8 @@ The project uses CMake (≥ 3.20). `CMakeLists.txt` defines the following primar
 
 A CMake function `goc_configure_target(<target>)` centralises the options shared by every library variant: `PUBLIC` include path `include/`, `PRIVATE` paths `src/` and `vendor/minicoro/`, compile definition `GC_THREADS`, and link libraries `PkgConfig::LIBUV` and `PkgConfig::BDWGC`. All library targets (`goc`, `goc_shared`, `goc_asan`, `goc_tsan`) are configured through this function.
 
+When `-DLIBGOC_VMEM=ON` (the default), `LIBGOC_VMEM_ENABLED` is added as a `PRIVATE` compile definition on the `goc` library target **and** on every per-phase test executable. This ensures that `src/internal.h`'s canary macros are disabled and that `test_p8_safety.c` detects the vmem build at compile time (P8.1 uses `#ifdef LIBGOC_VMEM_ENABLED` to skip the canary-abort test in vmem builds, where the canary is a no-op).
+
 Dependencies are resolved via `pkg-config` (libuv as `libuv`, Boehm GC as `bdw-gc-threaded` — **no fallback**; configure fails loudly if the threaded variant is absent). minicoro is instantiated via `src/minicoro.c` (which defines `MINICORO_IMPL`) and its header is available to all targets via `target_include_directories` pointing at `vendor/minicoro/`.
 
 > **Boehm GC thread registration:** libgoc compiles with `-DGC_THREADS` and requires a Boehm GC built with `--enable-threads` (the `bdw-gc-threaded` pkg-config module). Linking against a non-threaded build causes `GC_INIT()` to malfunction or segfault at runtime; CMake will fail at configure time if the threaded variant is absent. See `README.md` for per-platform installation instructions. All threads are created via `gc_pthread_create` (defined in `src/internal.h`). On POSIX (Linux/macOS), `gc_pthread_create` is an alias for `GC_pthread_create`, which wraps the thread start with `GC_call_with_stack_base` so each thread is automatically registered with the collector; no manual `GC_register_my_thread` call is needed or permitted on POSIX (it would double-register and corrupt the GC's internal thread table). On Windows, bdwgc (MSYS2 UCRT64) is compiled with Win32 threads and does not provide `GC_pthread_create`; `gc_pthread_create` is implemented in `gc.c` as a thin wrapper around `pthread_create` that passes a trampoline (`gc_thread_trampoline`) as the thread entry, which calls `GC_register_my_thread` at startup and `GC_unregister_my_thread` at exit.
@@ -465,7 +467,7 @@ goc_alt_op ops[] = {
     { .ch = done,              .op_kind = GOC_ALT_TAKE },
     { .ch = goc_timeout(5000), .op_kind = GOC_ALT_TAKE },
 };
-goc_alts_result r = goc_alts(ops, 2);
+goc_alts_result* r = goc_alts(ops, 2);
 ```
 
 The join channel may be ignored if no join is needed — the channel is GC-allocated and will be collected once it becomes unreachable after the fiber closes it.
@@ -699,7 +701,17 @@ while not shutdown:
                                           applies to ALL entry kinds: launch entries AND goc_alts
                                           park entries; stack_canary_ptr must never be NULL */
     mco_coro* coro = entry->coro       /* snapshot handle before resume — see note below */
+
+    /* Redirect GC stack scan to fiber stack for the duration of mco_resume.
+       See "GC Stack Bottom Redirect" below for full explanation. */
+    struct GC_stack_base orig_sb, fiber_sb
+    GC_get_my_stackbottom(&orig_sb)
+    fiber_sb.mem_base = coro->stack_base + coro->stack_size
+    GC_set_stackbottom(NULL, &fiber_sb)
+
     mco_resume(coro)                   /* run fiber until next mco_yield or return */
+
+    GC_set_stackbottom(NULL, &orig_sb) /* restore OS thread stack bottom */
     GC_remove_roots(&entry, &entry + 1)
     lock(drain_mutex); active_count--; unlock(drain_mutex)
     /* active_count is decremented unconditionally.  The lock is released before
@@ -716,6 +728,10 @@ while not shutdown:
 ```
 
 > **Why `coro` is snapshotted before `mco_resume`.** When a fiber suspends inside `goc_take`, it stack-allocates a `goc_entry` (the parking entry) on its own coroutine stack and parks. The pool worker's `entry` pointer therefore points into the fiber's stack for the duration of that park. If the fiber is immediately re-scheduled on the same resume call (i.e. it runs to completion without yielding again), minicoro recycles the stack — and the memory `entry` pointed at is gone by the time `mco_resume` returns. Reading `entry->coro` after the resume is therefore a use-after-free and a potential segfault. The `mco_coro` object itself is minicoro heap-allocated and remains valid until `mco_destroy`, so snapshotting `coro = entry->coro` *before* the resume is always safe and eliminates the hazard entirely. See [Unified Wakeup](#unified-wakeup) for the analogous `e->next` snapshot requirement in `chan_put_to_taker` and `chan_take_from_putter`.
+
+> **GC Stack Bottom Redirect.** When `mco_resume` switches the CPU stack pointer (RSP) from the worker OS thread's stack into the fiber's stack, the Boehm GC stop-the-world handler captures that fiber-stack RSP as the "bottom of the stack to scan". GC then tries to scan from that RSP all the way up to the worker thread's registered OS-stack bottom — a range potentially spanning the entire virtual address space between the two stacks. That range contains unmapped pages, causing SIGSEGV inside the GC marker thread on every collection cycle.
+>
+> **Fix:** Before `mco_resume`, call `GC_get_my_stackbottom` to save the worker's current OS-thread stack bottom, then `GC_set_stackbottom(NULL, &fiber_sb)` to redirect GC's scan to `[fiber_RSP, fiber_stack_top]` — the actual fiber stack. After `mco_resume` returns (fiber has yielded or exited), restore the original OS thread stack bottom with `GC_set_stackbottom(NULL, &orig_sb)`. This keeps the GC scan range valid for the entire duration of fiber execution and eliminates the inter-stack SIGSEGV.
 
 The invariant is:
 
@@ -921,7 +937,7 @@ goc_alt_op ops[] = {
     { .ch = data_ch,          .op_kind = GOC_ALT_TAKE },
     { .ch = goc_timeout(500), .op_kind = GOC_ALT_TAKE },
 };
-goc_alts_result r = goc_alts(ops, 2);
+goc_alts_result* r = goc_alts(ops, 2);
 ```
 
 ---
@@ -936,15 +952,15 @@ typedef enum {
 } goc_alt_kind;
 
 typedef struct { goc_chan* ch; goc_alt_kind op_kind; void* put_val; } goc_alt_op;
-typedef struct { size_t index; goc_val_t value; } goc_alts_result;
+typedef struct { goc_chan* ch; goc_val_t value; } goc_alts_result;
 
-goc_alts_result goc_alts     (goc_alt_op* ops, size_t n); /* fiber context */
-goc_alts_result goc_alts_sync(goc_alt_op* ops, size_t n); /* blocking OS thread */
+goc_alts_result* goc_alts     (goc_alt_op* ops, size_t n); /* fiber context */
+goc_alts_result* goc_alts_sync(goc_alt_op* ops, size_t n); /* blocking OS thread */
 ```
 
 `goc_alts` may suspend the calling fiber and must only be called from within a fiber. `goc_alts_sync` blocks the calling OS thread; calling it from within a fiber is a runtime invariant violation and aborts with a diagnostic message.
 
-The returned `goc_alts_result.index` is the zero-based index of the winning arm. `goc_alts_result.value` is a `goc_val_t`. For take arms, `value.ok == GOC_CLOSED` means the channel was closed rather than that a `NULL` was sent. For put arms, the winning result is always `{NULL, GOC_OK}` — `result_slot` is NULL for put entries and `wake()` skips the `result_slot` write. For a `GOC_ALT_DEFAULT` arm, the winning result is `{NULL, GOC_OK}`.
+The returned `goc_alts_result->ch` is the channel pointer of the winning arm; it is `NULL` when the `GOC_ALT_DEFAULT` arm fires. `goc_alts_result->value` is a `goc_val_t`. For take arms, `value.ok == GOC_CLOSED` means the channel was closed rather than that a `NULL` was sent. For put arms, the winning result is always `{NULL, GOC_OK}` — `result_slot` is NULL for put entries and `wake()` skips the `result_slot` write. For a `GOC_ALT_DEFAULT` arm, the winning result is `{NULL, GOC_OK}`.
 
 **Invariants:**
 
@@ -1002,7 +1018,7 @@ typedef enum   { GOC_ALT_TAKE, GOC_ALT_PUT,
                  GOC_ALT_DEFAULT                       } goc_alt_kind;
 typedef struct { goc_chan* ch; goc_alt_kind op_kind;
                  void* put_val;                        } goc_alt_op;
-typedef struct { size_t index; goc_val_t value;        } goc_alts_result;
+typedef struct { goc_chan* ch; goc_val_t value;        } goc_alts_result;
 typedef enum {
     GOC_DRAIN_OK      = 0,  /* all fibers finished within the deadline */
     GOC_DRAIN_TIMEOUT = 1,  /* deadline expired; pool remains valid and running */
@@ -1030,14 +1046,14 @@ goc_chan*     goc_go(void (*fn)(void*), void* arg);
 goc_chan*     goc_go_on(goc_pool* pool, void (*fn)(void*), void* arg);
 
 /* Channel I/O — fiber context */
-goc_val_t     goc_take(goc_chan* ch);
+goc_val_t*    goc_take(goc_chan* ch);
 goc_status_t  goc_put(goc_chan* ch, void* val);
 
 /* Channel I/O — non-blocking (any context) */
-goc_val_t     goc_take_try(goc_chan* ch);   /* ok==GOC_EMPTY if open but empty */
+goc_val_t*    goc_take_try(goc_chan* ch);   /* ok==GOC_EMPTY if open but empty */
 
 /* Channel I/O — blocking OS thread */
-goc_val_t     goc_take_sync(goc_chan* ch);
+goc_val_t*    goc_take_sync(goc_chan* ch);
 goc_status_t  goc_put_sync(goc_chan* ch, void* val);
 
 /* Channel I/O — callbacks (any context; cb invoked on uv loop thread) */
@@ -1052,14 +1068,15 @@ goc_chan*     goc_read_lock(goc_mutex* mx);
 goc_chan*     goc_write_lock(goc_mutex* mx);
 
 /* Select */
-goc_alts_result goc_alts     (goc_alt_op* ops, size_t n);
-goc_alts_result goc_alts_sync(goc_alt_op* ops, size_t n);
+goc_alts_result* goc_alts     (goc_alt_op* ops, size_t n);
+goc_alts_result* goc_alts_sync(goc_alt_op* ops, size_t n);
 
 /* Timeout */
 goc_chan*     goc_timeout(uint64_t ms);
 
 /* Thread pool */
 goc_pool*          goc_pool_make(size_t threads);
+goc_pool*          goc_default_pool(void);
 void               goc_pool_destroy(goc_pool* pool);         /* blocking drain-and-join */
 goc_drain_result_t goc_pool_destroy_timeout(goc_pool* pool,
                                             uint64_t ms);    /* GOC_DRAIN_OK or GOC_DRAIN_TIMEOUT; pool remains valid on timeout */
@@ -1281,7 +1298,7 @@ The test suite is split across phase files in `tests/`, each a self-contained C 
 
 | Test | Description |
 |---|---|
-| P8.1 | Stack overflow: an `overflow_fiber` corrupts its own canary word then parks on `goc_take`; a `sender_fiber` calls `goc_put` to wake it; `pool_worker_fn` checks the canary before the next `mco_resume`, finds it corrupted, and calls `abort()`; verified via `fork` + `waitpid` asserting `SIGABRT`. Two fibers are used (rather than a fiber + `goc_take_sync` from the OS thread) to guarantee the victim parks before the sender runs — with `goc_take_sync`, a race exists where the OS thread parks first and the fiber's `goc_put` rendezvouses immediately without ever suspending, so the canary check never fires. |
+| P8.1 | Stack overflow: an `overflow_fiber` corrupts its own canary word then parks on `goc_take`; a `sender_fiber` calls `goc_put` to wake it; `pool_worker_fn` checks the canary before the next `mco_resume`, finds it corrupted, and calls `abort()`; verified via `fork` + `waitpid` asserting `SIGABRT`. Two fibers are used (rather than a fiber + `goc_take_sync` from the OS thread) to guarantee the victim parks before the sender runs — with `goc_take_sync`, a race exists where the OS thread parks first and the fiber's `goc_put` rendezvouses immediately without ever suspending, so the canary check never fires. **Skipped when `LIBGOC_VMEM_ENABLED` is defined** (vmem builds); only exercised in canary builds (`-DLIBGOC_VMEM=OFF`). |
 | P8.2 | `goc_take` called from a bare OS thread (not a fiber) → `abort()`; verified via `fork` + `waitpid` asserting `SIGABRT` |
 | P8.3 | `goc_put` called from a bare OS thread (not a fiber) → `abort()`; verified via `fork` + `waitpid` asserting `SIGABRT` |
 | P8.4 | `goc_alts` called with more than one `GOC_ALT_DEFAULT` arm (from within a fiber) → `abort()`; verified via `fork` + `waitpid` asserting `SIGABRT`. A fiber is spawned via `goc_go()` to provide fiber context. |
@@ -1335,19 +1352,20 @@ ctest --test-dir build-tsan --output-on-failure
 
 Triggered on every push or pull request that touches `src/`, `include/`, `tests/`, `CMakeLists.txt`, `vendor/`, or the workflow file itself. Changes to documentation (`README.md`, `DESIGN.md`, `TODO.md`) do **not** trigger CI.
 
-Runs a build matrix across three operating systems:
+Runs a build matrix across four configurations:
 
-| Runner | Dependencies | Build | Tests |
-|---|---|---|---|
-| `ubuntu-latest` | apt: `libuv1-dev`, `libatomic-ops-dev`; Boehm GC built from source | CMake `RelWithDebInfo` | All phases (P1–P9) via `ctest --timeout 120` |
-| `macos-latest` | Homebrew: `libuv`, `bdw-gc`, `pkg-config`; `bdw-gc-threaded.pc` alias created manually | CMake `RelWithDebInfo` | All phases (P1–P9) via `ctest --timeout 120` |
-| `windows-latest` | MSYS2 UCRT64: `gcc`, `cmake`, `libuv`, `gc`, `pkg-config` (MinGW packages) | CMake `RelWithDebInfo`, full build | P1–P7, P9 via `ctest --timeout 120`; P8 self-skips (see below) |
+| Runner | `cmake_flags` | Tests |
+|---|---|---|
+| `ubuntu-latest` | *(none — vmem build)* | All phases (P1–P9) via `ctest --timeout 120`; P8.1 skipped (vmem build) |
+| `macos-latest` | *(none — vmem build)* | All phases (P1–P9) via `ctest --timeout 120`; P8.1 skipped (vmem build) |
+| `windows-latest` | *(none — vmem build)* | P1–P7, P9 via `ctest --timeout 120`; P8 self-skips (no `fork`) |
+| `ubuntu-latest` | `-DLIBGOC_VMEM=OFF` (canary build) | All phases (P1–P9) via `ctest --timeout 120`; P8.1 exercises canary abort |
 
-On Linux, Boehm GC is built from source with `--enable-threads=posix` and cached between runs. A `bdw-gc-threaded.pc` alias is created from the `bdw-gc.pc` file so that CMake's `pkg_check_modules(BDWGC … bdw-gc-threaded)` finds it.
+All four configurations run `RelWithDebInfo` builds. Dependencies per OS:
 
-On macOS, Homebrew's `bdw-gc` formula does not ship a `bdw-gc-threaded.pc` pkg-config alias; the workflow creates it in the global Homebrew `lib/pkgconfig` directory (`$(brew --prefix)/lib/pkgconfig`) where `pkg-config` searches by default.
-
-On Windows, MSYS2/MinGW-w64 (UCRT64 environment) is used instead of MSVC+vcpkg. This is required because libgoc uses `pthread.h` and C11 `_Atomic` directly — APIs that are not available in MSVC builds or in the Win32-threads build of bdwgc that vcpkg produces. MSYS2's MinGW packages provide a POSIX-compatible toolchain with full GCC C11 support and a bdwgc build compiled with pthreads. A `bdw-gc-threaded.pc` alias is created in `/ucrt64/lib/pkgconfig` before CMake runs.
+- **Linux**: apt: `libuv1-dev`, `libatomic-ops-dev`; Boehm GC built from source with `--enable-threads=posix` and cached between runs. A `bdw-gc-threaded.pc` alias is created from the `bdw-gc.pc` file so that CMake's `pkg_check_modules(BDWGC … bdw-gc-threaded)` finds it.
+- **macOS**: Homebrew: `libuv`, `bdw-gc`, `pkg-config`. Homebrew's `bdw-gc` formula does not ship a `bdw-gc-threaded.pc` pkg-config alias; the workflow creates it in `$(brew --prefix)/lib/pkgconfig`.
+- **Windows**: MSYS2/MinGW-w64 (UCRT64 environment) is used instead of MSVC+vcpkg. This is required because libgoc uses `pthread.h` and C11 `_Atomic` directly. MSYS2's MinGW packages provide a POSIX-compatible toolchain with full GCC C11 support and a bdwgc build compiled with pthreads. A `bdw-gc-threaded.pc` alias is created in `/ucrt64/lib/pkgconfig` before CMake runs.
 
 The test suite itself is portable to Windows with one exception: **Phase 8 (safety tests)** relies on `fork()`/`waitpid()` to isolate processes that call `abort()`. These POSIX APIs are not available in MinGW. `test_p8_safety.c` detects `_WIN32` at compile time and replaces each of the 11 P8 tests with a `TEST_SKIP` stub, so the binary still builds and runs cleanly — it just reports skipped tests rather than failing.
 
