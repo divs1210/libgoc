@@ -153,11 +153,17 @@
 ; and join.
 
 (defn bench-spawn-idle [count]
-  (let [park  (chan)
-        t0    (System/nanoTime)
-        joins (vec (repeatedly count #(go (<! park) :done)))]
-    (close! park)
-    (doseq [j joins] (<!! j))
+  ; core.async channels allow at most 1024 pending takes.  Batch go-blocks
+  ; into groups of 512 (each sharing one park channel) to stay within limits
+  ; while preserving the spawn-block-wake semantics of the benchmark.
+  (let [batch-size 512
+        parks      (vec (repeatedly (long (Math/ceil (/ count batch-size))) chan))
+        t0         (System/nanoTime)
+        joins      (vec (map (fn [i]
+                               (go (<! (parks (quot i batch-size))) :done))
+                             (range count)))]
+    (run! close! parks)
+    (run! <!! joins)
     (let [s    (/ (- (System/nanoTime) t0) 1e9)
           ms   (long (* s 1000))
           rate (/ count s)]
