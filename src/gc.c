@@ -182,16 +182,8 @@ void goc_fiber_root_update_sp(void* handle, mco_coro* coro)
 
 void goc_fiber_roots_init(void)
 {
-    /* Guard against re-registration across goc_init/goc_shutdown cycles.
-     * If push_fiber_roots is already installed, GC_get_push_other_roots()
-     * returns push_fiber_roots itself; storing it in prev_push_roots would
-     * create an infinite self-call loop in the callback.  Skip if already
-     * installed; only capture and chain a genuinely different callback. */
-    GC_push_other_roots_proc cur = GC_get_push_other_roots();
-    if (cur != push_fiber_roots) {
-        prev_push_roots = cur;
-        GC_set_push_other_roots(push_fiber_roots);
-    }
+    prev_push_roots = GC_get_push_other_roots();
+    GC_set_push_other_roots(push_fiber_roots);
 }
 
 /* ---------------------------------------------------------------------------

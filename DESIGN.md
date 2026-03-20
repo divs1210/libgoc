@@ -734,8 +734,6 @@ while not shutdown:
 > - `scan_from` (`_Atomic(void*)`) — cached saved RSP/SP of the suspended fiber, initialised by `mco_get_suspended_sp` at birth and updated by `goc_fiber_root_update_sp` (called in `pool_worker_fn` after each `mco_resume` returns with `MCO_SUSPENDED`). The callback reads this cached value instead of calling `mco_get_suspended_sp` per GC cycle, avoiding 200k random cache misses to vmem-allocated `mco_coro` structs.
 > - `entry` (`goc_entry*`) — the fiber's initial GC-allocated entry; explicitly pushed via `GC_push_all_eager(&n->entry, …)`. This is required because the run queue node that holds a reference to `goc_entry*` is `malloc`'d (not GC-managed), making the entry unreachable to the conservative scanner without this explicit push.
 >
-> **Re-init guard.** `goc_fiber_roots_init()` (called by `goc_init`) guards against re-installation: if `GC_get_push_other_roots()` already returns `push_fiber_roots`, the call is a no-op. Without this guard, a second `goc_init()` call would store `push_fiber_roots` in `prev_push_roots`, causing the callback to call itself infinitely on every GC mark phase.
->
 > **Shutdown cleanup.** `goc_shutdown()` frees all nodes in `fiber_root_head` and resets the head to NULL. Without this cleanup, nodes from a completed `goc_init/shutdown` cycle accumulate in the static list, and subsequent cycles pay O(N_accumulated) per GC mark phase.
 
 The invariant is:
