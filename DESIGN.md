@@ -290,8 +290,10 @@ struct goc_chan {
     size_t       buf_size;
     size_t       buf_head;
     size_t       buf_count;
-    goc_entry*   takers;      /* linked list */
-    goc_entry*   putters;
+    goc_entry*   takers;      /* head of parked-taker linked list */
+    goc_entry*   takers_tail; /* tail of takers list; NULL = unknown (invalidated by removal) */
+    goc_entry*   putters;     /* head of parked-putter linked list */
+    goc_entry*   putters_tail;/* tail of putters list; NULL = unknown */
     uv_mutex_t*  lock;        /* malloc-allocated; destroyed by goc_shutdown after pool drain */
     int          closed;
     size_t       dead_count;  /* cancelled entries still physically on takers/putters lists */
@@ -631,7 +633,9 @@ bool wake(goc_chan* ch, goc_entry* e, void* value) {
 }
 ```
 
-At the **top of `goc_take` and `goc_put`**, immediately after acquiring the lock, if `dead_count >= GOC_DEAD_COUNT_THRESHOLD`, walk both `takers` and `putters` and unlink every entry where `cancelled == 1`, then reset `dead_count` to 0. This amortises list cleanup without requiring inline removal at cancellation time.
+At the **top of `goc_take` and `goc_put`**, immediately after acquiring the lock, if `dead_count >= GOC_DEAD_COUNT_THRESHOLD`, walk both `takers` and `putters` and unlink every entry where `cancelled == 1`, then reset `dead_count` to 0. This amortises list cleanup without requiring inline removal at cancellation time. `compact_dead_entries` also repairs both tail pointers, so that append is O(1) again after a compaction sweep.
+
+> **O(1) tail append via `chan_list_append`.** All slow-path append sites (`goc_take`, `goc_put`, `goc_alts`, `goc_take_cb`, `goc_put_cb`) use the `chan_list_append` helper (declared in `channel_internal.h`) instead of walking to the tail. The helper appends in O(1) when `takers_tail` / `putters_tail` is valid; it falls back to an O(N) repair walk only when the tail pointer has been invalidated by a prior removal. Removal operations in `chan_put_to_taker` and `chan_take_from_putter` invalidate the tail pointer when they remove the last remaining entry (detected by `next == NULL` after removal). Without this optimisation, `bench_spawn_idle` with N fibers all parking on a single channel performed O(N²) work during the spawn phase (N entries each requiring a full traversal), making 200k fibers take hundreds of seconds instead of tens.
 
 > **`e->next` must be saved before calling `wake()` in the splice helpers, and before any dispatch call in `goc_close`.** `chan_put_to_taker` and `chan_take_from_putter` both splice the woken entry out of its list with `*pp = e->next`. For `GOC_FIBER` entries, `wake()` calls `post_to_run_queue`, which enqueues the entry on the pool's run queue. On a multi-core system a pool thread may dequeue and resume the fiber *immediately* — before `wake()` even returns. That fiber's `mco_yield` call site resumes and the function continues to its return, deallocating the stack frame that contains the `goc_entry` (stack-allocated in `goc_take`/`goc_put` slow paths). Any subsequent read of `e->next` would be a use-after-free and a potential SIGSEGV. The fix is to snapshot `next = e->next` *before* calling `wake()`, while `ch->lock` is still held (the lock prevents concurrent modification of the list), then use `next` for the splice after `wake()` returns. The same hazard applies to `goc_close`, which iterates `ch->takers` and `ch->putters` and calls `post_to_run_queue` directly. For `goc_alts`-parked entries the `goc_entry` is GC-heap allocated, so a resumed fiber can allow the GC to collect the entry while `goc_close`'s loop is still running — `e->next` after dispatch is equally a use-after-free. `goc_close`'s loops are therefore written as `while (e != NULL) { goc_entry* next = e->next; ..dispatch..; e = next; }`. This pattern must be preserved in any future modification of these helpers and of `goc_close`.
 
@@ -724,6 +728,15 @@ while not shutdown:
 > **Why not `GC_add_roots`?** BDW-GC's `GC_add_roots` / `GC_remove_roots` store entries in a fixed internal table (`MAX_ROOT_SETS` ≈ 2048). Benchmarks that spawn large numbers of fibers (e.g. `bench_spawn_idle` with 200 000 fibers) exhaust this table, causing BDW-GC to abort with `"Too many root sets"`.
 >
 > **Fix:** `goc_init` registers a `GC_push_other_roots` callback (`push_fiber_roots` in `src/gc.c`) that iterates a lock-free linked list of live fiber stacks and calls `GC_push_all_eager` for each live entry during every GC mark phase. The list is manipulated with atomic CAS operations only — no mutex — because BDW-GC's stop-the-world suspends threads via SIGPWR on Linux; a mutex in the callback would deadlock if a stopped thread held it. Each fiber registers on birth (`goc_go_on`, O(1) CAS-prepend) and unregisters on death (`pool_worker_fn` before `mco_destroy`, O(1) CAS to NULL via the stored handle). Dead nodes remain in the list but are skipped by the callback; memory overhead is one `malloc`'d node per fiber lifetime.
+>
+> **Exact-SP scanning and `goc_entry` liveness.** Each `fiber_root_node` stores three fields set at registration time:
+> - `coro` (`_Atomic(mco_coro*)`) — set to NULL on unregistration (O(1) CAS).
+> - `scan_from` (`_Atomic(void*)`) — cached saved RSP/SP of the suspended fiber, initialised by `mco_get_suspended_sp` at birth and updated by `goc_fiber_root_update_sp` (called in `pool_worker_fn` after each `mco_resume` returns with `MCO_SUSPENDED`). The callback reads this cached value instead of calling `mco_get_suspended_sp` per GC cycle, avoiding 200k random cache misses to vmem-allocated `mco_coro` structs.
+> - `entry` (`goc_entry*`) — the fiber's initial GC-allocated entry; explicitly pushed via `GC_push_all_eager(&n->entry, …)`. This is required because the run queue node that holds a reference to `goc_entry*` is `malloc`'d (not GC-managed), making the entry unreachable to the conservative scanner without this explicit push.
+>
+> **Re-init guard.** `goc_fiber_roots_init()` (called by `goc_init`) guards against re-installation: if `GC_get_push_other_roots()` already returns `push_fiber_roots`, the call is a no-op. Without this guard, a second `goc_init()` call would store `push_fiber_roots` in `prev_push_roots`, causing the callback to call itself infinitely on every GC mark phase.
+>
+> **Shutdown cleanup.** `goc_shutdown()` frees all nodes in `fiber_root_head` and resets the head to NULL. Without this cleanup, nodes from a completed `goc_init/shutdown` cycle accumulate in the static list, and subsequent cycles pay O(N_accumulated) per GC mark phase.
 
 The invariant is:
 
