@@ -1,12 +1,19 @@
 # Benchmarks
 
-This directory contains standalone CSP benchmarks implemented in Go and in C using libgoc.
+This directory contains standalone CSP benchmarks implemented in Go and in C
+using libgoc.
 
-1. **Channel ping-pong** — Two tasks pass a single message back and forth, measuring the basic cost of a send/receive and the context switches it causes.
-2. **Ring benchmark** — Many tasks are arranged in a circle and pass a token around, stressing scheduling and handoff overhead across a larger group.
-3. **Selective receive / fan-out / fan-in** — One producer feeds many workers, and a collector selects across multiple output channels, stressing select logic and load distribution.
-4. **Spawning many idle tasks** — Create lots of tasks that immediately block, highlighting creation time and memory overhead for lightweight tasks.
-5. **Prime sieve** — A pipeline of filters passes numbers through channels to find primes, stressing long chains of tasks and sustained channel traffic.
+1. **Channel ping-pong** — Two tasks pass a single message back and forth,
+   measuring the basic cost of a send/receive and the context switch it causes.
+2. **Ring** — Many tasks are arranged in a circle and pass a token around,
+   stressing scheduling and handoff overhead across a larger group.
+3. **Selective receive / fan-out / fan-in** — One producer feeds many workers
+   and a collector selects across multiple output channels, stressing select
+   logic and load distribution.
+4. **Spawn idle tasks** — Create many tasks that immediately block, highlighting
+   creation time and memory overhead for lightweight tasks.
+5. **Prime sieve** — A pipeline of filters passes numbers through channels to
+   find primes, stressing long chains of tasks and sustained channel traffic.
 
 ## Running
 
@@ -18,30 +25,40 @@ From this directory:
 # Single run (uses current GOMAXPROCS)
 make -C go run
 
-# Multi-pool testing (runs with pool sizes 1, 2, 4, 8)
+# Multi-pool testing (runs with GOMAXPROCS = 1, 2, 4, 8)
 make -C go run-all
 ```
 
 ### libgoc
+
 ```sh
 # Single run (uses current GOC_POOL_THREADS)
 make -C libgoc run
 
-# Multi-pool testing (runs with pool sizes 1, 2, 4, 8)
+# Multi-pool testing (runs with GOC_POOL_THREADS = 1, 2, 4, 8)
 make -C libgoc run-all
 ```
 
 ## Output Format
 
-Both implementations now use consistent integer millisecond formatting:
+Both implementations use consistent integer millisecond formatting:
+
 - **Time**: Integer milliseconds (e.g., `234ms`, `1567ms`)
 - **Rates**: Floating-point operations per second (e.g., `1234567 ops/s`)
 - **Organization**: Clear section headers for multi-pool runs
 
-## Benchmark Notes
+## Benchmark Status
 
-- **Go**: All 5 benchmarks are enabled and functional
-- **libgoc**: Currently runs 2 benchmarks (ping-pong and ring) - others disabled due to implementation issues
+| # | Benchmark | Go | libgoc |
+|---|-----------|:--:|:------:|
+| 1 | Channel ping-pong | ✅ | ✅ |
+| 2 | Ring | ✅ | ✅ |
+| 3 | Selective receive / fan-out / fan-in | ✅ | 🚧 |
+| 4 | Spawn idle tasks | ✅ | 🚧 |
+| 5 | Prime sieve | ✅ | 🚧 |
+
+🚧 — Implemented in `bench/libgoc/bench.c` but disabled in `main()` while the
+benchmark suite is being finalised.
 
 ## Runs
 
@@ -59,7 +76,7 @@ Both implementations now use consistent integer millisecond formatting:
 | **OS**          | Ubuntu 24.04.4 LTS             |
 | **Kernel**      | Linux 6.11.0 x86_64            |
 
-### Go (make run-all)
+### Go (`make run-all`)
 
 ```
 === Pool Size: 1 ===
@@ -95,7 +112,7 @@ Spawn idle tasks: 200000 goroutines in 406ms (492388 tasks/s)
 Prime sieve: 2262 primes up to 20000 in 160ms (14136 primes/s)
 ```
 
-### libgoc (make run-all)
+### libgoc (`make run-all`)
 
 ```
 === Pool Size: 1 ===
@@ -123,4 +140,73 @@ Ring benchmark: 500000 hops across 128 tasks in 1019ms (490455 hops/s)
 
 ### Chart
 
+Throughput comparison at GOMAXPROCS / GOC_POOL_THREADS = 1 and 8
+(higher is better; libgoc results shown where available).
+
+#### Channel ping-pong (round trips/s)
+
+```
+              POOL=1            POOL=8
+Go        ██████████████████  2,280,645
+libgoc    ██████████████████  2,244,633   (≈ parity at POOL=1)
+
+Go        ██████████████████  2,257,564
+libgoc    █████████████       624,659     (−72% at POOL=8)
+```
+
+```
+Benchmark           Pool  Go (ops/s)   libgoc (ops/s)  Ratio (libgoc/Go)
+------------------  ----  -----------  --------------  -----------------
+Channel ping-pong      1  2,280,645      2,244,633          0.98×
+Channel ping-pong      2  2,224,597        788,650          0.35×
+Channel ping-pong      4  2,228,437        519,721          0.23×
+Channel ping-pong      8  2,257,564        624,659          0.28×
+```
+
+#### Ring (hops/s)
+
+```
+Benchmark  Pool  Go (ops/s)   libgoc (ops/s)  Ratio (libgoc/Go)
+---------  ----  -----------  --------------  -----------------
+Ring          1  2,243,222        761,308          0.34×
+Ring          2  2,284,381        377,239          0.17×
+Ring          4  2,240,562        305,005          0.14×
+Ring          8  2,250,942        490,455          0.22×
+```
+
 ### Summary
+
+**Ping-pong — single-threaded parity; multi-threaded regression.**  With a
+single pool thread, libgoc and Go achieve nearly identical ping-pong throughput
+(~2.24 M round trips/s vs ~2.28 M).  Both runtimes must perform the same two
+rendezvous channel operations per round trip, and the coroutine/goroutine
+switch overhead is comparable.
+
+As pool threads increase, libgoc's ping-pong throughput *drops* to ~0.6–0.8 M
+round trips/s while Go's stays flat near 2.25 M.  The cause: a ping-pong
+pattern forces two fibers to alternate ownership of the token, which means
+every send/receive pair involves a cross-thread wakeup when the two fibers
+land on different OS threads.  Go's work-stealing scheduler keeps communicating
+goroutines on the same thread naturally; libgoc's current pool scheduler does
+not yet implement this locality optimisation.
+
+**Ring — significant gap across all thread counts.**  Ring throughput is
+~0.14–0.34× of Go's.  The ring places each message on a different pair of
+fibers for every hop, amplifying the cross-thread wakeup cost that also
+affects ping-pong.  The gap is widest at POOL=4 (0.14×) and partially
+recovers at POOL=8 (0.22×), likely because more threads allow more concurrent
+forwarding.
+
+**What the numbers do and do not say.**  Both benchmarks measure only
+inter-fiber communication latency, not CPU computation throughput.  libgoc's
+coroutine stack model is heavier than Go's goroutine stacks (minicoro uses a
+fixed or virtual-memory-backed stack per fiber vs. Go's automatically-growing
+stacks), and the current pool scheduler lacks work-stealing.  These are known
+areas of improvement tracked in `TODO.md`.  Benchmarks 3–5 (fan-in, spawn,
+sieve) are implemented in `bench/libgoc/bench.c` and will be enabled once
+multi-threaded cross-fiber communication performance improves.
+
+**Go scalability.**  Go scales well on CPU-bound workloads (spawn: 188 K/s →
+492 K/s; prime sieve: 1919/s → 14136/s from POOL=1 to POOL=8) while
+communication-bound workloads (ping-pong, ring) remain flat because the
+bottleneck is channel round-trip latency, not CPU availability.
