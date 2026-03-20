@@ -109,7 +109,7 @@ Spawn idle tasks: 200000 goroutines in 406ms (492388 tasks/s)
 Prime sieve: 2262 primes up to 20000 in 160ms (14136 primes/s)
 ```
 
-### libgoc vmem — `-DLIBGOC_VMEM=ON` (default) — (`make run-all`)
+### libgoc vmem — `-DLIBGOC_VMEM=ON` — (`make run-all`)
 
 ```
 === Pool Size: 1 ===
@@ -145,7 +145,7 @@ Spawn idle tasks: 200000 fibers in 12828ms (15590 tasks/s)
 Prime sieve: 2262 primes up to 20000 in 1580ms (1431 primes/s)
 ```
 
-### libgoc canary — `-DLIBGOC_VMEM=OFF` — (`make run-all`)
+### libgoc canary — (default) — (`make run-all`)
 
 ```
 === Pool Size: 1 ===
