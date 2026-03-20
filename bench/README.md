@@ -41,10 +41,7 @@ Both implementations now use consistent integer millisecond formatting:
 ## Benchmark Notes
 
 - **Go**: All 5 benchmarks are enabled and functional
-- **libgoc**: All 5 benchmarks are enabled. The spawn-idle and prime-sieve defaults
-  are lower on macOS (20k spawns / 10k primes) to avoid per-fiber stack mapping
-  limits. Override with `GOC_BENCH_SPAWN_COUNT` or `GOC_BENCH_PRIME_MAX` if you want
-  to push higher.
+- **libgoc**: Currently runs 2 benchmarks (ping-pong and ring) - others disabled due to implementation issues
 
 ## Runs
 
@@ -99,8 +96,6 @@ Prime sieve: 2262 primes up to 20000 in 160ms (14136 primes/s)
 ```
 
 ### libgoc (make run-all)
-
-Output now includes all five benchmarks; the snippet below is truncated for brevity.
 
 ```
 === Pool Size: 1 ===

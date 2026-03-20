@@ -3,7 +3,6 @@
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <uv.h>
 
 // Benchmarks
@@ -339,19 +338,6 @@ static void bench_prime_sieve(size_t max) {
 }
 
 
-static size_t bench_get_env_size(const char* name, size_t fallback) {
-    const char* raw = getenv(name);
-    if (raw == NULL || *raw == '\0')
-        return fallback;
-
-    char* end = NULL;
-    unsigned long long value = strtoull(raw, &end, 10);
-    if (end == raw || *end != '\0')
-        return fallback;
-
-    return (size_t)value;
-}
-
 // Main
 // ====
 int main(void) {
@@ -360,24 +346,16 @@ int main(void) {
     size_t ping_rounds    = 200000;
     size_t ring_nodes     = 128;
     size_t ring_hops      = 500000;
-#ifdef __APPLE__
-    size_t default_spawn_count = 20000;
-    size_t default_prime_max   = 10000;
-#else
-    size_t default_spawn_count = 50000;
-    size_t default_prime_max   = 20000;
-#endif
-    size_t select_workers = bench_get_env_size("GOC_BENCH_SELECT_WORKERS", 8);
-    size_t select_tasks   = bench_get_env_size("GOC_BENCH_SELECT_TASKS", 200000);
-    /* Default spawn count is lower on macOS to avoid exhausting stack mappings. */
-    size_t spawn_count    = bench_get_env_size("GOC_BENCH_SPAWN_COUNT", default_spawn_count);
-    size_t prime_max      = bench_get_env_size("GOC_BENCH_PRIME_MAX", default_prime_max);
+    // size_t select_workers = 8;
+    // size_t select_tasks   = 200000;
+    // size_t spawn_count    = 200000;
+    // size_t prime_max      = 20000;
 
     bench_ping_pong(ping_rounds);
     bench_ring(ring_nodes, ring_hops);
-    bench_fan_in(select_workers, select_tasks);
-    bench_spawn_idle(spawn_count);
-    bench_prime_sieve(prime_max);
+    // bench_fan_in(select_workers, select_tasks);
+    // bench_spawn_idle(spawn_count);
+    // bench_prime_sieve(prime_max);
 
     goc_shutdown();
     return 0;
