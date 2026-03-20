@@ -111,6 +111,8 @@ The project uses CMake (≥ 3.20). `CMakeLists.txt` defines the following primar
 
 A CMake function `goc_configure_target(<target>)` centralises the options shared by every library variant: `PUBLIC` include path `include/`, `PRIVATE` paths `src/` and `vendor/minicoro/`, compile definition `GC_THREADS`, and link libraries `PkgConfig::LIBUV` and `PkgConfig::BDWGC`. All library targets (`goc`, `goc_shared`, `goc_asan`, `goc_tsan`) are configured through this function.
 
+When `-DLIBGOC_VMEM=ON` (the default), `LIBGOC_VMEM_ENABLED` is added as a `PRIVATE` compile definition on the `goc` library target **and** on every per-phase test executable. This ensures that `src/internal.h`'s canary macros are disabled and that `test_p8_safety.c` detects the vmem build at compile time (P8.1 uses `#ifdef LIBGOC_VMEM_ENABLED` to skip the canary-abort test in vmem builds, where the canary is a no-op).
+
 Dependencies are resolved via `pkg-config` (libuv as `libuv`, Boehm GC as `bdw-gc-threaded` — **no fallback**; configure fails loudly if the threaded variant is absent). minicoro is instantiated via `src/minicoro.c` (which defines `MINICORO_IMPL`) and its header is available to all targets via `target_include_directories` pointing at `vendor/minicoro/`.
 
 > **Boehm GC thread registration:** libgoc compiles with `-DGC_THREADS` and requires a Boehm GC built with `--enable-threads` (the `bdw-gc-threaded` pkg-config module). Linking against a non-threaded build causes `GC_INIT()` to malfunction or segfault at runtime; CMake will fail at configure time if the threaded variant is absent. See `README.md` for per-platform installation instructions. All threads are created via `gc_pthread_create` (defined in `src/internal.h`). On POSIX (Linux/macOS), `gc_pthread_create` is an alias for `GC_pthread_create`, which wraps the thread start with `GC_call_with_stack_base` so each thread is automatically registered with the collector; no manual `GC_register_my_thread` call is needed or permitted on POSIX (it would double-register and corrupt the GC's internal thread table). On Windows, bdwgc (MSYS2 UCRT64) is compiled with Win32 threads and does not provide `GC_pthread_create`; `gc_pthread_create` is implemented in `gc.c` as a thin wrapper around `pthread_create` that passes a trampoline (`gc_thread_trampoline`) as the thread entry, which calls `GC_register_my_thread` at startup and `GC_unregister_my_thread` at exit.
@@ -1296,7 +1298,7 @@ The test suite is split across phase files in `tests/`, each a self-contained C 
 
 | Test | Description |
 |---|---|
-| P8.1 | Stack overflow: an `overflow_fiber` corrupts its own canary word then parks on `goc_take`; a `sender_fiber` calls `goc_put` to wake it; `pool_worker_fn` checks the canary before the next `mco_resume`, finds it corrupted, and calls `abort()`; verified via `fork` + `waitpid` asserting `SIGABRT`. Two fibers are used (rather than a fiber + `goc_take_sync` from the OS thread) to guarantee the victim parks before the sender runs — with `goc_take_sync`, a race exists where the OS thread parks first and the fiber's `goc_put` rendezvouses immediately without ever suspending, so the canary check never fires. |
+| P8.1 | Stack overflow: an `overflow_fiber` corrupts its own canary word then parks on `goc_take`; a `sender_fiber` calls `goc_put` to wake it; `pool_worker_fn` checks the canary before the next `mco_resume`, finds it corrupted, and calls `abort()`; verified via `fork` + `waitpid` asserting `SIGABRT`. Two fibers are used (rather than a fiber + `goc_take_sync` from the OS thread) to guarantee the victim parks before the sender runs — with `goc_take_sync`, a race exists where the OS thread parks first and the fiber's `goc_put` rendezvouses immediately without ever suspending, so the canary check never fires. **Skipped when `LIBGOC_VMEM_ENABLED` is defined** (vmem builds); only exercised in canary builds (`-DLIBGOC_VMEM=OFF`). |
 | P8.2 | `goc_take` called from a bare OS thread (not a fiber) → `abort()`; verified via `fork` + `waitpid` asserting `SIGABRT` |
 | P8.3 | `goc_put` called from a bare OS thread (not a fiber) → `abort()`; verified via `fork` + `waitpid` asserting `SIGABRT` |
 | P8.4 | `goc_alts` called with more than one `GOC_ALT_DEFAULT` arm (from within a fiber) → `abort()`; verified via `fork` + `waitpid` asserting `SIGABRT`. A fiber is spawned via `goc_go()` to provide fiber context. |
@@ -1350,19 +1352,20 @@ ctest --test-dir build-tsan --output-on-failure
 
 Triggered on every push or pull request that touches `src/`, `include/`, `tests/`, `CMakeLists.txt`, `vendor/`, or the workflow file itself. Changes to documentation (`README.md`, `DESIGN.md`, `TODO.md`) do **not** trigger CI.
 
-Runs a build matrix across three operating systems:
+Runs a build matrix across four configurations:
 
-| Runner | Dependencies | Build | Tests |
-|---|---|---|---|
-| `ubuntu-latest` | apt: `libuv1-dev`, `libatomic-ops-dev`; Boehm GC built from source | CMake `RelWithDebInfo` | All phases (P1–P9) via `ctest --timeout 120` |
-| `macos-latest` | Homebrew: `libuv`, `bdw-gc`, `pkg-config`; `bdw-gc-threaded.pc` alias created manually | CMake `RelWithDebInfo` | All phases (P1–P9) via `ctest --timeout 120` |
-| `windows-latest` | MSYS2 UCRT64: `gcc`, `cmake`, `libuv`, `gc`, `pkg-config` (MinGW packages) | CMake `RelWithDebInfo`, full build | P1–P7, P9 via `ctest --timeout 120`; P8 self-skips (see below) |
+| Runner | `cmake_flags` | Tests |
+|---|---|---|
+| `ubuntu-latest` | *(none — vmem build)* | All phases (P1–P9) via `ctest --timeout 120`; P8.1 skipped (vmem build) |
+| `macos-latest` | *(none — vmem build)* | All phases (P1–P9) via `ctest --timeout 120`; P8.1 skipped (vmem build) |
+| `windows-latest` | *(none — vmem build)* | P1–P7, P9 via `ctest --timeout 120`; P8 self-skips (no `fork`) |
+| `ubuntu-latest` | `-DLIBGOC_VMEM=OFF` (canary build) | All phases (P1–P9) via `ctest --timeout 120`; P8.1 exercises canary abort |
 
-On Linux, Boehm GC is built from source with `--enable-threads=posix` and cached between runs. A `bdw-gc-threaded.pc` alias is created from the `bdw-gc.pc` file so that CMake's `pkg_check_modules(BDWGC … bdw-gc-threaded)` finds it.
+All four configurations run `RelWithDebInfo` builds. Dependencies per OS:
 
-On macOS, Homebrew's `bdw-gc` formula does not ship a `bdw-gc-threaded.pc` pkg-config alias; the workflow creates it in the global Homebrew `lib/pkgconfig` directory (`$(brew --prefix)/lib/pkgconfig`) where `pkg-config` searches by default.
-
-On Windows, MSYS2/MinGW-w64 (UCRT64 environment) is used instead of MSVC+vcpkg. This is required because libgoc uses `pthread.h` and C11 `_Atomic` directly — APIs that are not available in MSVC builds or in the Win32-threads build of bdwgc that vcpkg produces. MSYS2's MinGW packages provide a POSIX-compatible toolchain with full GCC C11 support and a bdwgc build compiled with pthreads. A `bdw-gc-threaded.pc` alias is created in `/ucrt64/lib/pkgconfig` before CMake runs.
+- **Linux**: apt: `libuv1-dev`, `libatomic-ops-dev`; Boehm GC built from source with `--enable-threads=posix` and cached between runs. A `bdw-gc-threaded.pc` alias is created from the `bdw-gc.pc` file so that CMake's `pkg_check_modules(BDWGC … bdw-gc-threaded)` finds it.
+- **macOS**: Homebrew: `libuv`, `bdw-gc`, `pkg-config`. Homebrew's `bdw-gc` formula does not ship a `bdw-gc-threaded.pc` pkg-config alias; the workflow creates it in `$(brew --prefix)/lib/pkgconfig`.
+- **Windows**: MSYS2/MinGW-w64 (UCRT64 environment) is used instead of MSVC+vcpkg. This is required because libgoc uses `pthread.h` and C11 `_Atomic` directly. MSYS2's MinGW packages provide a POSIX-compatible toolchain with full GCC C11 support and a bdwgc build compiled with pthreads. A `bdw-gc-threaded.pc` alias is created in `/ucrt64/lib/pkgconfig` before CMake runs.
 
 The test suite itself is portable to Windows with one exception: **Phase 8 (safety tests)** relies on `fork()`/`waitpid()` to isolate processes that call `abort()`. These POSIX APIs are not available in MinGW. `test_p8_safety.c` detects `_WIN32` at compile time and replaces each of the 11 P8 tests with a `TEST_SKIP` stub, so the binary still builds and runs cleanly — it just reports skipped tests rather than failing.
 
