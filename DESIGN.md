@@ -95,7 +95,7 @@ Benchmarks live in `bench/` and are documented in [bench/README.md](./bench/READ
 
 minicoro is a single-header library vendored under `vendor/minicoro/`. It requires exactly one translation unit to instantiate its implementation: `src/minicoro.c` defines `MINICORO_IMPL` before including `minicoro.h`. All other files include `minicoro.h` without defining `MINICORO_IMPL`.
 
-`src/minicoro.c` **must be compiled without `-DGC_THREADS`** (see [minicoro Limitations](#minicoro-limitations)). `CMakeLists.txt` enforces this via `set_source_files_properties(src/minicoro.c PROPERTIES COMPILE_OPTIONS "-UGC_THREADS")`.
+`src/minicoro.c` **must be compiled without `-DGC_THREADS`** and **with `-DMCO_ZERO_MEMORY`** (see [minicoro Limitations](#minicoro-limitations)). `CMakeLists.txt` enforces this via `set_source_files_properties(src/minicoro.c PROPERTIES COMPILE_OPTIONS "-UGC_THREADS;-DMCO_ZERO_MEMORY")`.
 
 ---
 
@@ -499,6 +499,8 @@ libgoc uses [minicoro](https://github.com/edubart/minicoro) for all fiber switch
 **Stack management.** By default, libgoc enables minicoro's virtual memory allocator for dynamic stack growth. When virtual memory is disabled (`-DLIBGOC_VMEM=OFF`), libgoc uses canary-protected stacks with overflow detection. If stack overflow is detected, the runtime calls `abort()` immediately with a diagnostic message. Avoid large stack-allocated buffers and deep recursion inside fibers regardless of stack mode — use `goc_malloc`-allocated buffers on the GC heap for large data.
 
 **`src/minicoro.c` must be compiled without `-DGC_THREADS`.** minicoro declares a `static MCO_THREAD_LOCAL mco_current_co` variable (a `thread_local` TLS slot) to track the running coroutine per thread. When Boehm GC is compiled with `GC_THREADS` it wraps `pthread_create` and invokes `GC_call_with_stack_base` during thread startup, which walks TLS descriptors. If minicoro's TLS block is visible to that walk before `mco_current_co` is initialised on a new thread, the GC faults with a SIGSEGV inside its own startup code — even if no minicoro function has yet been called. The fix is to compile `src/minicoro.c` in its own isolated translation unit with `-UGC_THREADS`, which `CMakeLists.txt` enforces via `set_source_files_properties`. minicoro never calls any GC function, so the flag is irrelevant to its correctness regardless.
+
+**`src/minicoro.c` must be compiled with `-DMCO_ZERO_MEMORY`.** minicoro's internal push/pop storage buffer is used to pass values between `mco_push`/`mco_pop` calls across a `mco_yield`/`mco_resume` boundary. When `MCO_ZERO_MEMORY` is not defined, popped bytes remain in the buffer after the pop — if those bytes held a GC-managed pointer, Boehm GC's conservative scanner may keep the referent alive indefinitely because it still sees a pointer-shaped value in the coroutine's allocation. Defining `MCO_ZERO_MEMORY` causes minicoro to `memset` the popped region to zero immediately after copying it to the caller, eliminating the stale-pointer window. This is minicoro's built-in GC-environment support and **must be enabled** when building with Boehm GC. `-UGC_THREADS` and `-DMCO_ZERO_MEMORY` are therefore complementary: the former prevents the TLS-related crash at thread startup; the latter ensures the conservative collector does not retain objects via stale references in coroutine storage.
 
 ---
 

@@ -82,13 +82,17 @@ function(goc_configure_target target_name)
     )
 endfunction()
 
-# minicoro.c must NOT be compiled with -DGC_THREADS.
+# minicoro.c must NOT be compiled with -DGC_THREADS (the TLS variable
+# mco_current_co causes a SIGSEGV during Boehm GC's thread-startup walk);
+# it MUST be compiled with -DMCO_ZERO_MEMORY so that minicoro zeroes its
+# push/pop storage on pop, preventing stale GC-managed pointers from keeping
+# objects alive longer than they should be under Boehm's conservative scan.
 # Set globally before any add_library so it applies to all targets that
 # include this source file. Does not require TARGET_DIRECTORY (CMake 3.26+).
 if(LIBGOC_VMEM)
-    set_source_files_properties(src/minicoro.c PROPERTIES COMPILE_OPTIONS "-UGC_THREADS;-UGC_PTHREADS;-DMCO_USE_VMEM_ALLOCATOR")
+    set_source_files_properties(src/minicoro.c PROPERTIES COMPILE_OPTIONS "-UGC_THREADS;-UGC_PTHREADS;-DMCO_USE_VMEM_ALLOCATOR;-DMCO_ZERO_MEMORY")
 else()
-    set_source_files_properties(src/minicoro.c PROPERTIES COMPILE_OPTIONS "-UGC_THREADS;-UGC_PTHREADS")
+    set_source_files_properties(src/minicoro.c PROPERTIES COMPILE_OPTIONS "-UGC_THREADS;-UGC_PTHREADS;-DMCO_ZERO_MEMORY")
 endif()
 
 # ---------------------------------------------------------------------------
