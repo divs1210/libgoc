@@ -465,7 +465,7 @@ goc_alt_op ops[] = {
     { .ch = done,              .op_kind = GOC_ALT_TAKE },
     { .ch = goc_timeout(5000), .op_kind = GOC_ALT_TAKE },
 };
-goc_alts_result r = goc_alts(ops, 2);
+goc_alts_result* r = goc_alts(ops, 2);
 ```
 
 The join channel may be ignored if no join is needed — the channel is GC-allocated and will be collected once it becomes unreachable after the fiber closes it.
@@ -921,7 +921,7 @@ goc_alt_op ops[] = {
     { .ch = data_ch,          .op_kind = GOC_ALT_TAKE },
     { .ch = goc_timeout(500), .op_kind = GOC_ALT_TAKE },
 };
-goc_alts_result r = goc_alts(ops, 2);
+goc_alts_result* r = goc_alts(ops, 2);
 ```
 
 ---
@@ -936,15 +936,15 @@ typedef enum {
 } goc_alt_kind;
 
 typedef struct { goc_chan* ch; goc_alt_kind op_kind; void* put_val; } goc_alt_op;
-typedef struct { size_t index; goc_val_t value; } goc_alts_result;
+typedef struct { goc_chan* ch; goc_val_t value; } goc_alts_result;
 
-goc_alts_result goc_alts     (goc_alt_op* ops, size_t n); /* fiber context */
-goc_alts_result goc_alts_sync(goc_alt_op* ops, size_t n); /* blocking OS thread */
+goc_alts_result* goc_alts     (goc_alt_op* ops, size_t n); /* fiber context */
+goc_alts_result* goc_alts_sync(goc_alt_op* ops, size_t n); /* blocking OS thread */
 ```
 
 `goc_alts` may suspend the calling fiber and must only be called from within a fiber. `goc_alts_sync` blocks the calling OS thread; calling it from within a fiber is a runtime invariant violation and aborts with a diagnostic message.
 
-The returned `goc_alts_result.index` is the zero-based index of the winning arm. `goc_alts_result.value` is a `goc_val_t`. For take arms, `value.ok == GOC_CLOSED` means the channel was closed rather than that a `NULL` was sent. For put arms, the winning result is always `{NULL, GOC_OK}` — `result_slot` is NULL for put entries and `wake()` skips the `result_slot` write. For a `GOC_ALT_DEFAULT` arm, the winning result is `{NULL, GOC_OK}`.
+The returned `goc_alts_result->ch` is the channel pointer of the winning arm; it is `NULL` when the `GOC_ALT_DEFAULT` arm fires. `goc_alts_result->value` is a `goc_val_t`. For take arms, `value.ok == GOC_CLOSED` means the channel was closed rather than that a `NULL` was sent. For put arms, the winning result is always `{NULL, GOC_OK}` — `result_slot` is NULL for put entries and `wake()` skips the `result_slot` write. For a `GOC_ALT_DEFAULT` arm, the winning result is `{NULL, GOC_OK}`.
 
 **Invariants:**
 
@@ -1002,7 +1002,7 @@ typedef enum   { GOC_ALT_TAKE, GOC_ALT_PUT,
                  GOC_ALT_DEFAULT                       } goc_alt_kind;
 typedef struct { goc_chan* ch; goc_alt_kind op_kind;
                  void* put_val;                        } goc_alt_op;
-typedef struct { size_t index; goc_val_t value;        } goc_alts_result;
+typedef struct { goc_chan* ch; goc_val_t value;        } goc_alts_result;
 typedef enum {
     GOC_DRAIN_OK      = 0,  /* all fibers finished within the deadline */
     GOC_DRAIN_TIMEOUT = 1,  /* deadline expired; pool remains valid and running */
@@ -1030,14 +1030,14 @@ goc_chan*     goc_go(void (*fn)(void*), void* arg);
 goc_chan*     goc_go_on(goc_pool* pool, void (*fn)(void*), void* arg);
 
 /* Channel I/O — fiber context */
-goc_val_t     goc_take(goc_chan* ch);
+goc_val_t*    goc_take(goc_chan* ch);
 goc_status_t  goc_put(goc_chan* ch, void* val);
 
 /* Channel I/O — non-blocking (any context) */
-goc_val_t     goc_take_try(goc_chan* ch);   /* ok==GOC_EMPTY if open but empty */
+goc_val_t*    goc_take_try(goc_chan* ch);   /* ok==GOC_EMPTY if open but empty */
 
 /* Channel I/O — blocking OS thread */
-goc_val_t     goc_take_sync(goc_chan* ch);
+goc_val_t*    goc_take_sync(goc_chan* ch);
 goc_status_t  goc_put_sync(goc_chan* ch, void* val);
 
 /* Channel I/O — callbacks (any context; cb invoked on uv loop thread) */
@@ -1052,14 +1052,15 @@ goc_chan*     goc_read_lock(goc_mutex* mx);
 goc_chan*     goc_write_lock(goc_mutex* mx);
 
 /* Select */
-goc_alts_result goc_alts     (goc_alt_op* ops, size_t n);
-goc_alts_result goc_alts_sync(goc_alt_op* ops, size_t n);
+goc_alts_result* goc_alts     (goc_alt_op* ops, size_t n);
+goc_alts_result* goc_alts_sync(goc_alt_op* ops, size_t n);
 
 /* Timeout */
 goc_chan*     goc_timeout(uint64_t ms);
 
 /* Thread pool */
 goc_pool*          goc_pool_make(size_t threads);
+goc_pool*          goc_default_pool(void);
 void               goc_pool_destroy(goc_pool* pool);         /* blocking drain-and-join */
 goc_drain_result_t goc_pool_destroy_timeout(goc_pool* pool,
                                             uint64_t ms);    /* GOC_DRAIN_OK or GOC_DRAIN_TIMEOUT; pool remains valid on timeout */
