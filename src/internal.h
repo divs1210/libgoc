@@ -198,7 +198,12 @@ void chan_unregister(goc_chan* ch);
 void post_to_run_queue(goc_pool* pool, goc_entry* entry);
 void pool_fiber_born(goc_pool* pool);
 
-/* channel.c — inline helper for common atomic CAS pattern */
+/* Inline helper used by wake() and goc_close to atomically claim a parked
+ * entry for dispatch.  For goc_alts entries (fired != NULL), first CAS fired
+ * 0→1 (acq_rel) — if another arm already fired, return false immediately.
+ * Then CAS woken 0→1 (acq_rel) — if another caller already claimed the entry,
+ * return false.  Returns true only when the caller wins both CASes (or fired
+ * is NULL and only the woken CAS is needed). */
 static inline bool try_claim_wake(goc_entry* e) {
     if (e->fired != NULL) {
         int expected_fired = 0;

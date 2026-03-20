@@ -29,14 +29,17 @@
  * Called under ch->lock. Unified wakeup path for a single parked entry.
  * Returns true when the entry is claimed and scheduled, false otherwise.
  * Steps:
- *   1. Acquire-load e->cancelled; if set → ch->dead_count++; return.
- *   2. CAS e->woken 0→1 (acq_rel); if fails → ch->dead_count++; return.
+ *   1. Acquire-load e->cancelled; if set → ch->dead_count++; return false.
+ *   2. Call try_claim_wake(e):
+ *      a. If e->fired != NULL (goc_alts entry): CAS fired 0→1 (acq_rel);
+ *         if another arm already fired → return false.
+ *      b. CAS e->woken 0→1 (acq_rel); if fails → return false.
  *   3. Write value to *e->result_slot (if non-NULL).
  *   4. Set e->ok = GOC_OK.
  *   5. Dispatch by kind.
  *
  * NOTE: goc_close does NOT call wake. It iterates the lists directly and
- * sets e->ok = GOC_CLOSED after winning the CAS (see goc_close below).
+ * sets e->ok = GOC_CLOSED after winning try_claim_wake (see goc_close below).
  * Like wake(), goc_close must skip any entry where e->cancelled == 1.
  * Cancelled entries belong to goc_alts losers whose coroutine is already
  * MCO_DEAD; calling post_to_run_queue on them would resume a dead coroutine
