@@ -653,14 +653,14 @@ typedef struct goc_pool {
     uv_sem_t        work_sem;       /* signalled when runq becomes non-empty */
     _Atomic int     shutdown;       /* set to 1 to stop workers */
 
-    /* Drain synchronisation — used by goc_pool_destroy to wait until all
-       in-flight fibers have completed before joining worker threads. */
+    /* Drain synchronisation — drain_mutex now protects ONLY live_count and
+       drain_cond.  active_count is _Atomic and updated without the mutex. */
     pthread_mutex_t drain_mutex;
     pthread_cond_t  drain_cond;
-    size_t          active_count;   /* fibers currently queued or executing; incremented
-                                       by post_to_run_queue, decremented unconditionally
-                                       after every mco_resume (yield or exit).  Used for
-                                       internal scheduling accounting only. */
+    _Atomic size_t  active_count;   /* [Fix 1] fibers currently queued or executing;
+                                       incremented by post_to_run_queue, decremented
+                                       atomically after every mco_resume (yield or exit).
+                                       No mutex needed — drain only watches live_count. */
     size_t          live_count;     /* fibers still alive on this pool; incremented exactly
                                        once per fiber at birth by pool_fiber_born() (called
                                        from goc_go_on before post_to_run_queue), decremented
@@ -672,38 +672,51 @@ typedef struct goc_pool {
                                        Re-queuing a parked fiber via wake() must not inflate
                                        it, or the count would grow unboundedly with channel
                                        operations and goc_pool_destroy would never unblock. */
+
+    /* [Fix 4] Per-pool recycled runq node free-list.
+       Eliminates malloc/free on the hot post_to_run_queue / runq_pop path.
+       Protected by node_freelist_lock (separate from drain_mutex). */
+    uv_mutex_t      node_freelist_lock;
+    goc_runq_node*  node_freelist_head;
 } goc_pool;
 ```
 
-> **`drain_cond` is signalled only on `MCO_DEAD`.** `active_count` is decremented on every yield or exit, but the broadcast fires only when a fiber actually dies. `goc_pool_destroy` and `goc_pool_destroy_timeout` wait on `live_count == 0`, not `active_count == 0` — a parked fiber (MCO_SUSPENDED) has already decremented `active_count` to zero while still being alive, so using `active_count` as the drain signal would cause a premature return while fibers are merely blocked on a channel.
+> **`drain_cond` is signalled only on `MCO_DEAD`.** `active_count` is decremented atomically on every yield or exit (no mutex needed — [Fix 1]), but the broadcast fires only when a fiber actually dies. `goc_pool_destroy` and `goc_pool_destroy_timeout` wait on `live_count == 0`, not `active_count == 0` — a parked fiber (MCO_SUSPENDED) has already decremented `active_count` to zero while still being alive, so using `active_count` as the drain signal would cause a premature return while fibers are merely blocked on a channel.
 
 The default pool is created by `goc_init` with `max(4, hardware_concurrency)` worker threads. This can be overridden by setting the `GOC_POOL_THREADS` environment variable before calling `goc_init`.
 
 Each worker thread runs a loop:
 
 ```
+/* [Fix 3] orig_sb and last_fiber_stack_top are computed once at thread start. */
+orig_sb = GC_get_my_stackbottom()
+last_fiber_stack_top = NULL
+
 while not shutdown:
     wait on work_sem
-    goc_entry* entry = runq_pop()
+    goc_entry* entry = runq_pop()        /* [Fix 4] returns recycled node to free-list */
     if *entry->stack_canary_ptr != GOC_STACK_CANARY:
         abort()                        /* stack overflow — deterministic crash, not silent corruption
                                           applies to ALL entry kinds: launch entries AND goc_alts
                                           park entries; stack_canary_ptr must never be NULL */
     mco_coro* coro = entry->coro       /* snapshot handle before resume — see note below */
 
-    /* Redirect GC stack scan to fiber stack for the duration of mco_resume.
-       See "GC Stack Bottom Redirect" below for full explanation. */
-    struct GC_stack_base orig_sb, fiber_sb
-    GC_get_my_stackbottom(&orig_sb)
-    fiber_sb.mem_base = coro->stack_base + coro->stack_size
-    GC_set_stackbottom(NULL, &fiber_sb)
+    /* [Fix 3] Redirect GC stack scan to fiber stack — skip GC_set_stackbottom
+       when the same fiber stack is resumed back-to-back on this worker. */
+    fiber_stack_top = coro->stack_base + coro->stack_size
+    changed_sb = (fiber_stack_top != last_fiber_stack_top)
+    if changed_sb:
+        last_fiber_stack_top = fiber_stack_top
+        fiber_sb.mem_base = fiber_stack_top
+        GC_set_stackbottom(NULL, &fiber_sb)
 
     mco_resume(coro)                   /* run fiber until next mco_yield or return */
 
-    GC_set_stackbottom(NULL, &orig_sb) /* restore OS thread stack bottom */
-    lock(drain_mutex); active_count--; unlock(drain_mutex)
-    /* active_count is decremented unconditionally.  The lock is released before
-       checking MCO_DEAD to avoid holding drain_mutex across mco_destroy. */
+    if changed_sb:
+        GC_set_stackbottom(NULL, &orig_sb) /* restore OS thread stack bottom */
+
+    /* [Fix 1] active_count is _Atomic — no drain_mutex needed here. */
+    atomic_fetch_sub(&active_count, 1)
     if mco_status(coro) == MCO_DEAD:
         fe = mco_get_user_data(coro)
         goc_fiber_root_unregister(fe->fiber_root_handle)  /* unregister via push_other_roots list */
@@ -761,7 +774,7 @@ The invariant is:
 ```c
 typedef struct goc_runq_node {
     goc_entry*           entry;
-    struct goc_runq_node* next;   /* GC-allocated node */
+    struct goc_runq_node* next;
 } goc_runq_node;
 
 typedef struct {
@@ -773,22 +786,39 @@ typedef struct {
 ```
 
 ```
-runq_push(q, entry):
-    node = goc_malloc(sizeof(goc_runq_node))
-    node->entry = entry; node->next = NULL
-    uv_mutex_lock(&q->tail_lock)
-    q->tail->next = node
-    q->tail = node
-    uv_mutex_unlock(&q->tail_lock)
+/* [Fix 4] node_alloc / node_free recycle nodes via pool->node_freelist_head
+   instead of calling goc_malloc / goc_free on every dispatch. */
+node_alloc(pool):
+    lock(pool->node_freelist_lock)
+    node = pool->node_freelist_head
+    if node != NULL: pool->node_freelist_head = node->next
+    unlock(pool->node_freelist_lock)
+    if node == NULL: node = goc_malloc(sizeof(goc_runq_node))
+    return node
 
-runq_pop(q) → goc_entry* or NULL:
-    uv_mutex_lock(&q->head_lock)
-    node = q->head->next          /* head is a sentinel */
+node_free(pool, node):
+    lock(pool->node_freelist_lock)
+    node->next = pool->node_freelist_head
+    pool->node_freelist_head = node
+    unlock(pool->node_freelist_lock)
+
+runq_push(pool, entry):
+    node = node_alloc(pool)
+    node->entry = entry; node->next = NULL
+    uv_mutex_lock(&pool->runq.tail_lock)
+    pool->runq.tail->next = node
+    pool->runq.tail = node
+    uv_mutex_unlock(&pool->runq.tail_lock)
+
+runq_pop(pool) → goc_entry* or NULL:
+    uv_mutex_lock(&pool->runq.head_lock)
+    node = pool->runq.head->next          /* head is a sentinel */
     if node == NULL:
-        uv_mutex_unlock(&q->head_lock) → return NULL
-    q->head = node
+        uv_mutex_unlock(&pool->runq.head_lock) → return NULL
+    pool->runq.head = node
     entry = node->entry
-    uv_mutex_unlock(&q->head_lock)
+    uv_mutex_unlock(&pool->runq.head_lock)
+    node_free(pool, node)                  /* recycle node to free-list */
     return entry
 ```
 
@@ -1093,7 +1123,7 @@ uv_loop_t*    goc_scheduler(void);
 | Function | Signature | Defined in |
 |---|---|---|
 | `cb_queue_init` | `void cb_queue_init(void)` | `loop.c` |
-| `post_to_run_queue` | `void post_to_run_queue(goc_pool* pool, goc_entry* entry)` | `pool.c` — increments `active_count` only; does **not** touch `live_count` |
+| `post_to_run_queue` | `void post_to_run_queue(goc_pool* pool, goc_entry* entry)` | `pool.c` — atomically increments `active_count` ([Fix 1]); does **not** touch `live_count` |
 | `pool_fiber_born` | `void pool_fiber_born(goc_pool* pool)` | `pool.c` — increments `live_count` exactly once per new fiber; called from `goc_go_on` before `post_to_run_queue` |
 | `post_callback` | `void post_callback(goc_entry* entry, void* value)` | `loop.c` |
 | `on_wakeup` | `void on_wakeup(uv_async_t* handle)` | `loop.c` |
