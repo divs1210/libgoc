@@ -172,7 +172,10 @@ static void fan_in_fn(void* arg) {
         if (r->value.ok == GOC_OK) {
             received++;
         } else {
-            /* channel closed — remove it by swapping with the last active slot */
+            /* channel closed — find and remove it by swapping with the last active slot.
+             * Linear scan is O(n_active) but occurs at most once per worker channel,
+             * so total overhead across the entire fan-in is O(workers²) which is
+             * negligible for typical benchmark worker counts. */
             for (size_t k = 0; k < n_active; k++) {
                 if (ops[k].ch == r->ch) {
                     ops[k] = ops[n_active - 1];

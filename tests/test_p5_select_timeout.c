@@ -707,21 +707,25 @@ done:;
  *
  * data_ch     — data channel that is never written to; the timeout must win
  * timeout_ms  — deadline in milliseconds passed to goc_timeout
+ * timeout_ch  — populated by the fiber with the channel returned by goc_timeout;
+ *               used by the test to compare against result->ch
  * done        — signalled when goc_alts returns
  * result      — the goc_alts_result
  */
 typedef struct {
     goc_chan*       data_ch;
     uint64_t        timeout_ms;
+    goc_chan*       timeout_ch;
     done_t*         done;
     goc_alts_result* result;
 } p5_10_args_t;
 
 static void test_p5_10_fiber_fn(void* arg) {
     p5_10_args_t* a = (p5_10_args_t*)arg;
+    a->timeout_ch = goc_timeout(a->timeout_ms);
     goc_alt_op ops[] = {
-        { .ch = a->data_ch,              .op_kind = GOC_ALT_TAKE },
-        { .ch = goc_timeout(a->timeout_ms), .op_kind = GOC_ALT_TAKE },
+        { .ch = a->data_ch,    .op_kind = GOC_ALT_TAKE },
+        { .ch = a->timeout_ch, .op_kind = GOC_ALT_TAKE },
     };
     a->result = goc_alts(ops, 2);
     done_signal(a->done);
@@ -732,7 +736,7 @@ static void test_p5_10_fiber_fn(void* arg) {
  *
  * The fiber calls goc_alts with a take arm on an empty data channel and a take
  * arm on a goc_timeout channel (50 ms).  Nobody writes to the data channel, so
- * the timeout arm (index 1) must win after roughly 50 ms.  result.ok must be
+ * the timeout arm must win after roughly 50 ms.  result.ok must be
  * GOC_CLOSED (the timer closed the timeout channel).
  */
 static void test_p5_10(void) {
@@ -753,7 +757,7 @@ static void test_p5_10(void) {
 
     done_wait(&done);
 
-    ASSERT(args.result->ch != NULL && args.result->ch != args.data_ch); /* timeout arm */
+    ASSERT(args.result->ch == args.timeout_ch);  /* timeout arm won */
     ASSERT(args.result->value.ok == GOC_CLOSED); /* timer fired → channel closed */
 
     goc_val_t* v = goc_take_sync(join);
