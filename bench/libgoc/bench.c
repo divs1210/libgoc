@@ -194,9 +194,7 @@ static void bench_ring(size_t ring_nodes, size_t ring_hops) {
 
     uint64_t t0 = uv_hrtime();
     goc_put_sync(channels[0], (void*)(uintptr_t)ring_hops);
-    for (size_t i = 0; i < ring_nodes; i++) {
-        goc_take_sync(joins[i]);
-    }
+    goc_take_all_sync(joins, ring_nodes);
     uint64_t t1 = uv_hrtime();
 
     double s    = (double)(t1 - t0) / 1e9;
@@ -380,8 +378,7 @@ static void bench_spawn_idle(size_t count) {
 
     goc_close(park);
 
-    for (size_t i = 0; i < count; i++)
-        goc_take_sync(joins[i]);
+    goc_take_all_sync(joins, count);
     uint64_t t1 = uv_hrtime();
 
     double s    = (double)(t1 - t0) / 1e9;
