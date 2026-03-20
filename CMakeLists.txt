@@ -106,7 +106,7 @@ goc_configure_target(goc)
 if(LIBGOC_VMEM)
     target_compile_definitions(goc PRIVATE LIBGOC_VMEM_ENABLED)
 endif()
-target_compile_definitions(goc PRIVATE LIBGOC_STACK_SIZE_VALUE=${LIBGOC_STACK_SIZE})
+target_compile_definitions(goc PRIVATE LIBGOC_STACK_SIZE=${LIBGOC_STACK_SIZE})
 
 # ---------------------------------------------------------------------------
 # Optional shared library: goc_shared  (-DLIBGOC_SHARED=ON)
@@ -118,7 +118,7 @@ if(LIBGOC_SHARED)
     if(LIBGOC_VMEM)
         target_compile_definitions(goc_shared PRIVATE LIBGOC_VMEM_ENABLED)
     endif()
-    target_compile_definitions(goc_shared PRIVATE LIBGOC_STACK_SIZE_VALUE=${LIBGOC_STACK_SIZE})
+    target_compile_definitions(goc_shared PRIVATE LIBGOC_STACK_SIZE=${LIBGOC_STACK_SIZE})
 endif()
 
 # ---------------------------------------------------------------------------
@@ -132,7 +132,7 @@ if(LIBGOC_ASAN)
     if(LIBGOC_VMEM)
         target_compile_definitions(goc_asan PRIVATE LIBGOC_VMEM_ENABLED)
     endif()
-    target_compile_definitions(goc_asan PRIVATE LIBGOC_STACK_SIZE_VALUE=${LIBGOC_STACK_SIZE})
+    target_compile_definitions(goc_asan PRIVATE LIBGOC_STACK_SIZE=${LIBGOC_STACK_SIZE})
 endif()
 
 # ---------------------------------------------------------------------------
@@ -146,7 +146,7 @@ if(LIBGOC_TSAN)
     if(LIBGOC_VMEM)
         target_compile_definitions(goc_tsan PRIVATE LIBGOC_VMEM_ENABLED)
     endif()
-    target_compile_definitions(goc_tsan PRIVATE LIBGOC_STACK_SIZE_VALUE=${LIBGOC_STACK_SIZE})
+    target_compile_definitions(goc_tsan PRIVATE LIBGOC_STACK_SIZE=${LIBGOC_STACK_SIZE})
 endif()
 
 # ---------------------------------------------------------------------------
@@ -192,7 +192,7 @@ foreach(test_src IN LISTS TEST_SOURCES)
     if(LIBGOC_VMEM)
         target_compile_definitions(${test_name} PRIVATE LIBGOC_VMEM_ENABLED)
     endif()
-    target_compile_definitions(${test_name} PRIVATE LIBGOC_STACK_SIZE_VALUE=${LIBGOC_STACK_SIZE})
+    target_compile_definitions(${test_name} PRIVATE LIBGOC_STACK_SIZE=${LIBGOC_STACK_SIZE})
 
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
