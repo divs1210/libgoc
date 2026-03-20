@@ -935,6 +935,72 @@ static void test_p5_13(void) {
 done:;
 }
 
+/* --- P5.14: multiple channels close while fiber is parked --------------- */
+
+/*
+ * Argument bundle for the multi-close parked select fiber in P5.14.
+ */
+typedef struct {
+    goc_chan*       ch1;
+    goc_chan*       ch2;
+    done_t*         ready;
+    done_t*         done;
+    goc_alts_result result;
+} p5_14_args_t;
+
+static void test_p5_14_fiber_fn(void* arg) {
+    p5_14_args_t* a = (p5_14_args_t*)arg;
+    done_signal(a->ready);
+    goc_alt_op ops[] = {
+        { .ch = a->ch1, .op_kind = GOC_ALT_TAKE },
+        { .ch = a->ch2, .op_kind = GOC_ALT_TAKE },
+    };
+    a->result = goc_alts(ops, 2);
+    done_signal(a->done);
+}
+
+/*
+ * P5.14 — multiple channels close while fiber is parked in goc_alts
+ *
+ * The fiber parks on two take arms.  The main thread closes both channels
+ * back-to-back before the fiber resumes.  The select must wake exactly once
+ * and return with ok == GOC_CLOSED without crashing or hanging.
+ */
+static void test_p5_14(void) {
+    TEST_BEGIN("P5.14  goc_alts: single wake when multiple channels close");
+    done_t ready, done;
+    done_init(&ready);
+    done_init(&done);
+
+    goc_chan* ch1 = goc_chan_make(0);
+    goc_chan* ch2 = goc_chan_make(0);
+    ASSERT(ch1 != NULL);
+    ASSERT(ch2 != NULL);
+
+    p5_14_args_t args = { .ch1 = ch1, .ch2 = ch2, .ready = &ready, .done = &done };
+    goc_chan* join = goc_go(test_p5_14_fiber_fn, &args);
+    ASSERT(join != NULL);
+
+    done_wait(&ready);
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 5000000L /* 5 ms */ };
+    nanosleep(&ts, NULL);
+
+    goc_close(ch1);
+    goc_close(ch2);
+
+    done_wait(&done);
+
+    ASSERT(args.result.value.ok == GOC_CLOSED);
+
+    goc_val_t v = goc_take_sync(join);
+    ASSERT(v.ok == GOC_CLOSED);
+
+    done_destroy(&ready);
+    done_destroy(&done);
+    TEST_PASS();
+done:;
+}
+
 /* =========================================================================
  * main
  *
@@ -965,6 +1031,7 @@ int main(void) {
     test_p5_11();
     test_p5_12();
     test_p5_13();
+    test_p5_14();
     printf("\n");
 
     goc_shutdown();

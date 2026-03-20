@@ -307,7 +307,7 @@ struct goc_chan {
 2. **Loser path:** if the CAS fails, another caller already owns teardown — return immediately. No pointer is read, no lock is attempted.
 3. **Winner path:** acquire `ch->lock`, set `ch->closed = 1`, wake all parked takers and putters with `ok==GOC_CLOSED`, release the lock, call `chan_unregister`. **The mutex is left valid and intact** — ownership of `ch->lock` passes to the shutdown sweep in Step 2b.
 
-   When iterating takers and putters, `goc_close` must skip any entry where `e->cancelled == 1` **before** attempting the `woken` CAS. Cancelled entries belong to `goc_alts` losers whose coroutine is already `MCO_DEAD`; winning the CAS on such an entry and calling `post_to_run_queue` would call `mco_resume` on a dead coroutine, producing a SIGSEGV. This is the same guard applied by `wake()` and must be kept consistent with it.
+   When iterating takers and putters, `goc_close` must skip any entry where `e->cancelled == 1` **before** calling `try_claim_wake`. Cancelled entries belong to `goc_alts` losers whose coroutine is already `MCO_DEAD`; winning the CAS on such an entry and calling `post_to_run_queue` would call `mco_resume` on a dead coroutine, producing a SIGSEGV. This is the same guard applied by `wake()` and must be kept consistent with it.
 
    See [Unified Wakeup](#unified-wakeup) for the `e->next` snapshot requirement.
 
@@ -321,8 +321,8 @@ typedef enum { GOC_FIBER, GOC_CALLBACK, GOC_SYNC } goc_entry_kind;
 typedef struct goc_entry {
     goc_entry_kind    kind;
     _Atomic int       cancelled;    /* alts: skip if set; written/read from multiple pool threads */
-    _Atomic int       woken;        /* set by wake before dispatch; guards against double-wake */
-    _Atomic int*      fired;        /* shared flag for goc_alts; NULL for plain take/put entries */
+    _Atomic int       woken;        /* set by try_claim_wake before dispatch; prevents double-wake (second line of defence after fired) */
+    _Atomic int*      fired;        /* shared flag for goc_alts; NULL for plain take/put entries; CAS'd 0→1 by try_claim_wake */
     struct goc_entry* next;
     goc_pool*         pool;         /* pool to re-enqueue this fiber on after a channel wake */
 
@@ -612,33 +612,34 @@ Non-blocking attempt to receive from a channel. Returns immediately under lock w
 ### Unified Wakeup
 
 ```c
-void wake(goc_chan* ch, goc_entry* e, void* value) {
+bool wake(goc_chan* ch, goc_entry* e, void* value) {
     /* acquire ordering: see the full write that set `cancelled` before deciding to skip */
     if (atomic_load_explicit(&e->cancelled, memory_order_acquire)) {
         ch->dead_count++;   /* entry stays on the list; compaction runs at next take/put */
-        return;
+        return false;
     }
-    /* acq_rel CAS on woken guards against two channels simultaneously waking the same
-       entry (possible in goc_alts) before cancelled has propagated. Only the CAS winner
-       proceeds; the loser treats the entry as already handled. */
-    int expected = 0;
-    if (!atomic_compare_exchange_strong_explicit(
-            &e->woken, &expected, 1,
-            memory_order_acq_rel, memory_order_acquire)) {
+    /* try_claim_wake performs two atomic CASes:
+       1. If e->fired != NULL (a goc_alts entry), CAS fired 0→1 (acq_rel). If another
+          arm already fired, return false — this is the core guard against double-wake
+          when multiple channels close simultaneously while a fiber is parked in goc_alts.
+       2. CAS woken 0→1 (acq_rel). Prevents a second wake on the same entry if two
+          channels race before cancelled has propagated. */
+    if (!try_claim_wake(e)) {
         ch->dead_count++;
-        return;
+        return false;
     }
+    if (e->result_slot != NULL)
+        *e->result_slot = value;
     e->ok = GOC_OK;
     if (e->kind == GOC_FIBER) {
-        *e->result_slot = value;
         post_to_run_queue(e->pool, e);
     } else if (e->kind == GOC_CALLBACK) {
         post_callback(e, value);   /* posted via uv_async_send; cb fires on loop thread */
     } else {
         /* GOC_SYNC: store result and unblock the waiting OS thread */
-        *e->result_slot = value;
         goc_sync_post(e->sync_sem_ptr);
     }
+    return true;
 }
 ```
 
@@ -967,9 +968,9 @@ The returned `goc_alts_result.index` is the zero-based index of the winning arm.
 
    **Park:** For `goc_alts`: call `mco_yield` to suspend the fiber. For `goc_alts_sync`: block on a shared `goc_sync_t` (portable mutex + condvar). Copy the fiber/condvar context into every `entries[i]`. Set `entries[i]->arm_idx = i`.
 
-   **`goc_alts_sync` teardown:** After `goc_sync_wait` returns, call `goc_sync_destroy(&shared_sync)` before returning. This is safe: `wake` wins the `woken` CAS and completes `goc_sync_post` before any other path can call `goc_sync_post` on the same object. All other entries either have their `cancelled` flag set or lose the `woken` CAS, so no additional `goc_sync_post` on `shared_sync` will occur after `goc_sync_wait` unblocks. `goc_sync_destroy` may therefore be called immediately.
+   **`goc_alts_sync` teardown:** After `goc_sync_wait` returns, call `goc_sync_destroy(&shared_sync)` before returning. This is safe: `wake` wins both CASes inside `try_claim_wake` and completes `goc_sync_post` before any other path can call `goc_sync_post` on the same object. All other entries either have their `cancelled` flag set or lose one of the CASes in `try_claim_wake`, so no additional `goc_sync_post` on `shared_sync` will occur after `goc_sync_wait` unblocks. `goc_sync_destroy` may therefore be called immediately.
 
-6. **On wake (park path only):** The first channel to fire performs a CAS on `fired` (0→1, `acq_rel`). The storing thread writes the delivered value into `result_slot` **before** the CAS; the resuming fiber reads `fired` with `memory_order_acquire`, guaranteeing it observes the written value. The resuming fiber then iterates all entries and writes `cancelled = 1` on every entry where `woken == 0` (the losers).
+6. **On wake (park path only):** The first channel to call `try_claim_wake` wins by performing a CAS on `fired` (0→1, `acq_rel`) followed by a CAS on `woken` (0→1, `acq_rel`). `wake()` then writes the delivered value into `result_slot` and calls `post_to_run_queue`. The write to `result_slot` happens before the entry is enqueued for the resuming pool thread, so the fiber observes the correct value when it reads `result_slot` after `mco_yield` returns. The resuming fiber then iterates all entries and writes `cancelled = 1` on every entry where `woken == 0` (the losers).
 
    > **Fast-path return does not write `cancelled`.** When Phase 5's re-attempt under lock succeeds before any entries are appended to a channel list, `goc_alts` returns immediately. At that point the entries have never been enqueued, so no channel can ever call `wake()` on them — writing `cancelled` would be harmless but is unnecessary and must not be done unconditionally. Only the park path (where entries were appended to channel lists and the fiber yielded) must iterate and cancel the losing entries on resume. The allocated `goc_entry` objects and the `fired` flag are simply abandoned — all are GC-heap allocated and the collector reclaims them automatically. No explicit free or cancel is required.
 
@@ -1076,14 +1077,15 @@ uv_loop_t*    goc_scheduler(void);
 | `pool_fiber_born` | `void pool_fiber_born(goc_pool* pool)` | `pool.c` — increments `live_count` exactly once per new fiber; called from `goc_go_on` before `post_to_run_queue` |
 | `post_callback` | `void post_callback(goc_entry* entry, void* value)` | `loop.c` |
 | `on_wakeup` | `void on_wakeup(uv_async_t* handle)` | `loop.c` |
-| `wake` | `void wake(goc_chan* ch, goc_entry* entry, void* value)` | `channel.c` |
+| `wake` | `bool wake(goc_chan* ch, goc_entry* entry, void* value)` | `channel.c` — returns `true` when the entry is successfully claimed and dispatched; `false` when cancelled or already claimed (via `try_claim_wake`) |
+| `try_claim_wake` | `static inline bool try_claim_wake(goc_entry* e)` | `internal.h` — for `goc_alts` entries: CAS `fired` 0→1 first; if another arm already fired, returns `false`. Then CAS `woken` 0→1; returns `false` if already claimed. Returns `true` only when both CASes succeed (or `fired` is NULL for plain take/put entries). |
 | `compact_dead_entries` | `void compact_dead_entries(goc_chan* ch)` | `channel.c` |
 | `goc_chan_destroy` | `void goc_chan_destroy(goc_chan* ch)` | `channel.c` — stub only; mutex teardown is deferred to `goc_shutdown` Step 2 |
 | `chan_register` | `void chan_register(goc_chan* ch)` | `gc.c` — appends `ch` to the `live_channels` array under `g_live_mutex`; called by `goc_chan_make`. This list is the sole input to the graceful-drain wait in `goc_shutdown`. |
 | `chan_unregister` | `void chan_unregister(goc_chan* ch)` | `gc.c` — removes `ch` from `live_channels` under `g_live_mutex`; called by `goc_close`. |
 | `chan_take_from_buffer` | `static inline int chan_take_from_buffer(goc_chan*, void**)` | `channel_internal.h` — requires `struct goc_chan` in scope via `chan_type.h` |
-| `chan_take_from_putter` | `static inline int chan_take_from_putter(goc_chan*, void**)` | `channel_internal.h` — requires `struct goc_chan` in scope via `chan_type.h`; snapshots `e->next` before `wake()` to avoid UAF on stack-allocated entries |
-| `chan_put_to_taker` | `static inline int chan_put_to_taker(goc_chan*, void*)` | `channel_internal.h` — requires `struct goc_chan` in scope via `chan_type.h`; snapshots `e->next` before `wake()` to avoid UAF on stack-allocated entries |
+| `chan_take_from_putter` | `static inline int chan_take_from_putter(goc_chan*, void**)` | `channel_internal.h` — requires `struct goc_chan` in scope via `chan_type.h`; iterates the full putters queue (discarding cancelled and lost-race entries mid-queue); snapshots `e->next` before `wake()` to avoid UAF on stack-allocated entries |
+| `chan_put_to_taker` | `static inline int chan_put_to_taker(goc_chan*, void*)` | `channel_internal.h` — requires `struct goc_chan` in scope via `chan_type.h`; iterates the full takers queue (discarding cancelled and lost-race entries mid-queue); snapshots `e->next` before `wake()` to avoid UAF on stack-allocated entries |
 | `chan_put_to_buffer` | `static inline int chan_put_to_buffer(goc_chan*, void*)` | `channel_internal.h` — requires `struct goc_chan` in scope via `chan_type.h` |
 | `chan_set_on_close` | `void chan_set_on_close(goc_chan* ch, void (*on_close)(void*), void* ud)` | `channel.c` (declared in `channel_internal.h`) — registers a one-shot callback invoked when the channel is closed; if the channel is already closed at call time the callback fires immediately |
 
