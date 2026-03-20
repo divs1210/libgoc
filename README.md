@@ -22,11 +22,11 @@ The library provides stackful coroutines ("fibers"), channels, a select primitiv
 
 **Platform:** Linux, macOS, and Windows.
 
-> ⚠️ This library is in active development!
-> - API stable ✅
-> - Core functionality complete ✅
-> - Stress testing underway ⚠️
-> - Clear optimization path 📈
+> This library is in active development ⚠️
+> - ✅ API stable
+> - ✅ Core functionality complete
+> - ⚠️ Stress testing underway
+> - 📈 Clear optimization path
 
 **Dependencies:**
 
