@@ -111,7 +111,7 @@ The project uses CMake (≥ 3.20). `CMakeLists.txt` defines the following primar
 
 A CMake function `goc_configure_target(<target>)` centralises the options shared by every library variant: `PUBLIC` include path `include/`, `PRIVATE` paths `src/` and `vendor/minicoro/`, compile definition `GC_THREADS`, and link libraries `PkgConfig::LIBUV` and `PkgConfig::BDWGC`. All library targets (`goc`, `goc_shared`, `goc_asan`, `goc_tsan`) are configured through this function.
 
-When `-DLIBGOC_VMEM=ON` (the default), `LIBGOC_VMEM_ENABLED` is added as a `PRIVATE` compile definition on the `goc` library target **and** on every per-phase test executable. This ensures that `src/internal.h`'s canary macros are disabled and that `test_p8_safety.c` detects the vmem build at compile time (P8.1 uses `#ifdef LIBGOC_VMEM_ENABLED` to skip the canary-abort test in vmem builds, where the canary is a no-op).
+When `-DLIBGOC_VMEM=ON` is passed, `LIBGOC_VMEM_ENABLED` is added as a `PRIVATE` compile definition on the `goc` library target **and** on every per-phase test executable. This ensures that `src/internal.h`'s canary macros are disabled and that `test_p8_safety.c` detects the vmem build at compile time (P8.1 uses `#ifdef LIBGOC_VMEM_ENABLED` to skip the canary-abort test in vmem builds, where the canary is a no-op). By default (canary mode), `LIBGOC_VMEM_ENABLED` is **not** defined and canary protection is active.
 
 Dependencies are resolved via `pkg-config` (libuv as `libuv`, Boehm GC as `bdw-gc-threaded` — **no fallback**; configure fails loudly if the threaded variant is absent). minicoro is instantiated via `src/minicoro.c` (which defines `MINICORO_IMPL`) and its header is available to all targets via `target_include_directories` pointing at `vendor/minicoro/`.
 
@@ -400,11 +400,11 @@ typedef struct goc_entry {
 
 Each fiber stack is created and managed by minicoro. Stack allocation, alignment, and guard-page setup are handled internally by minicoro — libgoc does not call `posix_memalign` or `mprotect` directly for fiber stacks.
 
-Per-fiber stack size uses minicoro's default (passed as `0` to `mco_desc_init`), which adapts to the active allocator. Avoid large stack allocations and deep recursion inside fiber entry functions — see [minicoro Limitations](#minicoro-limitations).
+Per-fiber stack size is controlled by the `LIBGOC_STACK_SIZE` CMake option (default `0`, passed to `mco_desc_init` as the `stack_size` argument). When `0`, minicoro uses its built-in default, which adapts to the active allocator. Avoid large stack allocations and deep recursion inside fiber entry functions — see [minicoro Limitations](#minicoro-limitations).
 
-**Conditional stack overflow detection.** When virtual memory is disabled (`-DLIBGOC_VMEM=OFF`), libgoc writes a sentinel canary word at the lowest address of each fiber stack immediately after `mco_create` returns. The worker loop checks the canary *before* every `mco_resume` call. If the canary has been overwritten, the runtime calls `abort()` with a diagnostic message identifying the corrupted fiber. This converts silent heap corruption into a deterministic, debuggable crash.
+**Conditional stack overflow detection.** By default (canary mode), libgoc writes a sentinel canary word at the lowest address of each fiber stack immediately after `mco_create` returns. The worker loop checks the canary *before* every `mco_resume` call. If the canary has been overwritten, the runtime calls `abort()` with a diagnostic message identifying the corrupted fiber. This converts silent heap corruption into a deterministic, debuggable crash.
 
-With virtual memory enabled (default), stacks can grow dynamically and overflow detection is disabled for performance. The canary logic compiles to no-ops via conditional macros in `src/internal.h`. Stack protection is only meaningful with canary-protected stacks.
+With virtual memory enabled (`-DLIBGOC_VMEM=ON`), stacks can grow dynamically and overflow detection is disabled for performance. The canary logic compiles to no-ops via conditional macros in `src/internal.h`. Stack protection is only meaningful with canary-protected stacks.
 
 ```c
 /* Non-virtual memory mode: canary protection enabled */
@@ -488,7 +488,7 @@ libgoc uses [minicoro](https://github.com/edubart/minicoro) for all fiber switch
 
 **C++ exceptions are not supported.** The C++ exception mechanism maintains internal unwinding state that is not preserved across a coroutine context switch. Throwing an exception that propagates across a `mco_yield` / `mco_resume` boundary is undefined behaviour and will typically corrupt the exception handler chain or crash. In mixed C/C++ codebases all fiber entry functions must be declared `extern "C"` and must not allow any C++ exception to escape them.
 
-**Stack management.** By default, libgoc enables minicoro's virtual memory allocator for dynamic stack growth. When virtual memory is disabled (`-DLIBGOC_VMEM=OFF`), libgoc uses canary-protected stacks with overflow detection. If stack overflow is detected, the runtime calls `abort()` immediately with a diagnostic message. Avoid large stack-allocated buffers and deep recursion inside fibers regardless of stack mode — use `goc_malloc`-allocated buffers on the GC heap for large data.
+**Stack management.** By default, libgoc uses canary-protected stacks with overflow detection. This is the portable default and encourages library authors to develop with a platform-independent mindset. The virtual memory allocator can be enabled with `-DLIBGOC_VMEM=ON` for dynamic stack growth — useful when individual fibers need large or variable stacks. If stack overflow is detected in canary mode, the runtime calls `abort()` immediately with a diagnostic message. Avoid large stack-allocated buffers and deep recursion inside fibers regardless of stack mode — use `goc_malloc`-allocated buffers on the GC heap for large data.
 
 **`src/minicoro.c` must be compiled without `-DGC_THREADS`.** minicoro declares a `static MCO_THREAD_LOCAL mco_current_co` variable (a `thread_local` TLS slot) to track the running coroutine per thread. When Boehm GC is compiled with `GC_THREADS` it wraps `pthread_create` and invokes `GC_call_with_stack_base` during thread startup, which walks TLS descriptors. If minicoro's TLS block is visible to that walk before `mco_current_co` is initialised on a new thread, the GC faults with a SIGSEGV inside its own startup code — even if no minicoro function has yet been called. The fix is to compile `src/minicoro.c` in its own isolated translation unit with `-UGC_THREADS`, which `CMakeLists.txt` enforces via `set_source_files_properties`. minicoro never calls any GC function, so the flag is irrelevant to its correctness regardless.
 
@@ -1360,10 +1360,10 @@ Runs a build matrix across four configurations:
 
 | Runner | `cmake_flags` | Tests |
 |---|---|---|
-| `ubuntu-latest` | *(none — vmem build)* | All phases (P1–P9) via `ctest --timeout 120`; P8.1 skipped (vmem build) |
-| `macos-latest` | *(none — vmem build)* | All phases (P1–P9) via `ctest --timeout 120`; P8.1 skipped (vmem build) |
-| `windows-latest` | *(none — vmem build)* | P1–P7, P9 via `ctest --timeout 120`; P8 self-skips (no `fork`) |
-| `ubuntu-latest` | `-DLIBGOC_VMEM=OFF` (canary build) | All phases (P1–P9) via `ctest --timeout 120`; P8.1 exercises canary abort |
+| `ubuntu-latest` | *(none — canary build)* | All phases (P1–P9) via `ctest --timeout 120`; P8.1 exercises canary abort |
+| `macos-latest` | *(none — canary build)* | All phases (P1–P9) via `ctest --timeout 120`; P8.1 exercises canary abort |
+| `windows-latest` | *(none — canary build)* | P1–P7, P9 via `ctest --timeout 120`; P8 self-skips (no `fork`) |
+| `ubuntu-latest` | `-DLIBGOC_VMEM=ON` (vmem build) | All phases (P1–P9) via `ctest --timeout 120`; P8.1 skipped (vmem build) |
 
 All four configurations run `RelWithDebInfo` builds. Dependencies per OS:
 
