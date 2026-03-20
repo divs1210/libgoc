@@ -16,7 +16,7 @@
  * 3. Selective receive / fan-out / fan-in — one producer fans work out to N
  *    worker fibers; a collector fiber uses goc_alts to receive from all N
  *    output channels simultaneously, stressing select logic and load
- *    distribution.  (Currently disabled in main — see comment there.)
+ *    distribution.
  *
  * 4. Spawn idle tasks — spawn a large number of fibers that immediately park
  *    on a shared channel, then wake them all by closing it.  Measures fiber
