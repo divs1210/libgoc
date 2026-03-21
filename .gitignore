@@ -80,3 +80,4 @@ build-bench-vmem-old/
 bench/libgoc/bench-libgoc-vmem
 bench/libgoc/bench-vmem-old
 .clj-kondo/.cache/v1/clj/bench.core.transit.json
+fix.md

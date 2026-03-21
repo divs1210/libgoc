@@ -292,19 +292,25 @@ goc_val_t* goc_take(goc_chan* ch)
         return r;
     }
 
-    /* Slow path: park on this channel */
+    /* Slow path: park on this channel.
+     * Heap-allocate the parking entry so its address is unique across yields.
+     * Stack allocation caused a use-after-resume bug: if the fiber re-parked
+     * at the same call depth after being woken, the new entry occupied the
+     * same stack address as the old one.  A waker still spinning on parked==0
+     * would then win try_claim_wake on the NEW entry (woken==0), posting the
+     * coroutine to the run queue a second time → double-resume → stall/crash. */
     void* local_result = NULL;
 
-    goc_entry e = { 0 };
-    e.kind             = GOC_FIBER;
-    e.coro             = mco_running();
-    e.pool             = ((goc_entry*)mco_get_user_data(mco_running()))->pool;
-    e.result_slot      = &local_result;
-    e.ok               = GOC_CLOSED;   /* default; overwritten by wake on success */
-    goc_stack_canary_init(&e);
+    goc_entry* e = goc_malloc(sizeof(goc_entry));
+    e->kind             = GOC_FIBER;
+    e->coro             = mco_running();
+    e->pool             = ((goc_entry*)mco_get_user_data(mco_running()))->pool;
+    e->result_slot      = &local_result;
+    e->ok               = GOC_CLOSED;   /* default; overwritten by wake on success */
+    goc_stack_canary_init(e);
 
     /* Append to takers list */
-    chan_list_append(&ch->takers, &ch->takers_tail, &e);
+    chan_list_append(&ch->takers, &ch->takers_tail, e);
 
     /* Set parked = 0 on the fiber's initial entry while ch->lock is still held.
      * wake() and goc_close() will spin until pool_worker_fn sets it back to 1
@@ -318,7 +324,7 @@ goc_val_t* goc_take(goc_chan* ch)
     /* pool_worker_fn has set fiber_entry->parked = 1 by this point */
 
     goc_val_t* r = goc_malloc(sizeof(goc_val_t));
-    r->val = local_result; r->ok = e.ok;
+    r->val = local_result; r->ok = e->ok;
     return r;
 }
 
@@ -365,17 +371,18 @@ goc_status_t goc_put(goc_chan* ch, void* val)
         return GOC_OK;
     }
 
-    /* Slow path: park on this channel */
-    goc_entry e = { 0 };
-    e.kind             = GOC_FIBER;
-    e.coro             = mco_running();
-    e.pool             = ((goc_entry*)mco_get_user_data(mco_running()))->pool;
-    e.put_val          = val;
-    e.ok               = GOC_CLOSED;   /* default; overwritten by wake on success */
-    goc_stack_canary_init(&e);
+    /* Slow path: park on this channel.
+     * Heap-allocate the parking entry — see goc_take slow path comment. */
+    goc_entry* e = goc_malloc(sizeof(goc_entry));
+    e->kind             = GOC_FIBER;
+    e->coro             = mco_running();
+    e->pool             = ((goc_entry*)mco_get_user_data(mco_running()))->pool;
+    e->put_val          = val;
+    e->ok               = GOC_CLOSED;   /* default; overwritten by wake on success */
+    goc_stack_canary_init(e);
 
     /* Append to putters list */
-    chan_list_append(&ch->putters, &ch->putters_tail, &e);
+    chan_list_append(&ch->putters, &ch->putters_tail, e);
 
     /* Same yield-gate as goc_take slow path. */
     goc_entry* fiber_entry = (goc_entry*)mco_get_user_data(mco_running());
@@ -385,7 +392,7 @@ goc_status_t goc_put(goc_chan* ch, void* val)
     mco_yield(mco_running());
     /* pool_worker_fn has set fiber_entry->parked = 1 by this point */
 
-    return e.ok;
+    return e->ok;
 }
 
 /* --------------------------------------------------------------------------
