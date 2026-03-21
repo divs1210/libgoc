@@ -77,7 +77,7 @@ make -C clojure run-all
 | **OS**          | Ubuntu 24.04.4 LTS             |
 | **Kernel**      | Linux 6.11.0 x86_64            |
 
-### Go (`make run-all`)
+### Go (`make -C go run-all`)
 
 ```
 === Pool Size: 1 ===
@@ -113,7 +113,7 @@ Spawn idle tasks: 200000 goroutines in 696ms (286965 tasks/s)
 Prime sieve: 2262 primes up to 20000 in 249ms (9074 primes/s)
 ```
 
-### libgoc canary — (default) — (`make run-all`)
+### libgoc canary — (default) — (`make -C libgoc run-all`)
 
 ```
 === Pool Size: 1 ===
@@ -149,7 +149,7 @@ Spawn idle tasks: 200000 fibers in 10622ms (18827 tasks/s)
 Prime sieve: 2262 primes up to 20000 in 1007ms (2245 primes/s)
 ```
 
-### libgoc vmem — `-DLIBGOC_VMEM=ON` — (`make BUILD_DIR=../../build-bench-vmem build run-all`)
+### libgoc vmem — `-DLIBGOC_VMEM=ON` — (`make -C libgoc BUILD_DIR=../../build-bench-vmem build run-all`)
 
 ```
 === Pool Size: 1 ===
@@ -185,7 +185,7 @@ Spawn idle tasks: 200000 fibers in 10689ms (18710 tasks/s)
 Prime sieve: 2262 primes up to 20000 in 1151ms (1964 primes/s)
 ```
 
-### Clojure core.async (`make run-all`)
+### Clojure core.async (`make -C clojure run-all`)
 
 ```
 === Pool Size: 1 ===
