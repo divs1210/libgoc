@@ -496,7 +496,22 @@ The join channel may be ignored if no join is needed — the channel is GC-alloc
 
 Fibers suspend by calling `mco_yield` and are resumed by the pool worker calling `mco_resume`. Each fiber's stack must be scanned by the GC while the fiber is suspended — its local variables may hold pointers to GC-managed objects. Rather than calling `GC_add_roots`/`GC_remove_roots` around every yield (which would exhaust BDW-GC's fixed internal root-set table when large numbers of fibers are created), libgoc registers a `GC_push_other_roots` callback (see **GC Fiber Stack Roots** below) that scans all live fiber stacks at each GC mark phase.
 
-Each fiber's stack is registered once at birth (in `goc_go_on`, `src/fiber.c`) and unregistered once at death (in `pool_worker_fn` before `mco_destroy`, `src/pool.c`).
+Each fiber's stack is registered once at birth (in `goc_go_on`, `src/fiber.c`) and unregistered once at death (in `pool_worker_fn` before `goc_coro_pool_return`, `src/pool.c`).
+
+### Coroutine Stack Pooling (canary mode)
+
+When a fiber finishes (coroutine reaches `MCO_DEAD`), `goc_coro_pool_return` stores the `mco_coro` flat allocation in a `_Thread_local` free-list (`tl_coro_pool[]`, max `GOC_CORO_POOL_MAX = 64` slots) instead of immediately calling `mco_destroy`. The next `goc_fiber_materialize` call on the same worker pops the slot and reinitialises it in-place with `mco_init`.
+
+**What `mco_init` does (and does not do):**
+- `memset`s the `mco_coro` header to zero, resets all state (function pointer, user data, status, etc.)
+- Re-creates the `_mco_context` and writes a small initial frame (~2–3 words) at the **top** of the stack via `_mco_makectx`
+- The rest of the stack (bottom 55+ KB) is **untouched** — those pages remain warm in the TLB from the previous fiber
+
+**Effect:** eliminates one `malloc`/`free` round-trip per fiber and avoids TLB/page-fault cost on the bulk of the stack.
+
+**vmem mode excluded:** vmem stacks grow on demand with variable committed size per fiber; pooling would balloon RSS unpredictably. `goc_coro_pool_return` falls through to `mco_destroy` when `LIBGOC_VMEM_ENABLED` is defined.
+
+**Pool drain on worker exit:** `goc_coro_pool_drain()` is called at the end of `pool_worker_fn` (after the dispatch loop exits) to destroy all pooled allocations before the thread terminates, preventing memory leaks after `goc_pool_destroy` joins the workers.
 
 ---
 
@@ -770,7 +785,7 @@ run:
     lock(drain_mutex); active_count--; unlock(drain_mutex)
     if mco_status(coro) == MCO_DEAD:
         if fe != NULL: goc_fiber_root_unregister(fe->fiber_root_handle)  /* unregister via push_other_roots list */
-        mco_destroy(coro)
+        goc_coro_pool_return(coro)  /* canary: return to TL pool (or destroy if full); vmem: destroy */
         lock(drain_mutex); live_count--; broadcast(drain_cond); unlock(drain_mutex)
     /* if MCO_SUSPENDED: the fiber yielded and is parked on a channel.
        active_count has been decremented but live_count has NOT — the fiber is

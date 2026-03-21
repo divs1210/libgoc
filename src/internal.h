@@ -212,6 +212,10 @@ void pool_fiber_born(goc_pool* pool);
 /* fiber.c → used by pool.c (deferred fiber materialisation) */
 void goc_fiber_materialize(goc_entry* entry);
 
+/* fiber.c → used by pool.c only (must be called from a pool worker thread) */
+void goc_coro_pool_return(mco_coro* coro);
+void goc_coro_pool_drain(void);
+
 /* Inline helper used by wake() and goc_close to atomically claim a parked
  * entry for dispatch.  For goc_alts entries (fired != NULL), first CAS fired
  * 0→1 (acq_rel) — if another arm already fired, return false immediately.

@@ -249,7 +249,9 @@ run:
         if (mco_status(coro) == MCO_DEAD) {
             if (fe != NULL)
                 goc_fiber_root_unregister(fe->fiber_root_handle);
-            mco_destroy(coro);
+            /* Return the flat mco_coro allocation to the thread-local pool
+             * (canary mode) or destroy it immediately (vmem mode). */
+            goc_coro_pool_return(coro);
 
             pthread_mutex_lock(&pool->drain_mutex);
             pool->live_count--;
@@ -258,6 +260,9 @@ run:
         }
     }
 
+    /* Free all pooled coro allocations before the thread exits.
+     * Must run after the shutdown loop exits so no new fibers arrive. */
+    goc_coro_pool_drain();
     tl_worker = NULL;
     return NULL;
 }
