@@ -21,20 +21,12 @@ The library provides stackful coroutines ("fibers"), channels, a select primitiv
 | `libuv` | event loop, timers, cross-thread wakeup |
 | Boehm GC | garbage collection; **must be built with POSIX thread support** (`--enable-threads=posix`); linked automatically, initialised by `goc_init` |
 
-> See [minicoro limitations](#minicoro-limitations) in the Public API section for fiber stack constraints.
-
 **Pre-built static libraries** for:
 - Linux (x86-64)
 - macOS (arm64)
 - Windows (x86-64)
 
 are available on the [Releases page](https://github.com/divs1210/libgoc/releases).
-
-> This library is in active development ⚠️
-> - ✅ API stable
-> - ✅ Core functionality complete
-> - ✅ Stress testing done
-> - 📈 Clear optimization path
 
 **Also see:**
 - [Design Doc](./DESIGN.md)
