@@ -46,6 +46,20 @@
  *          malloc path in alts_dedup_sort_channels; correct arm fires, no
  *          memory error (run under ASAN to catch heap misuse)
  *
+ * Test coverage (Phase 6 continued — goc_wsdq and goc_injector):
+ *
+ *   P6.6   wsdq push_bottom / pop_bottom round-trip (LIFO, single-threaded)
+ *   P6.7   wsdq pop_bottom on empty deque returns NULL
+ *   P6.8   wsdq steal_top on empty deque returns NULL
+ *   P6.9   wsdq steal_top ordering is FIFO
+ *   P6.10  wsdq grows when full (single-threaded)
+ *   P6.11  wsdq concurrent owner-push / thief-steal (multi-threaded)
+ *   P6.12  wsdq concurrent push + pop + steal under contention
+ *   P6.13  wsdq_destroy on non-empty deque is safe
+ *   P6.14  injector push/pop round-trip (FIFO, single-threaded)
+ *   P6.15  injector_pop on empty returns NULL
+ *   P6.16  injector concurrent push from multiple threads
+ *
  * Notes:
  *   - goc_init() is called once in main() before any test runs.
  *   - goc_shutdown() is called once in main() after all tests complete.
@@ -517,7 +531,7 @@ done:;
 }
 
 /* =========================================================================
- * Phase 3 — goc_wsdq and goc_injector unit tests
+ * Phase 6 (continued) — goc_wsdq and goc_injector unit tests
  *
  * These tests exercise the work-stealing deque and MPSC injector queue
  * directly, without an active pool. Entries are malloc+memset'd; goc_init
@@ -525,8 +539,8 @@ done:;
  * rely on fiber scheduling.
  * ====================================================================== */
 
-#define P3_N 10000
-#define P3_T 4   /* thief / producer threads */
+#define P6_N 10000
+#define P6_T 4   /* thief / producer threads */
 
 /* Helper: allocate a zeroed goc_entry with arm_idx set to seq */
 static goc_entry* make_entry(int seq) {
@@ -536,9 +550,9 @@ static goc_entry* make_entry(int seq) {
     return e;
 }
 
-/* ---- P3.1 ---- */
-static void test_p3_1(void) {
-    TEST_BEGIN("P3.1  wsdq push/pop round-trip (LIFO, single-threaded)");
+/* ---- P6.6 ---- */
+static void test_p6_6(void) {
+    TEST_BEGIN("P6.6  wsdq push/pop round-trip (LIFO, single-threaded)");
 
     goc_wsdq dq;
     wsdq_init(&dq, 8);
@@ -561,9 +575,9 @@ static void test_p3_1(void) {
 done:;
 }
 
-/* ---- P3.2 ---- */
-static void test_p3_2(void) {
-    TEST_BEGIN("P3.2  wsdq pop_bottom on empty returns NULL");
+/* ---- P6.7 ---- */
+static void test_p6_7(void) {
+    TEST_BEGIN("P6.7  wsdq pop_bottom on empty returns NULL");
 
     goc_wsdq dq;
     wsdq_init(&dq, 4);
@@ -573,9 +587,9 @@ static void test_p3_2(void) {
 done:;
 }
 
-/* ---- P3.3 ---- */
-static void test_p3_3(void) {
-    TEST_BEGIN("P3.3  wsdq steal_top on empty returns NULL");
+/* ---- P6.8 ---- */
+static void test_p6_8(void) {
+    TEST_BEGIN("P6.8  wsdq steal_top on empty returns NULL");
 
     goc_wsdq dq;
     wsdq_init(&dq, 4);
@@ -585,9 +599,9 @@ static void test_p3_3(void) {
 done:;
 }
 
-/* ---- P3.4 ---- */
-static void test_p3_4(void) {
-    TEST_BEGIN("P3.4  wsdq steal_top ordering is FIFO");
+/* ---- P6.9 ---- */
+static void test_p6_9(void) {
+    TEST_BEGIN("P6.9  wsdq steal_top ordering is FIFO");
 
     goc_wsdq dq;
     wsdq_init(&dq, 4);
@@ -613,9 +627,9 @@ static void test_p3_4(void) {
 done:;
 }
 
-/* ---- P3.5 ---- */
-static void test_p3_5(void) {
-    TEST_BEGIN("P3.5  wsdq grows when full (single-threaded)");
+/* ---- P6.10 ---- */
+static void test_p6_10(void) {
+    TEST_BEGIN("P6.10  wsdq grows when full (single-threaded)");
 
     goc_wsdq dq;
     wsdq_init(&dq, 4);
@@ -640,7 +654,7 @@ static void test_p3_5(void) {
 done:;
 }
 
-/* ---- P3.6: concurrent owner-push / thief-steal ---- */
+/* ---- P6.11: concurrent owner-push / thief-steal ---- */
 
 typedef struct {
     goc_wsdq*   dq;
@@ -648,10 +662,10 @@ typedef struct {
     int*           total;
     pthread_mutex_t* mu;
     _Atomic bool*  done;
-} p3_6_thief_arg;
+} p6_11_thief_arg;
 
-static void* p3_6_thief(void* arg) {
-    p3_6_thief_arg* a = (p3_6_thief_arg*)arg;
+static void* p6_11_thief(void* arg) {
+    p6_11_thief_arg* a = (p6_11_thief_arg*)arg;
     while (true) {
         goc_entry* e = wsdq_steal_top(a->dq);
         if (e != NULL) {
@@ -675,30 +689,30 @@ static void* p3_6_thief(void* arg) {
     return NULL;
 }
 
-static void test_p3_6(void) {
-    TEST_BEGIN("P3.6  wsdq concurrent owner-push / thief-steal");
+static void test_p6_11(void) {
+    TEST_BEGIN("P6.11  wsdq concurrent owner-push / thief-steal");
 
     goc_wsdq dq;
     wsdq_init(&dq, 256);
 
-    bool* seen = calloc(P3_N, sizeof(bool));
+    bool* seen = calloc(P6_N, sizeof(bool));
     int total = 0;
     pthread_mutex_t mu;
     pthread_mutex_init(&mu, NULL);
     _Atomic bool done = false;
 
-    p3_6_thief_arg arg = { &dq, seen, &total, &mu, &done };
+    p6_11_thief_arg arg = { &dq, seen, &total, &mu, &done };
 
-    pthread_t thieves[P3_T];
-    for (int t = 0; t < P3_T; t++)
-        pthread_create(&thieves[t], NULL, p3_6_thief, &arg);
+    pthread_t thieves[P6_T];
+    for (int t = 0; t < P6_T; t++)
+        pthread_create(&thieves[t], NULL, p6_11_thief, &arg);
 
-    for (int i = 0; i < P3_N; i++)
+    for (int i = 0; i < P6_N; i++)
         wsdq_push_bottom(&dq, make_entry(i));
 
     atomic_store_explicit(&done, true, memory_order_release);
 
-    for (int t = 0; t < P3_T; t++)
+    for (int t = 0; t < P6_T; t++)
         pthread_join(thieves[t], NULL);
 
     /* Owner drains remainder */
@@ -709,8 +723,8 @@ static void test_p3_6(void) {
         free(e);
     }
 
-    ASSERT(total == P3_N);
-    for (int i = 0; i < P3_N; i++)
+    ASSERT(total == P6_N);
+    for (int i = 0; i < P6_N; i++)
         ASSERT(seen[i]);
 
     pthread_mutex_destroy(&mu);
@@ -720,7 +734,7 @@ static void test_p3_6(void) {
 done:;
 }
 
-/* ---- P3.7: concurrent push + pop + steal under contention ---- */
+/* ---- P6.12: concurrent push + pop + steal under contention ---- */
 
 typedef struct {
     goc_wsdq*    dq;
@@ -728,10 +742,10 @@ typedef struct {
     int*            total;
     pthread_mutex_t* mu;
     _Atomic bool*   done;
-} p3_7_thief_arg;
+} p6_12_thief_arg;
 
-static void* p3_7_thief(void* arg) {
-    p3_7_thief_arg* a = (p3_7_thief_arg*)arg;
+static void* p6_12_thief(void* arg) {
+    p6_12_thief_arg* a = (p6_12_thief_arg*)arg;
     goc_entry* e;
     while (true) {
         e = wsdq_steal_top(a->dq);
@@ -755,26 +769,26 @@ static void* p3_7_thief(void* arg) {
     return NULL;
 }
 
-static void test_p3_7(void) {
-    TEST_BEGIN("P3.7  wsdq concurrent push+pop+steal under contention");
+static void test_p6_12(void) {
+    TEST_BEGIN("P6.12  wsdq concurrent push+pop+steal under contention");
 
     goc_wsdq dq;
     wsdq_init(&dq, 256);
 
-    bool* seen = calloc(P3_N, sizeof(bool));
+    bool* seen = calloc(P6_N, sizeof(bool));
     int total = 0;
     pthread_mutex_t mu;
     pthread_mutex_init(&mu, NULL);
     _Atomic bool done = false;
 
-    p3_7_thief_arg arg = { &dq, seen, &total, &mu, &done };
+    p6_12_thief_arg arg = { &dq, seen, &total, &mu, &done };
 
-    pthread_t thieves[P3_T];
-    for (int t = 0; t < P3_T; t++)
-        pthread_create(&thieves[t], NULL, p3_7_thief, &arg);
+    pthread_t thieves[P6_T];
+    for (int t = 0; t < P6_T; t++)
+        pthread_create(&thieves[t], NULL, p6_12_thief, &arg);
 
     /* Owner: push N entries, immediately try to pop each one back */
-    for (int i = 0; i < P3_N; i++) {
+    for (int i = 0; i < P6_N; i++) {
         wsdq_push_bottom(&dq, make_entry(i));
         goc_entry* e = wsdq_pop_bottom(&dq);
         if (e != NULL) {
@@ -788,7 +802,7 @@ static void test_p3_7(void) {
 
     atomic_store_explicit(&done, true, memory_order_release);
 
-    for (int t = 0; t < P3_T; t++)
+    for (int t = 0; t < P6_T; t++)
         pthread_join(thieves[t], NULL);
 
     /* Owner drains remainder */
@@ -799,8 +813,8 @@ static void test_p3_7(void) {
         free(e);
     }
 
-    ASSERT(total == P3_N);
-    for (int i = 0; i < P3_N; i++)
+    ASSERT(total == P6_N);
+    for (int i = 0; i < P6_N; i++)
         ASSERT(seen[i]);
 
     pthread_mutex_destroy(&mu);
@@ -810,9 +824,9 @@ static void test_p3_7(void) {
 done:;
 }
 
-/* ---- P3.8 ---- */
-static void test_p3_8(void) {
-    TEST_BEGIN("P3.8  wsdq_destroy on non-empty deque is safe");
+/* ---- P6.13 ---- */
+static void test_p6_13(void) {
+    TEST_BEGIN("P6.13  wsdq_destroy on non-empty deque is safe");
 
     goc_wsdq dq;
     wsdq_init(&dq, 4);
@@ -833,9 +847,9 @@ static void test_p3_8(void) {
 done:;
 }
 
-/* ---- P3.9 ---- */
-static void test_p3_9(void) {
-    TEST_BEGIN("P3.9  injector push/pop round-trip (FIFO, single-threaded)");
+/* ---- P6.14 ---- */
+static void test_p6_14(void) {
+    TEST_BEGIN("P6.14  injector push/pop round-trip (FIFO, single-threaded)");
 
     goc_injector inj;
     injector_init(&inj);
@@ -858,9 +872,9 @@ static void test_p3_9(void) {
 done:;
 }
 
-/* ---- P3.10 ---- */
-static void test_p3_10(void) {
-    TEST_BEGIN("P3.10 injector_pop on empty returns NULL");
+/* ---- P6.15 ---- */
+static void test_p6_15(void) {
+    TEST_BEGIN("P6.15 injector_pop on empty returns NULL");
 
     goc_injector inj;
     injector_init(&inj);
@@ -870,40 +884,40 @@ static void test_p3_10(void) {
 done:;
 }
 
-/* ---- P3.11: concurrent injector push from multiple threads ---- */
+/* ---- P6.16: concurrent injector push from multiple threads ---- */
 
 typedef struct {
     goc_injector* inj;
     int           start;  /* sequence numbers [start, start + count) */
     int           count;
-} p3_11_prod_arg;
+} p6_16_prod_arg;
 
-static void* p3_11_producer(void* arg) {
-    p3_11_prod_arg* a = (p3_11_prod_arg*)arg;
+static void* p6_16_producer(void* arg) {
+    p6_16_prod_arg* a = (p6_16_prod_arg*)arg;
     for (int i = 0; i < a->count; i++)
         injector_push(a->inj, make_entry(a->start + i));
     return NULL;
 }
 
-static void test_p3_11(void) {
-    TEST_BEGIN("P3.11 injector concurrent push from multiple threads");
+static void test_p6_16(void) {
+    TEST_BEGIN("P6.16 injector concurrent push from multiple threads");
 
     goc_injector inj;
     injector_init(&inj);
 
-    int per_thread = P3_N / P3_T;
-    p3_11_prod_arg args[P3_T];
-    pthread_t prods[P3_T];
-    for (int t = 0; t < P3_T; t++) {
+    int per_thread = P6_N / P6_T;
+    p6_16_prod_arg args[P6_T];
+    pthread_t prods[P6_T];
+    for (int t = 0; t < P6_T; t++) {
         args[t].inj   = &inj;
         args[t].start = t * per_thread;
         args[t].count = per_thread;
-        pthread_create(&prods[t], NULL, p3_11_producer, &args[t]);
+        pthread_create(&prods[t], NULL, p6_16_producer, &args[t]);
     }
-    for (int t = 0; t < P3_T; t++)
+    for (int t = 0; t < P6_T; t++)
         pthread_join(prods[t], NULL);
 
-    bool* seen = calloc(P3_N, sizeof(bool));
+    bool* seen = calloc(P6_N, sizeof(bool));
     int total = 0;
     goc_entry* e;
     while ((e = injector_pop(&inj)) != NULL) {
@@ -912,8 +926,8 @@ static void test_p3_11(void) {
         total++;
         free(e);
     }
-    ASSERT(total == P3_N);
-    for (int i = 0; i < P3_N; i++)
+    ASSERT(total == P6_N);
+    for (int i = 0; i < P6_N; i++)
         ASSERT(seen[i]);
 
     free(seen);
@@ -946,18 +960,18 @@ int main(void) {
     test_p6_5();
     printf("\n");
 
-    printf("Phase 3 — Work-stealing deque + injector\n");
-    test_p3_1();
-    test_p3_2();
-    test_p3_3();
-    test_p3_4();
-    test_p3_5();
-    test_p3_6();
-    test_p3_7();
-    test_p3_8();
-    test_p3_9();
-    test_p3_10();
-    test_p3_11();
+    printf("Phase 6 (continued) — Work-stealing deque + injector\n");
+    test_p6_6();
+    test_p6_7();
+    test_p6_8();
+    test_p6_9();
+    test_p6_10();
+    test_p6_11();
+    test_p6_12();
+    test_p6_13();
+    test_p6_14();
+    test_p6_15();
+    test_p6_16();
     printf("\n");
 
     goc_shutdown();
