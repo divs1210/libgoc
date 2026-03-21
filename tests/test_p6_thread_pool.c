@@ -67,6 +67,12 @@
  *   P6.19  pool external post sleep-miss: serial external posts with forced
  *          idle windows — verifies that a worker sleeping in uv_sem_wait is
  *          reliably woken when an external caller pushes to its injector
+ *   P6.20  pool external post targets busy worker: injected tasks still
+ *          complete even when the round-robin target worker is inside
+ *          mco_resume and its idle_sem post is consumed after the fact
+ *   P6.21  pool idle steal gap: work that becomes stealable after a worker's
+ *          double-check (but before uv_sem_wait) is still processed within
+ *          deadline, not silently dropped
  *
  * Notes:
  *   - goc_init() is called once in main() before any test runs.
@@ -1175,6 +1181,179 @@ static void test_p6_19(void) {
 done:;
 }
 
+/* ---- P6.20: external post targets busy worker — tasks still complete ---- */
+/*
+ * Bug being tested (pool.c external path — item #6):
+ *   post_to_run_queue's external path both pushes the entry into
+ *   workers[idx].injector AND posts workers[idx].idle_sem.  If workers[idx]
+ *   is currently inside mco_resume (busy running a fiber), the sem post is
+ *   wasted: it increments the semaphore count of a non-sleeping worker.
+ *   Idle workers at other indices have no way to steal from workers[idx]'s
+ *   injector (injectors are not stealable), so they cannot help.  The entry
+ *   sits in workers[idx].injector until workers[idx] itself loops back and
+ *   drains it.
+ *
+ * Test strategy:
+ *   1. 2-worker pool so round-robin alternates strictly between workers 0 and 1.
+ *   2. Keep worker 0 occupied for ~20 ms by dispatching a CPU-spinning fiber
+ *      (tight loop, no yield) so it stays inside mco_resume.
+ *   3. During that window post N tasks externally from the main thread.
+ *      Odd-numbered round-robin targets (idx=1,3,5,…) land in worker 1's
+ *      injector and are processed immediately.  Even-numbered targets
+ *      (idx=0,2,4,…) land in worker 0's injector, which is not drained until
+ *      the spinning fiber exits ~20 ms later.  The sem post to worker 0's
+ *      idle_sem is wasted; worker 1 cannot steal worker 0's injector.
+ *   4. Assert all N tasks complete within 3 seconds (they must, once the
+ *      spinner exits and worker 0 drains its injector).
+ *   A hang means the wasted sem post caused the queued entries to be lost.
+ */
+#define P6_20_WORKERS  2
+#define P6_20_TASKS    200
+
+typedef struct {
+    _Atomic int* completed;
+    int          total;
+    done_t*      done;
+} p6_20_task_arg_t;
+
+static void p6_20_task_fn(void* arg) {
+    p6_20_task_arg_t* a = (p6_20_task_arg_t*)arg;
+    if (atomic_fetch_add_explicit(a->completed, 1, memory_order_acq_rel) + 1
+            == a->total)
+        done_signal(a->done);
+}
+
+typedef struct {
+    done_t* started;
+} p6_20_spinner_arg_t;
+
+/* CPU-spinning fiber: burns ~20 ms without yielding. */
+static void p6_20_spinner_fn(void* arg) {
+    p6_20_spinner_arg_t* a = (p6_20_spinner_arg_t*)arg;
+    done_signal(a->started);
+    volatile long x = 0;
+    /* ~20 ms of work at typical clock speeds. */
+    for (long i = 0; i < 50000000L; i++) x += i;
+    (void)x;
+}
+
+static void test_p6_20(void) {
+    TEST_BEGIN("P6.20  external post busy-worker: injector tasks still complete");
+
+    done_t done, spinner_started;
+    done_init(&done);
+    done_init(&spinner_started);
+
+    _Atomic int completed = 0;
+
+    goc_pool* pool = goc_pool_make(P6_20_WORKERS);
+    ASSERT(pool != NULL);
+
+    /* Launch the spinner first; wait until it's actually running so that
+     * next_push_idx is advanced and the subsequent task posts land on both
+     * workers in a predictable round-robin pattern. */
+    p6_20_spinner_arg_t sarg = { &spinner_started };
+    goc_go_on(pool, p6_20_spinner_fn, &sarg);
+    done_wait(&spinner_started);  /* spinner is now burning CPU on one worker */
+
+    /* Post all tasks while the spinner holds one worker inside mco_resume. */
+    p6_20_task_arg_t targ = { &completed, P6_20_TASKS, &done };
+    for (int i = 0; i < P6_20_TASKS; i++)
+        goc_go_on(pool, p6_20_task_fn, &targ);
+
+    /* 3-second deadline: must complete even though ~half the tasks land in
+     * the busy worker's injector and sit there until the spinner exits. */
+    bool ok = done_wait_timeout(&done, 3000);
+    ASSERT(ok);
+
+    goc_pool_destroy(pool);
+    done_destroy(&done);
+    done_destroy(&spinner_started);
+    TEST_PASS();
+done:;
+}
+
+/* ---- P6.21: idle steal gap — stealable work after double-check ---- */
+/*
+ * Bug being tested (pool.c worker loop — item #7):
+ *   The idle double-check (step 4 in pool_worker_fn) re-checks only the
+ *   worker's own injector and its own deque before sleeping.  It does NOT
+ *   re-run the steal phase (step 3).  Combined with the fixed-neighbor
+ *   wakeup in the internal path (bug #4), a window exists:
+ *
+ *     1. Workers W1 … W(N-1) all complete step 3 (steal), find nothing,
+ *        increment idle_count, do the double-check (still nothing), and
+ *        are about to call uv_sem_wait.
+ *     2. W0 is running a spawner fiber that calls goc_go_on K times
+ *        (internal post): each post pushes one entry onto W0's deque and
+ *        wakes workers[(W0+1)%N] = W1 only.
+ *     3. W1 is woken K times by the K sem posts, but it may not steal all K
+ *        entries fast enough while W2 … W(N-1) stay sleeping — they were
+ *        past the steal check and will not retry it before sleeping.
+ *
+ *   Test strategy: N=4 workers, spawner creates 1000 entries via internal
+ *   posts.  All entries must be processed within 5 seconds.  A timeout
+ *   means some entries were stranded because the only notified worker (W1)
+ *   couldn't keep up and the sleeping workers (W2, W3) never retried the
+ *   steal phase before sleeping.
+ *
+ *   Distinction from P6.18: P6.18 uses 4 workers + 500 children with a
+ *   3s deadline.  P6.21 uses 4 workers + 1000 children with an explicit
+ *   "deep-idle" pre-settle (usleep before the spawner starts) to maximise
+ *   the probability that W1-W3 are all past their steal check when the
+ *   burst arrives, specifically exercising the double-check gap.
+ */
+#define P6_21_WORKERS  4
+#define P6_21_CHILDREN 1000
+
+typedef struct {
+    goc_pool*    pool;
+    done_t*      done;
+    _Atomic int* completed;
+    int          total;
+} p6_21_arg_t;
+
+static void p6_21_child_fn(void* arg) {
+    p6_21_arg_t* a = (p6_21_arg_t*)arg;
+    if (atomic_fetch_add_explicit(a->completed, 1, memory_order_acq_rel) + 1
+            == a->total)
+        done_signal(a->done);
+}
+
+static void p6_21_spawner_fn(void* arg) {
+    p6_21_arg_t* a = (p6_21_arg_t*)arg;
+    for (int i = 0; i < a->total; i++)
+        goc_go_on(a->pool, p6_21_child_fn, a);
+}
+
+static void test_p6_21(void) {
+    TEST_BEGIN("P6.21  idle steal gap: stealable work after double-check still completes");
+
+    done_t done;
+    done_init(&done);
+    _Atomic int completed = 0;
+
+    goc_pool* pool = goc_pool_make(P6_21_WORKERS);
+    ASSERT(pool != NULL);
+
+    /* Let all workers settle deep into uv_sem_wait before the burst arrives,
+     * maximising the chance they are past the steal phase at step 3. */
+    usleep(5000);
+
+    p6_21_arg_t args = { pool, &done, &completed, P6_21_CHILDREN };
+    goc_go_on(pool, p6_21_spawner_fn, &args);
+
+    /* 5-second deadline: a timeout means workers stuck past the steal
+     * double-check were never re-woken and entries stagnated in W0's deque. */
+    bool ok = done_wait_timeout(&done, 5000);
+    ASSERT(ok);
+
+    goc_pool_destroy(pool);
+    done_destroy(&done);
+    TEST_PASS();
+done:;
+}
+
 /* =========================================================================
  * main
  *
@@ -1214,6 +1393,8 @@ int main(void) {
     test_p6_17();
     test_p6_18();
     test_p6_19();
+    test_p6_20();
+    test_p6_21();
     printf("\n");
 
     goc_shutdown();
