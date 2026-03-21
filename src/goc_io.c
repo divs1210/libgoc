@@ -17,13 +17,17 @@
  *
  * Result delivery
  * ---------------
- * One-shot operation callbacks (write, connect, shutdown, FS, DNS) use
- * goc_put_sync() on a buffered channel (capacity 1).  Because the channel is
- * empty when the callback fires, goc_put_sync() completes immediately without
- * blocking the loop thread, then goc_close() is called to signal completion.
+ * All callbacks (one-shot and streaming) use goc_put_cb() so the event loop
+ * thread is never blocked waiting for a fiber to consume a result.
  *
- * Streaming callbacks (read, UDP recv) use goc_put_cb() (non-blocking) so
- * the loop thread is never stalled waiting for a fiber to consume data.
+ * GC safety
+ * ---------
+ * goc_chan* pointers stored inside malloc-allocated libuv context structs
+ * are invisible to Boehm GC.  Every *_ch function calls
+ * uv_handle_chan_register(ch) after submitting the request; every callback
+ * calls uv_handle_chan_unregister(ch) before goc_close(ch).  This keeps the
+ * channel in a GC-visible array (live_uv_handles in gc.c) for the duration
+ * of the pending I/O.
  */
 
 #include <stdlib.h>
@@ -67,7 +71,8 @@ static void on_fs_open(uv_fs_t* req)
     goc_fs_open_t* res = (goc_fs_open_t*)goc_malloc(sizeof(goc_fs_open_t));
     res->result = (uv_file)req->result;
     uv_fs_req_cleanup(req);
-    goc_put_sync(ctx->ch, res);
+    uv_handle_chan_unregister(ctx->ch);
+    goc_put_cb(ctx->ch, res, NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -85,7 +90,9 @@ goc_chan* goc_fs_open_ch(const char* path, int flags, int mode)
         goc_put_cb(ch, res, NULL, NULL);
         goc_close(ch);
         free(ctx);
+        return ch;
     }
+    uv_handle_chan_register(ch);
     return ch;
 }
 
@@ -106,7 +113,8 @@ static void on_fs_close(uv_fs_t* req)
     goc_fs_close_t* res = (goc_fs_close_t*)goc_malloc(sizeof(goc_fs_close_t));
     res->result = (int)req->result;
     uv_fs_req_cleanup(req);
-    goc_put_sync(ctx->ch, res);
+    uv_handle_chan_unregister(ctx->ch);
+    goc_put_cb(ctx->ch, res, NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -124,7 +132,9 @@ goc_chan* goc_fs_close_ch(uv_file file)
         goc_put_cb(ch, res, NULL, NULL);
         goc_close(ch);
         free(ctx);
+        return ch;
     }
+    uv_handle_chan_register(ch);
     return ch;
 }
 
@@ -145,7 +155,8 @@ static void on_fs_read(uv_fs_t* req)
     goc_fs_read_t* res = (goc_fs_read_t*)goc_malloc(sizeof(goc_fs_read_t));
     res->result = (ssize_t)req->result;
     uv_fs_req_cleanup(req);
-    goc_put_sync(ctx->ch, res);
+    uv_handle_chan_unregister(ctx->ch);
+    goc_put_cb(ctx->ch, res, NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -166,7 +177,9 @@ goc_chan* goc_fs_read_ch(uv_file file,
         goc_put_cb(ch, res, NULL, NULL);
         goc_close(ch);
         free(ctx);
+        return ch;
     }
+    uv_handle_chan_register(ch);
     return ch;
 }
 
@@ -189,7 +202,8 @@ static void on_fs_write(uv_fs_t* req)
     goc_fs_write_t* res = (goc_fs_write_t*)goc_malloc(sizeof(goc_fs_write_t));
     res->result = (ssize_t)req->result;
     uv_fs_req_cleanup(req);
-    goc_put_sync(ctx->ch, res);
+    uv_handle_chan_unregister(ctx->ch);
+    goc_put_cb(ctx->ch, res, NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -210,7 +224,9 @@ goc_chan* goc_fs_write_ch(uv_file file,
         goc_put_cb(ch, res, NULL, NULL);
         goc_close(ch);
         free(ctx);
+        return ch;
     }
+    uv_handle_chan_register(ch);
     return ch;
 }
 
@@ -233,7 +249,8 @@ static void on_fs_unlink(uv_fs_t* req)
     goc_fs_unlink_t* res = (goc_fs_unlink_t*)goc_malloc(sizeof(goc_fs_unlink_t));
     res->result = (int)req->result;
     uv_fs_req_cleanup(req);
-    goc_put_sync(ctx->ch, res);
+    uv_handle_chan_unregister(ctx->ch);
+    goc_put_cb(ctx->ch, res, NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -251,7 +268,9 @@ goc_chan* goc_fs_unlink_ch(const char* path)
         goc_put_cb(ch, res, NULL, NULL);
         goc_close(ch);
         free(ctx);
+        return ch;
     }
+    uv_handle_chan_register(ch);
     return ch;
 }
 
@@ -274,7 +293,8 @@ static void on_fs_stat(uv_fs_t* req)
     if (req->result == 0)
         res->statbuf = req->statbuf;
     uv_fs_req_cleanup(req);
-    goc_put_sync(ctx->ch, res);
+    uv_handle_chan_unregister(ctx->ch);
+    goc_put_cb(ctx->ch, res, NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -292,7 +312,9 @@ goc_chan* goc_fs_stat_ch(const char* path)
         goc_put_cb(ch, res, NULL, NULL);
         goc_close(ch);
         free(ctx);
+        return ch;
     }
+    uv_handle_chan_register(ch);
     return ch;
 }
 
@@ -313,7 +335,8 @@ static void on_fs_rename(uv_fs_t* req)
     goc_fs_rename_t* res = (goc_fs_rename_t*)goc_malloc(sizeof(goc_fs_rename_t));
     res->result = (int)req->result;
     uv_fs_req_cleanup(req);
-    goc_put_sync(ctx->ch, res);
+    uv_handle_chan_unregister(ctx->ch);
+    goc_put_cb(ctx->ch, res, NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -331,7 +354,9 @@ goc_chan* goc_fs_rename_ch(const char* path, const char* new_path)
         goc_put_cb(ch, res, NULL, NULL);
         goc_close(ch);
         free(ctx);
+        return ch;
     }
+    uv_handle_chan_register(ch);
     return ch;
 }
 
@@ -352,7 +377,8 @@ static void on_fs_sendfile(uv_fs_t* req)
     goc_fs_sendfile_t* res = (goc_fs_sendfile_t*)goc_malloc(sizeof(goc_fs_sendfile_t));
     res->result = (ssize_t)req->result;
     uv_fs_req_cleanup(req);
-    goc_put_sync(ctx->ch, res);
+    uv_handle_chan_unregister(ctx->ch);
+    goc_put_cb(ctx->ch, res, NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -372,7 +398,9 @@ goc_chan* goc_fs_sendfile_ch(uv_file out_fd, uv_file in_fd,
         goc_put_cb(ch, res, NULL, NULL);
         goc_close(ch);
         free(ctx);
+        return ch;
     }
+    uv_handle_chan_register(ch);
     return ch;
 }
 
@@ -407,7 +435,8 @@ static void on_getaddrinfo(uv_getaddrinfo_t* req, int status,
                                      sizeof(goc_getaddrinfo_t));
     r->status = status;
     r->res    = res;   /* caller must call uv_freeaddrinfo(r->res) */
-    goc_put_sync(ctx->ch, r);
+    uv_handle_chan_unregister(ctx->ch);
+    goc_put_cb(ctx->ch, r, NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -430,7 +459,9 @@ goc_chan* goc_getaddrinfo_ch(const char* node, const char* service,
         goc_put_cb(ch, r, NULL, NULL);
         goc_close(ch);
         free(ctx);
+        return ch;
     }
+    uv_handle_chan_register(ch);
     return ch;
 }
 
@@ -468,7 +499,8 @@ static void on_getnameinfo(uv_getnameinfo_t* req, int status,
         r->service[0] = '\0';
     r->hostname[sizeof(r->hostname) - 1] = '\0';
     r->service[sizeof(r->service)  - 1] = '\0';
-    goc_put_sync(ctx->ch, r);
+    uv_handle_chan_unregister(ctx->ch);
+    goc_put_cb(ctx->ch, r, NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -490,7 +522,9 @@ goc_chan* goc_getnameinfo_ch(const struct sockaddr* addr, int flags)
         goc_put_cb(ch, r, NULL, NULL);
         goc_close(ch);
         free(ctx);
+        return ch;
     }
+    uv_handle_chan_register(ch);
     return ch;
 }
 
@@ -551,7 +585,7 @@ static void on_read_cb(uv_stream_t* stream, ssize_t nread,
         res->nread    = nread;
         res->buf.base = NULL;
         res->buf.len  = 0;
-        /* Use goc_put_cb so the loop thread is not blocked. */
+        uv_handle_chan_unregister(ctx->ch);
         goc_put_cb(ctx->ch, res, NULL, NULL);
         goc_close(ctx->ch);
         free(ctx);
@@ -588,7 +622,8 @@ static void on_read_start_dispatch(uv_async_t* h)
         res->nread    = rc;
         res->buf.base = NULL;
         res->buf.len  = 0;
-        goc_put_sync(d->ch, res);
+        uv_handle_chan_unregister(d->ch);
+        goc_put_cb(d->ch, res, NULL, NULL);
         goc_close(d->ch);
         free(ctx);
         d->stream->data = NULL;
@@ -605,6 +640,7 @@ goc_chan* goc_read_start(uv_stream_t* stream)
     assert(d);
     d->stream = stream;
     d->ch     = ch;
+    uv_handle_chan_register(ch);
     uv_async_init(g_loop, &d->async, on_read_start_dispatch);
     uv_async_send(&d->async);
     return ch;
@@ -627,6 +663,7 @@ static void on_read_stop_dispatch(uv_async_t* h)
 
     if (d->stream->data) {
         goc_stream_ctx_t* ctx = (goc_stream_ctx_t*)d->stream->data;
+        uv_handle_chan_unregister(ctx->ch);
         goc_close(ctx->ch);
         free(ctx);
         d->stream->data = NULL;
@@ -660,7 +697,8 @@ static void on_write_cb(uv_write_t* req, int status)
     goc_write_ctx_t* ctx = (goc_write_ctx_t*)req;
     goc_write_t*     res = (goc_write_t*)goc_malloc(sizeof(goc_write_t));
     res->status = status;
-    goc_put_sync(ctx->ch, res);
+    uv_handle_chan_unregister(ctx->ch);
+    goc_put_cb(ctx->ch, res, NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -683,7 +721,8 @@ static void on_write_dispatch(uv_async_t* h)
     if (rc < 0) {
         goc_write_t* res = (goc_write_t*)goc_malloc(sizeof(goc_write_t));
         res->status = rc;
-        goc_put_sync(ctx->ch, res);
+        uv_handle_chan_unregister(ctx->ch);
+        goc_put_cb(ctx->ch, res, NULL, NULL);
         goc_close(ctx->ch);
         free(ctx);
     }
@@ -701,6 +740,7 @@ goc_chan* goc_write_ch(uv_stream_t* handle,
     d->bufs   = bufs;
     d->nbufs  = nbufs;
     d->ch     = ch;
+    uv_handle_chan_register(ch);
     uv_async_init(g_loop, &d->async, on_write_dispatch);
     uv_async_send(&d->async);
     return ch;
