@@ -35,9 +35,10 @@
 
 typedef struct {
     pthread_t      thread;
-    goc_wsdq    deque;
+    goc_wsdq       deque;
     goc_injector   injector;   /* MPSC queue: external callers push here */
     uv_sem_t       idle_sem;
+    _Atomic int    idle_flag;  /* 1 while blocked in uv_sem_wait, 0 otherwise */
     size_t         index;
     goc_pool*      pool;
 } goc_worker;
@@ -191,12 +192,28 @@ static void* pool_worker_fn(void* arg) {
         entry = injector_pop(&tl_worker->injector);
         if (entry == NULL)
             entry = wsdq_pop_bottom(&tl_worker->deque);
+
+        /* Fix 1b: steal retry so that work posted to a peer's deque is not
+         * missed when no idle-flag scan fires a wakeup. */
+        if (entry == NULL && pool->thread_count > 1) {
+            for (size_t i = 0; i < pool->thread_count; i++) {
+                size_t victim = (tl_worker->index + 1 + i) % pool->thread_count;
+                if (victim == tl_worker->index) continue;
+                entry = wsdq_steal_top(&pool->workers[victim].deque);
+                if (entry != NULL) break;
+            }
+        }
+
         if (entry != NULL) {
             atomic_fetch_sub_explicit(&pool->idle_count, 1, memory_order_relaxed);
             goto run;
         }
 
+        /* Fix 1a: mark self as truly sleeping so post_to_run_queue can
+         * target this worker's semaphore rather than a busy neighbour's. */
+        atomic_store_explicit(&tl_worker->idle_flag, 1, memory_order_release);
         uv_sem_wait(&tl_worker->idle_sem);
+        atomic_store_explicit(&tl_worker->idle_flag, 0, memory_order_relaxed);
         atomic_fetch_sub_explicit(&pool->idle_count, 1, memory_order_relaxed);
         continue;   /* re-check shutdown and try again */
 
@@ -268,6 +285,23 @@ run:
 }
 
 /* -------------------------------------------------------------------------
+ * find_idle_worker_from — scan for an actually-sleeping worker
+ *
+ * Scans [start, start+N) mod N and returns the index of the first worker
+ * whose idle_flag is set (i.e. blocked in uv_sem_wait).
+ * Returns SIZE_MAX when no idle worker is found.
+ * ---------------------------------------------------------------------- */
+
+static size_t find_idle_worker_from(goc_pool* pool, size_t start) {
+    for (size_t i = 0; i < pool->thread_count; i++) {
+        size_t idx = (start + i) % pool->thread_count;
+        if (atomic_load_explicit(&pool->workers[idx].idle_flag, memory_order_acquire))
+            return idx;
+    }
+    return SIZE_MAX;
+}
+
+/* -------------------------------------------------------------------------
  * post_to_run_queue — internal; called from fiber.c and channel.c
  *
  * Routes the entry to either the calling worker's own deque (internal
@@ -295,12 +329,16 @@ void post_to_run_queue(goc_pool* pool, goc_entry* entry) {
          * total order with the worker's seq_cst increment (ARM/POWER safety). */
         atomic_thread_fence(memory_order_seq_cst);
 
-        /* Wake one idle worker (not self — self is running a fiber) so it
-         * can steal the just-pushed entry. */
+        /* Wake one actually-idle worker (not self) so it can steal the
+         * just-pushed entry.  Scan from the next slot to find a worker whose
+         * idle_flag is set; fix 1b covers the window where idle_count > 0
+         * but no flag is set yet (worker in double-check steal retry). */
         if (atomic_load_explicit(&pool->idle_count, memory_order_seq_cst) > 0
                 && pool->thread_count > 1) {
-            size_t idx = (w->index + 1) % pool->thread_count;
-            uv_sem_post(&pool->workers[idx].idle_sem);
+            size_t start = (w->index + 1) % pool->thread_count;
+            size_t target = find_idle_worker_from(pool, start);
+            if (target != SIZE_MAX)
+                uv_sem_post(&pool->workers[target].idle_sem);
         }
     } else {
         /* External caller: push into target worker's injector (MPSC-safe).
@@ -314,7 +352,9 @@ void post_to_run_queue(goc_pool* pool, goc_entry* entry) {
          * is a full memory barrier, providing the seq_cst effect needed for
          * the sleep-miss race closure. */
         if (atomic_load_explicit(&pool->idle_count, memory_order_seq_cst) > 0) {
-            uv_sem_post(&pool->workers[idx].idle_sem);
+            size_t target = find_idle_worker_from(pool, idx);
+            if (target != SIZE_MAX)
+                uv_sem_post(&pool->workers[target].idle_sem);
         }
     }
 }
@@ -377,6 +417,7 @@ goc_pool* goc_pool_make(size_t threads) {
         wsdq_init(&pool->workers[i].deque, 256);
         injector_init(&pool->workers[i].injector);
         uv_sem_init(&pool->workers[i].idle_sem, 0);
+        atomic_store_explicit(&pool->workers[i].idle_flag, 0, memory_order_relaxed);
         pool->workers[i].index = i;
         pool->workers[i].pool  = pool;
     }
