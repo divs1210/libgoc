@@ -1319,7 +1319,7 @@ The test suite is split across phase files in `tests/`, each a self-contained C 
 | P5.12 | `goc_alts_sync` blocks the OS thread on a put arm until a fiber takes the value |
 | P5.13 | `goc_timeout` closes its channel after the deadline, not before |
 
-**Phase 6 — Thread pool**
+**Phase 6 — Thread pool + work-stealing data structures**
 
 | Test | Description |
 |---|---|
@@ -1328,6 +1328,17 @@ The test suite is split across phase files in `tests/`, each a self-contained C 
 | P6.3 | `goc_pool_destroy_timeout` returns `GOC_DRAIN_TIMEOUT` when fibers are still running at deadline; pool remains valid — verified by dispatching a new short-lived fiber via `goc_go_on` to the same pool and confirming it runs to completion before `goc_pool_destroy` is called |
 | P6.4 | `goc_malloc` end-to-end: fiber builds GC-heap linked list, main traverses after join |
 | P6.5 | `goc_alts` with `n > GOC_ALTS_STACK_THRESHOLD` (8) arms exercises the `malloc` path in `alts_dedup_sort_channels`; correct arm fires, no memory error (run under ASAN to catch heap misuse) |
+| P6.6 | `wsdq_push_bottom` / `wsdq_pop_bottom` round-trip: push 16 entries, pop verifies LIFO order |
+| P6.7 | `wsdq_pop_bottom` on empty deque returns NULL |
+| P6.8 | `wsdq_steal_top` on empty deque returns NULL |
+| P6.9 | `wsdq_steal_top` ordering is FIFO: push 3 entries, steal verifies e1→e2→e3 |
+| P6.10 | `goc_wsdq` grows when full: push 256 entries into a capacity-4 deque, pop verifies all values |
+| P6.11 | Concurrent owner-push / thief-steal: 4 thief threads steal while owner pushes N entries; all N entries accounted for |
+| P6.12 | Concurrent push + pop + steal under contention: owner interleaves push and pop while 4 thieves steal; all N entries accounted for |
+| P6.13 | `wsdq_destroy` on non-empty deque is safe (no crash) |
+| P6.14 | `injector_push` / `injector_pop` round-trip: push 64 entries, pop verifies FIFO order |
+| P6.15 | `injector_pop` on empty injector returns NULL |
+| P6.16 | Concurrent injector push from multiple threads: 4 producer threads push N/4 entries each; all N entries consumed with no duplicates or losses |
 
 > **Not yet tested:** `compact_dead_entries` sweep — verifying that the amortised dead-entry sweep fires correctly when `dead_count >= GOC_DEAD_COUNT_THRESHOLD` after many fibers race on the same channel via `goc_alts`. The sweep logic exists and is exercised indirectly by the integration tests, but a dedicated test that asserts the sweep threshold, entry unlinking, and channel consistency after the sweep has not yet been written.
 
