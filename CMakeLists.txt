@@ -234,7 +234,7 @@ include(GNUInstallDirs)
 install(TARGETS goc
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
-install(FILES include/goc.h
+install(FILES include/goc.h include/goc_io.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 if(LIBGOC_SHARED)

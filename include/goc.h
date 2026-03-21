@@ -457,6 +457,4 @@ goc_drain_result_t goc_pool_destroy_timeout(goc_pool* pool, uint64_t ms);
 } /* extern "C" */
 #endif
 
-#include "goc_io.h"
-
 #endif /* GOC_H */

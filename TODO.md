@@ -4,7 +4,7 @@
 
 - [ ] **F1** Telemetry — expose runtime metrics for all pools, worker threads, fibers, channels, mutexes, and their metadata
 
-- [ ] **F2** libuv I/O function wrappers that use channels rather than callbacks
+- [x] **F2** libuv I/O function wrappers that use channels rather than callbacks
 
 - [ ] **F3** Memory-managed, mutable dynamic array
   - **F3.1** Amortized constant-time random access (read / write)
