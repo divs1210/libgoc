@@ -1,24 +1,24 @@
 /*
  * src/wsdq.c
  *
- * Implementation of goc_wsdeque (Chase–Lev work-stealing deque) and
+ * Implementation of goc_wsdq (Chase–Lev work-stealing deque) and
  * goc_injector (MPSC injector queue).
  *
  * Memory model notes — see pr.md §Step 3 for the full rationale:
  *
- *   wsdeque_push_bottom:
+ *   wsdq_push_bottom:
  *     - Loads top with acquire, bottom with relaxed (owner is sole writer).
  *     - Buffer growth executes under steal_lock (prevents thief use-after-free).
  *     - Stores incremented bottom with release (pairs with steal_top acquire).
  *
- *   wsdeque_steal_top:
+ *   wsdq_steal_top:
  *     - Holds steal_lock for the entire operation (serialises concurrent thieves).
  *     - Loads top and bottom with acquire.
  *     - Uses CAS on top (acq_rel) instead of a plain store so that it loses
  *       the race if pop_bottom's own CAS on top already claimed the last element.
  *       Without the CAS, both paths could return the same entry (double delivery).
  *
- *   wsdeque_pop_bottom:
+ *   wsdq_pop_bottom:
  *     - Decrements bottom with seq_cst via atomic_fetch_sub (Chase–Lev
  *       correctness requirement; prevents double-delivery of last element).
  *     - Loads top with acquire.
@@ -31,10 +31,10 @@
 #include "wsdq.h"
 
 /* =========================================================================
- * goc_wsdeque — Chase–Lev circular work-stealing deque
+ * goc_wsdq — Chase–Lev circular work-stealing deque
  * ====================================================================== */
 
-void wsdeque_init(goc_wsdeque* dq, size_t cap) {
+void wsdq_init(goc_wsdq* dq, size_t cap) {
     assert(cap > 0 && (cap & (cap - 1)) == 0);  /* must be power of two */
 
     atomic_init(&dq->bottom, 0);
@@ -47,13 +47,13 @@ void wsdeque_init(goc_wsdeque* dq, size_t cap) {
     uv_mutex_init(&dq->steal_lock);
 }
 
-void wsdeque_destroy(goc_wsdeque* dq) {
+void wsdq_destroy(goc_wsdq* dq) {
     goc_entry** buf = atomic_load_explicit(&dq->buf, memory_order_relaxed);
     free(buf);
     uv_mutex_destroy(&dq->steal_lock);
 }
 
-void wsdeque_push_bottom(goc_wsdeque* dq, goc_entry* entry) {
+void wsdq_push_bottom(goc_wsdq* dq, goc_entry* entry) {
     size_t b   = atomic_load_explicit(&dq->bottom, memory_order_relaxed);
     size_t t   = atomic_load_explicit(&dq->top,    memory_order_acquire);
     goc_entry** buf = atomic_load_explicit(&dq->buf, memory_order_relaxed);
@@ -84,7 +84,7 @@ void wsdeque_push_bottom(goc_wsdeque* dq, goc_entry* entry) {
     atomic_store_explicit(&dq->bottom, b + 1, memory_order_release);
 }
 
-goc_entry* wsdeque_pop_bottom(goc_wsdeque* dq) {
+goc_entry* wsdq_pop_bottom(goc_wsdq* dq) {
     /* seq_cst fetch_sub: required by Chase–Lev to form a total order with
      * the thief's acquire load of bottom, preventing double-delivery of the
      * last element on weak memory models (ARM, POWER). */
@@ -128,7 +128,7 @@ goc_entry* wsdeque_pop_bottom(goc_wsdeque* dq) {
     return entry;
 }
 
-goc_entry* wsdeque_steal_top(goc_wsdeque* dq) {
+goc_entry* wsdq_steal_top(goc_wsdq* dq) {
     uv_mutex_lock(&dq->steal_lock);
 
     size_t t = atomic_load_explicit(&dq->top,    memory_order_acquire);

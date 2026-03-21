@@ -1,10 +1,10 @@
 /*
  * src/wsdq.h
  *
- * Work-stealing deque (goc_wsdeque) and per-worker MPSC injector queue
+ * Work-stealing deque (goc_wsdq) and per-worker MPSC injector queue
  * (goc_injector) used by the work-stealing thread pool scheduler.
  *
- * goc_wsdeque — Chase–Lev circular work-stealing deque.
+ * goc_wsdq — Chase–Lev circular work-stealing deque.
  *   - push_bottom / pop_bottom: owner-only (single owner thread).
  *   - steal_top: any thread; serialised internally by a short mutex.
  *
@@ -25,10 +25,10 @@
 #include "internal.h"   /* goc_entry */
 
 /* -------------------------------------------------------------------------
- * goc_wsdeque — Chase–Lev work-stealing deque
+ * goc_wsdq — Chase–Lev work-stealing deque
  * ---------------------------------------------------------------------- */
 
-struct goc_wsdeque {
+struct goc_wsdq {
     _Atomic size_t        bottom;   /* written only by owner */
     _Atomic size_t        top;      /* written by thieves (under steal_lock) */
     _Atomic(goc_entry**) buf;      /* pointer to ring buffer; updated on grow */
@@ -37,7 +37,7 @@ struct goc_wsdeque {
                                          and buffer-swap during push_bottom growth */
 };
 
-typedef struct goc_wsdeque goc_wsdeque;
+typedef struct goc_wsdq goc_wsdq;
 
 /* -------------------------------------------------------------------------
  * goc_injector — MPSC queue (mutex-protected linked list)
@@ -57,26 +57,26 @@ struct goc_injector {
 typedef struct goc_injector goc_injector;
 
 /* -------------------------------------------------------------------------
- * goc_wsdeque API
+ * goc_wsdq API
  * ---------------------------------------------------------------------- */
 
 /* Initialise a deque with initial capacity `cap` (must be a power of two). */
-void wsdeque_init(goc_wsdeque* dq, size_t cap);
+void wsdq_init(goc_wsdq* dq, size_t cap);
 
 /* Release all memory owned by the deque (does not free `dq` itself).
  * Must NOT be called while any thread is concurrently calling steal_top. */
-void wsdeque_destroy(goc_wsdeque* dq);
+void wsdq_destroy(goc_wsdq* dq);
 
 /* Owner-only: push entry onto the bottom. Grows the deque if full.
  * Must only be called by the single owner thread. */
-void wsdeque_push_bottom(goc_wsdeque* dq, goc_entry* entry);
+void wsdq_push_bottom(goc_wsdq* dq, goc_entry* entry);
 
 /* Owner-only: pop from the bottom. Returns NULL if empty.
  * Must only be called by the single owner thread. */
-goc_entry* wsdeque_pop_bottom(goc_wsdeque* dq);
+goc_entry* wsdq_pop_bottom(goc_wsdq* dq);
 
 /* Any thread: steal from the top. Returns NULL if empty or lost a race. */
-goc_entry* wsdeque_steal_top(goc_wsdeque* dq);
+goc_entry* wsdq_steal_top(goc_wsdq* dq);
 
 /* -------------------------------------------------------------------------
  * goc_injector API

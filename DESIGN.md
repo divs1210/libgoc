@@ -648,7 +648,7 @@ At the **top of `goc_take` and `goc_put`**, immediately after acquiring the lock
 ```c
 typedef struct {
     pthread_t      thread;
-    goc_wsdeque    deque;       /* Chase–Lev work-stealing deque (owner-push/pop + thief-steal) */
+    goc_wsdq    deque;       /* Chase–Lev work-stealing deque (owner-push/pop + thief-steal) */
     goc_injector   injector;    /* MPSC queue: external callers push here; owner pops */
     uv_sem_t       idle_sem;    /* posted when work is available; worker sleeps on this */
     size_t         index;       /* worker index in pool->workers[] */
@@ -697,18 +697,18 @@ while not shutdown:
     if entry != NULL: goto run
 
     /* Stage 2: pop from own deque (LIFO, cache-warm) */
-    entry = wsdeque_pop_bottom(worker.deque)
+    entry = wsdq_pop_bottom(worker.deque)
     if entry != NULL: goto run
 
     /* Stage 3: steal from other workers (randomised start offset) */
     for each other worker (random offset, excluding self):
-        entry = wsdeque_steal_top(other.deque)
+        entry = wsdq_steal_top(other.deque)
         if entry != NULL: goto run
 
     /* Stage 4: go idle — sleep-miss race closure */
     atomic_fetch_add(idle_count, 1, seq_cst)  /* must be seq_cst — pairs with post seq_cst fence */
     entry = injector_pop(worker.injector)      /* double-check: close race with concurrent post */
-    if entry == NULL: entry = wsdeque_pop_bottom(worker.deque)
+    if entry == NULL: entry = wsdq_pop_bottom(worker.deque)
     if entry != NULL:
         atomic_fetch_sub(idle_count, 1, relaxed)
         goto run
@@ -797,17 +797,17 @@ The invariant is:
 
 
 
-Each pool uses per-worker **Chase–Lev work-stealing deques** (`goc_wsdeque`) and per-worker **MPSC injector queues** (`goc_injector`) instead of a single shared run queue.
+Each pool uses per-worker **Chase–Lev work-stealing deques** (`goc_wsdq`) and per-worker **MPSC injector queues** (`goc_injector`) instead of a single shared run queue.
 
 ```c
-/* goc_wsdeque — Chase–Lev circular work-stealing deque */
+/* goc_wsdq — Chase–Lev circular work-stealing deque */
 typedef struct {
     _Atomic size_t       bottom;     /* owner's push/pop cursor (write end) */
     _Atomic size_t       top;        /* thieves' steal cursor (read end) */
     _Atomic(goc_entry**) buf;        /* circular buffer, capacity always a power of two */
     size_t               capacity;
     uv_mutex_t           steal_lock; /* serialises concurrent thieves; not held by owner */
-} goc_wsdeque;
+} goc_wsdq;
 
 /* goc_injector — MPSC queue (mutex-protected singly-linked list) */
 typedef struct {
@@ -817,7 +817,7 @@ typedef struct {
 } goc_injector;
 ```
 
-`wsdeque_push_bottom` / `wsdeque_pop_bottom` are called only by the owning worker (no lock on the fast path). `wsdeque_steal_top` is called by any thread under `steal_lock`. `wsdeque_pop_bottom` uses `atomic_fetch_sub(seq_cst)` to decrement `bottom` and checks emptiness using `old_b <= top` (pre-decrement value) to avoid unsigned wraparound when `bottom == 0`.
+`wsdq_push_bottom` / `wsdq_pop_bottom` are called only by the owning worker (no lock on the fast path). `wsdq_steal_top` is called by any thread under `steal_lock`. `wsdq_pop_bottom` uses `atomic_fetch_sub(seq_cst)` to decrement `bottom` and checks emptiness using `old_b <= top` (pre-decrement value) to avoid unsigned wraparound when `bottom == 0`.
 
 `post_to_run_queue` routes entries as follows:
 

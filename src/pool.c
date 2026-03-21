@@ -34,7 +34,7 @@
 
 typedef struct {
     pthread_t      thread;
-    goc_wsdeque    deque;
+    goc_wsdq    deque;
     goc_injector   injector;   /* MPSC queue: external callers push here */
     uv_sem_t       idle_sem;
     size_t         index;
@@ -161,7 +161,7 @@ static void* pool_worker_fn(void* arg) {
         if (entry != NULL) goto run;
 
         /* 2. Pop from own deque (LIFO, cache-warm). */
-        entry = wsdeque_pop_bottom(&tl_worker->deque);
+        entry = wsdq_pop_bottom(&tl_worker->deque);
         if (entry != NULL) goto run;
 
         /* 3. Steal phase: try each other worker exactly once, starting from a
@@ -172,7 +172,7 @@ static void* pool_worker_fn(void* arg) {
             for (size_t i = 0; i < pool->thread_count; i++) {
                 size_t victim = (tl_worker->index + offset + i) % pool->thread_count;
                 if (victim == tl_worker->index) continue;
-                entry = wsdeque_steal_top(&pool->workers[victim].deque);
+                entry = wsdq_steal_top(&pool->workers[victim].deque);
                 if (entry != NULL) goto run;
             }
         }
@@ -187,7 +187,7 @@ static void* pool_worker_fn(void* arg) {
 
         entry = injector_pop(&tl_worker->injector);
         if (entry == NULL)
-            entry = wsdeque_pop_bottom(&tl_worker->deque);
+            entry = wsdq_pop_bottom(&tl_worker->deque);
         if (entry != NULL) {
             atomic_fetch_sub_explicit(&pool->idle_count, 1, memory_order_relaxed);
             goto run;
@@ -275,9 +275,9 @@ void post_to_run_queue(goc_pool* pool, goc_entry* entry) {
     if (w != NULL && w->pool == pool) {
         /* Internal caller: push to executing worker's own deque.
          * Safe: the owner is inside mco_resume, not touching the deque. */
-        wsdeque_push_bottom(&w->deque, entry);
+        wsdq_push_bottom(&w->deque, entry);
 
-        /* Explicit seq_cst fence: the bottom store in wsdeque_push_bottom is
+        /* Explicit seq_cst fence: the bottom store in wsdq_push_bottom is
          * only release; we need seq_cst here so idle_count reads below form a
          * total order with the worker's seq_cst increment (ARM/POWER safety). */
         atomic_thread_fence(memory_order_seq_cst);
@@ -361,7 +361,7 @@ goc_pool* goc_pool_make(size_t threads) {
     pool->workers      = malloc(threads * sizeof(goc_worker));
 
     for (size_t i = 0; i < threads; i++) {
-        wsdeque_init(&pool->workers[i].deque, 256);
+        wsdq_init(&pool->workers[i].deque, 256);
         injector_init(&pool->workers[i].injector);
         uv_sem_init(&pool->workers[i].idle_sem, 0);
         pool->workers[i].index = i;
@@ -418,7 +418,7 @@ void goc_pool_destroy(goc_pool* pool) {
     /* 5. Destroy per-worker resources. */
     for (size_t i = 0; i < pool->thread_count; i++) {
         uv_sem_destroy(&pool->workers[i].idle_sem);
-        wsdeque_destroy(&pool->workers[i].deque);
+        wsdq_destroy(&pool->workers[i].deque);
         injector_destroy(&pool->workers[i].injector);
     }
 
@@ -485,7 +485,7 @@ goc_drain_result_t goc_pool_destroy_timeout(goc_pool* pool, uint64_t ms) {
 
     for (size_t i = 0; i < pool->thread_count; i++) {
         uv_sem_destroy(&pool->workers[i].idle_sem);
-        wsdeque_destroy(&pool->workers[i].deque);
+        wsdq_destroy(&pool->workers[i].deque);
         injector_destroy(&pool->workers[i].injector);
     }
 
