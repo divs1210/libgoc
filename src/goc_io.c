@@ -20,6 +20,13 @@
  * All callbacks (one-shot and streaming) use goc_put_cb() so the event loop
  * thread is never blocked waiting for a fiber to consume a result.
  *
+ * Scalar vs. struct results
+ * -------------------------
+ * Operations whose only result is a scalar (status code, byte count, file
+ * descriptor) encode the value as (void*)(intptr_t)value in the channel.
+ * Operations that need composite results allocate a GC-managed struct and
+ * deliver its pointer through the channel.
+ *
  * GC safety
  * ---------
  * goc_chan* pointers stored inside malloc-allocated libuv context structs
@@ -61,18 +68,22 @@ typedef struct {
     goc_chan* ch;
 } goc_fs_ctx_t;
 
+/* Helper: encode a scalar result as void* for channel delivery. */
+#define SCALAR(v)  ((void*)(intptr_t)(v))
+/* Helper: decode scalar from channel take. */
+#define INT_VAL(v) ((int)(intptr_t)(v)->val)
+
 /* -------------------------------------------------------------------------
  * goc_io_fs_open
  * ---------------------------------------------------------------------- */
 
 static void on_fs_open(uv_fs_t* req)
 {
-    goc_fs_ctx_t*  ctx = (goc_fs_ctx_t*)req;
-    goc_io_fs_open_t* res = (goc_io_fs_open_t*)goc_malloc(sizeof(goc_io_fs_open_t));
-    res->result = (uv_file)req->result;
+    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)req;
+    uv_file fd = (uv_file)req->result;
     uv_fs_req_cleanup(req);
     uv_handle_chan_unregister(ctx->ch);
-    goc_put_cb(ctx->ch, res, NULL, NULL);
+    goc_put_cb(ctx->ch, SCALAR(fd), NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -85,9 +96,7 @@ goc_chan* goc_io_fs_open_ch(const char* path, int flags, int mode)
     ctx->ch = ch;
     int rc = uv_fs_open(g_loop, &ctx->req, path, flags, mode, on_fs_open);
     if (rc < 0) {
-        goc_io_fs_open_t* res = (goc_io_fs_open_t*)goc_malloc(sizeof(goc_io_fs_open_t));
-        res->result = (uv_file)rc;
-        goc_put_cb(ch, res, NULL, NULL);
+        goc_put_cb(ch, SCALAR(rc), NULL, NULL);
         goc_close(ch);
         free(ctx);
         return ch;
@@ -96,11 +105,11 @@ goc_chan* goc_io_fs_open_ch(const char* path, int flags, int mode)
     return ch;
 }
 
-goc_io_fs_open_t* goc_io_fs_open(const char* path, int flags, int mode)
+uv_file goc_io_fs_open(const char* path, int flags, int mode)
 {
     goc_chan*  ch = goc_io_fs_open_ch(path, flags, mode);
     goc_val_t* v  = goc_take(ch);
-    return (goc_io_fs_open_t*)v->val;
+    return (uv_file)(intptr_t)v->val;
 }
 
 /* -------------------------------------------------------------------------
@@ -109,12 +118,11 @@ goc_io_fs_open_t* goc_io_fs_open(const char* path, int flags, int mode)
 
 static void on_fs_close(uv_fs_t* req)
 {
-    goc_fs_ctx_t*   ctx = (goc_fs_ctx_t*)req;
-    goc_io_fs_close_t* res = (goc_io_fs_close_t*)goc_malloc(sizeof(goc_io_fs_close_t));
-    res->result = (int)req->result;
+    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)req;
+    int result = (int)req->result;
     uv_fs_req_cleanup(req);
     uv_handle_chan_unregister(ctx->ch);
-    goc_put_cb(ctx->ch, res, NULL, NULL);
+    goc_put_cb(ctx->ch, SCALAR(result), NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -127,9 +135,7 @@ goc_chan* goc_io_fs_close_ch(uv_file file)
     ctx->ch = ch;
     int rc = uv_fs_close(g_loop, &ctx->req, file, on_fs_close);
     if (rc < 0) {
-        goc_io_fs_close_t* res = (goc_io_fs_close_t*)goc_malloc(sizeof(goc_io_fs_close_t));
-        res->result = rc;
-        goc_put_cb(ch, res, NULL, NULL);
+        goc_put_cb(ch, SCALAR(rc), NULL, NULL);
         goc_close(ch);
         free(ctx);
         return ch;
@@ -138,11 +144,11 @@ goc_chan* goc_io_fs_close_ch(uv_file file)
     return ch;
 }
 
-goc_io_fs_close_t* goc_io_fs_close(uv_file file)
+int goc_io_fs_close(uv_file file)
 {
     goc_chan*  ch = goc_io_fs_close_ch(file);
     goc_val_t* v  = goc_take(ch);
-    return (goc_io_fs_close_t*)v->val;
+    return INT_VAL(v);
 }
 
 /* -------------------------------------------------------------------------
@@ -151,19 +157,18 @@ goc_io_fs_close_t* goc_io_fs_close(uv_file file)
 
 static void on_fs_read(uv_fs_t* req)
 {
-    goc_fs_ctx_t*  ctx = (goc_fs_ctx_t*)req;
-    goc_io_fs_read_t* res = (goc_io_fs_read_t*)goc_malloc(sizeof(goc_io_fs_read_t));
-    res->result = (ssize_t)req->result;
+    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)req;
+    ssize_t result = (ssize_t)req->result;
     uv_fs_req_cleanup(req);
     uv_handle_chan_unregister(ctx->ch);
-    goc_put_cb(ctx->ch, res, NULL, NULL);
+    goc_put_cb(ctx->ch, SCALAR(result), NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
 
 goc_chan* goc_io_fs_read_ch(uv_file file,
-                         const uv_buf_t bufs[], unsigned int nbufs,
-                         int64_t offset)
+                            const uv_buf_t bufs[], unsigned int nbufs,
+                            int64_t offset)
 {
     goc_chan*     ch  = goc_chan_make(1);
     goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)malloc(sizeof(goc_fs_ctx_t));
@@ -172,9 +177,7 @@ goc_chan* goc_io_fs_read_ch(uv_file file,
     int rc = uv_fs_read(g_loop, &ctx->req, file, bufs, nbufs, offset,
                         on_fs_read);
     if (rc < 0) {
-        goc_io_fs_read_t* res = (goc_io_fs_read_t*)goc_malloc(sizeof(goc_io_fs_read_t));
-        res->result = rc;
-        goc_put_cb(ch, res, NULL, NULL);
+        goc_put_cb(ch, SCALAR(rc), NULL, NULL);
         goc_close(ch);
         free(ctx);
         return ch;
@@ -183,13 +186,13 @@ goc_chan* goc_io_fs_read_ch(uv_file file,
     return ch;
 }
 
-goc_io_fs_read_t* goc_io_fs_read(uv_file file,
-                            const uv_buf_t bufs[], unsigned int nbufs,
-                            int64_t offset)
+ssize_t goc_io_fs_read(uv_file file,
+                       const uv_buf_t bufs[], unsigned int nbufs,
+                       int64_t offset)
 {
     goc_chan*  ch = goc_io_fs_read_ch(file, bufs, nbufs, offset);
     goc_val_t* v  = goc_take(ch);
-    return (goc_io_fs_read_t*)v->val;
+    return (ssize_t)(intptr_t)v->val;
 }
 
 /* -------------------------------------------------------------------------
@@ -198,19 +201,18 @@ goc_io_fs_read_t* goc_io_fs_read(uv_file file,
 
 static void on_fs_write(uv_fs_t* req)
 {
-    goc_fs_ctx_t*   ctx = (goc_fs_ctx_t*)req;
-    goc_io_fs_write_t* res = (goc_io_fs_write_t*)goc_malloc(sizeof(goc_io_fs_write_t));
-    res->result = (ssize_t)req->result;
+    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)req;
+    ssize_t result = (ssize_t)req->result;
     uv_fs_req_cleanup(req);
     uv_handle_chan_unregister(ctx->ch);
-    goc_put_cb(ctx->ch, res, NULL, NULL);
+    goc_put_cb(ctx->ch, SCALAR(result), NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
 
 goc_chan* goc_io_fs_write_ch(uv_file file,
-                          const uv_buf_t bufs[], unsigned int nbufs,
-                          int64_t offset)
+                             const uv_buf_t bufs[], unsigned int nbufs,
+                             int64_t offset)
 {
     goc_chan*     ch  = goc_chan_make(1);
     goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)malloc(sizeof(goc_fs_ctx_t));
@@ -219,9 +221,7 @@ goc_chan* goc_io_fs_write_ch(uv_file file,
     int rc = uv_fs_write(g_loop, &ctx->req, file, bufs, nbufs, offset,
                          on_fs_write);
     if (rc < 0) {
-        goc_io_fs_write_t* res = (goc_io_fs_write_t*)goc_malloc(sizeof(goc_io_fs_write_t));
-        res->result = rc;
-        goc_put_cb(ch, res, NULL, NULL);
+        goc_put_cb(ch, SCALAR(rc), NULL, NULL);
         goc_close(ch);
         free(ctx);
         return ch;
@@ -230,13 +230,13 @@ goc_chan* goc_io_fs_write_ch(uv_file file,
     return ch;
 }
 
-goc_io_fs_write_t* goc_io_fs_write(uv_file file,
-                              const uv_buf_t bufs[], unsigned int nbufs,
-                              int64_t offset)
+ssize_t goc_io_fs_write(uv_file file,
+                        const uv_buf_t bufs[], unsigned int nbufs,
+                        int64_t offset)
 {
     goc_chan*  ch = goc_io_fs_write_ch(file, bufs, nbufs, offset);
     goc_val_t* v  = goc_take(ch);
-    return (goc_io_fs_write_t*)v->val;
+    return (ssize_t)(intptr_t)v->val;
 }
 
 /* -------------------------------------------------------------------------
@@ -245,12 +245,11 @@ goc_io_fs_write_t* goc_io_fs_write(uv_file file,
 
 static void on_fs_unlink(uv_fs_t* req)
 {
-    goc_fs_ctx_t*    ctx = (goc_fs_ctx_t*)req;
-    goc_io_fs_unlink_t* res = (goc_io_fs_unlink_t*)goc_malloc(sizeof(goc_io_fs_unlink_t));
-    res->result = (int)req->result;
+    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)req;
+    int result = (int)req->result;
     uv_fs_req_cleanup(req);
     uv_handle_chan_unregister(ctx->ch);
-    goc_put_cb(ctx->ch, res, NULL, NULL);
+    goc_put_cb(ctx->ch, SCALAR(result), NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -263,9 +262,7 @@ goc_chan* goc_io_fs_unlink_ch(const char* path)
     ctx->ch = ch;
     int rc = uv_fs_unlink(g_loop, &ctx->req, path, on_fs_unlink);
     if (rc < 0) {
-        goc_io_fs_unlink_t* res = (goc_io_fs_unlink_t*)goc_malloc(sizeof(goc_io_fs_unlink_t));
-        res->result = rc;
-        goc_put_cb(ch, res, NULL, NULL);
+        goc_put_cb(ch, SCALAR(rc), NULL, NULL);
         goc_close(ch);
         free(ctx);
         return ch;
@@ -274,11 +271,11 @@ goc_chan* goc_io_fs_unlink_ch(const char* path)
     return ch;
 }
 
-goc_io_fs_unlink_t* goc_io_fs_unlink(const char* path)
+int goc_io_fs_unlink(const char* path)
 {
     goc_chan*  ch = goc_io_fs_unlink_ch(path);
     goc_val_t* v  = goc_take(ch);
-    return (goc_io_fs_unlink_t*)v->val;
+    return INT_VAL(v);
 }
 
 /* -------------------------------------------------------------------------
@@ -287,9 +284,9 @@ goc_io_fs_unlink_t* goc_io_fs_unlink(const char* path)
 
 static void on_fs_stat(uv_fs_t* req)
 {
-    goc_fs_ctx_t*  ctx = (goc_fs_ctx_t*)req;
+    goc_fs_ctx_t*     ctx = (goc_fs_ctx_t*)req;
     goc_io_fs_stat_t* res = (goc_io_fs_stat_t*)goc_malloc(sizeof(goc_io_fs_stat_t));
-    res->result = (int)req->result;
+    res->ok = (req->result == 0) ? GOC_OK : GOC_CLOSED;
     if (req->result == 0)
         res->statbuf = req->statbuf;
     uv_fs_req_cleanup(req);
@@ -308,7 +305,7 @@ goc_chan* goc_io_fs_stat_ch(const char* path)
     int rc = uv_fs_stat(g_loop, &ctx->req, path, on_fs_stat);
     if (rc < 0) {
         goc_io_fs_stat_t* res = (goc_io_fs_stat_t*)goc_malloc(sizeof(goc_io_fs_stat_t));
-        res->result = rc;
+        res->ok = GOC_CLOSED;
         goc_put_cb(ch, res, NULL, NULL);
         goc_close(ch);
         free(ctx);
@@ -331,12 +328,11 @@ goc_io_fs_stat_t* goc_io_fs_stat(const char* path)
 
 static void on_fs_rename(uv_fs_t* req)
 {
-    goc_fs_ctx_t*    ctx = (goc_fs_ctx_t*)req;
-    goc_io_fs_rename_t* res = (goc_io_fs_rename_t*)goc_malloc(sizeof(goc_io_fs_rename_t));
-    res->result = (int)req->result;
+    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)req;
+    int result = (int)req->result;
     uv_fs_req_cleanup(req);
     uv_handle_chan_unregister(ctx->ch);
-    goc_put_cb(ctx->ch, res, NULL, NULL);
+    goc_put_cb(ctx->ch, SCALAR(result), NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -349,9 +345,7 @@ goc_chan* goc_io_fs_rename_ch(const char* path, const char* new_path)
     ctx->ch = ch;
     int rc = uv_fs_rename(g_loop, &ctx->req, path, new_path, on_fs_rename);
     if (rc < 0) {
-        goc_io_fs_rename_t* res = (goc_io_fs_rename_t*)goc_malloc(sizeof(goc_io_fs_rename_t));
-        res->result = rc;
-        goc_put_cb(ch, res, NULL, NULL);
+        goc_put_cb(ch, SCALAR(rc), NULL, NULL);
         goc_close(ch);
         free(ctx);
         return ch;
@@ -360,11 +354,11 @@ goc_chan* goc_io_fs_rename_ch(const char* path, const char* new_path)
     return ch;
 }
 
-goc_io_fs_rename_t* goc_io_fs_rename(const char* path, const char* new_path)
+int goc_io_fs_rename(const char* path, const char* new_path)
 {
     goc_chan*  ch = goc_io_fs_rename_ch(path, new_path);
     goc_val_t* v  = goc_take(ch);
-    return (goc_io_fs_rename_t*)v->val;
+    return INT_VAL(v);
 }
 
 /* -------------------------------------------------------------------------
@@ -373,18 +367,17 @@ goc_io_fs_rename_t* goc_io_fs_rename(const char* path, const char* new_path)
 
 static void on_fs_sendfile(uv_fs_t* req)
 {
-    goc_fs_ctx_t*      ctx = (goc_fs_ctx_t*)req;
-    goc_io_fs_sendfile_t* res = (goc_io_fs_sendfile_t*)goc_malloc(sizeof(goc_io_fs_sendfile_t));
-    res->result = (ssize_t)req->result;
+    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)req;
+    ssize_t result = (ssize_t)req->result;
     uv_fs_req_cleanup(req);
     uv_handle_chan_unregister(ctx->ch);
-    goc_put_cb(ctx->ch, res, NULL, NULL);
+    goc_put_cb(ctx->ch, SCALAR(result), NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
 
 goc_chan* goc_io_fs_sendfile_ch(uv_file out_fd, uv_file in_fd,
-                             int64_t in_offset, size_t length)
+                                int64_t in_offset, size_t length)
 {
     goc_chan*     ch  = goc_chan_make(1);
     goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)malloc(sizeof(goc_fs_ctx_t));
@@ -393,9 +386,7 @@ goc_chan* goc_io_fs_sendfile_ch(uv_file out_fd, uv_file in_fd,
     int rc = uv_fs_sendfile(g_loop, &ctx->req, out_fd, in_fd, in_offset,
                             length, on_fs_sendfile);
     if (rc < 0) {
-        goc_io_fs_sendfile_t* res = (goc_io_fs_sendfile_t*)goc_malloc(sizeof(goc_io_fs_sendfile_t));
-        res->result = rc;
-        goc_put_cb(ch, res, NULL, NULL);
+        goc_put_cb(ch, SCALAR(rc), NULL, NULL);
         goc_close(ch);
         free(ctx);
         return ch;
@@ -404,12 +395,12 @@ goc_chan* goc_io_fs_sendfile_ch(uv_file out_fd, uv_file in_fd,
     return ch;
 }
 
-goc_io_fs_sendfile_t* goc_io_fs_sendfile(uv_file out_fd, uv_file in_fd,
-                                   int64_t in_offset, size_t length)
+ssize_t goc_io_fs_sendfile(uv_file out_fd, uv_file in_fd,
+                           int64_t in_offset, size_t length)
 {
     goc_chan*  ch = goc_io_fs_sendfile_ch(out_fd, in_fd, in_offset, length);
     goc_val_t* v  = goc_take(ch);
-    return (goc_io_fs_sendfile_t*)v->val;
+    return (ssize_t)(intptr_t)v->val;
 }
 
 /* =========================================================================
@@ -431,10 +422,10 @@ static void on_getaddrinfo(uv_getaddrinfo_t* req, int status,
                            struct addrinfo* res)
 {
     goc_getaddrinfo_ctx_t* ctx = (goc_getaddrinfo_ctx_t*)req;
-    goc_io_getaddrinfo_t*     r   = (goc_io_getaddrinfo_t*)goc_malloc(
+    goc_io_getaddrinfo_t*  r   = (goc_io_getaddrinfo_t*)goc_malloc(
                                      sizeof(goc_io_getaddrinfo_t));
-    r->status = status;
-    r->res    = res;   /* caller must call uv_freeaddrinfo(r->res) */
+    r->ok  = (status == 0) ? GOC_OK : GOC_CLOSED;
+    r->res = res;
     uv_handle_chan_unregister(ctx->ch);
     goc_put_cb(ctx->ch, r, NULL, NULL);
     goc_close(ctx->ch);
@@ -442,7 +433,7 @@ static void on_getaddrinfo(uv_getaddrinfo_t* req, int status,
 }
 
 goc_chan* goc_io_getaddrinfo_ch(const char* node, const char* service,
-                             const struct addrinfo* hints)
+                                const struct addrinfo* hints)
 {
     goc_chan*              ch  = goc_chan_make(1);
     goc_getaddrinfo_ctx_t* ctx = (goc_getaddrinfo_ctx_t*)malloc(
@@ -454,8 +445,8 @@ goc_chan* goc_io_getaddrinfo_ch(const char* node, const char* service,
     if (rc < 0) {
         goc_io_getaddrinfo_t* r = (goc_io_getaddrinfo_t*)goc_malloc(
                                    sizeof(goc_io_getaddrinfo_t));
-        r->status = rc;
-        r->res    = NULL;
+        r->ok  = GOC_CLOSED;
+        r->res = NULL;
         goc_put_cb(ch, r, NULL, NULL);
         goc_close(ch);
         free(ctx);
@@ -466,7 +457,7 @@ goc_chan* goc_io_getaddrinfo_ch(const char* node, const char* service,
 }
 
 goc_io_getaddrinfo_t* goc_io_getaddrinfo(const char* node, const char* service,
-                                   const struct addrinfo* hints)
+                                         const struct addrinfo* hints)
 {
     goc_chan*  ch = goc_io_getaddrinfo_ch(node, service, hints);
     goc_val_t* v  = goc_take(ch);
@@ -486,9 +477,9 @@ static void on_getnameinfo(uv_getnameinfo_t* req, int status,
                            const char* hostname, const char* service)
 {
     goc_getnameinfo_ctx_t* ctx = (goc_getnameinfo_ctx_t*)req;
-    goc_io_getnameinfo_t*     r   = (goc_io_getnameinfo_t*)goc_malloc(
+    goc_io_getnameinfo_t*  r   = (goc_io_getnameinfo_t*)goc_malloc(
                                      sizeof(goc_io_getnameinfo_t));
-    r->status = status;
+    r->ok = (status == 0) ? GOC_OK : GOC_CLOSED;
     if (hostname)
         strncpy(r->hostname, hostname, sizeof(r->hostname) - 1);
     else
@@ -516,7 +507,7 @@ goc_chan* goc_io_getnameinfo_ch(const struct sockaddr* addr, int flags)
     if (rc < 0) {
         goc_io_getnameinfo_t* r = (goc_io_getnameinfo_t*)goc_malloc(
                                    sizeof(goc_io_getnameinfo_t));
-        r->status    = rc;
+        r->ok         = GOC_CLOSED;
         r->hostname[0] = '\0';
         r->service[0]  = '\0';
         goc_put_cb(ch, r, NULL, NULL);
@@ -548,6 +539,13 @@ goc_io_getnameinfo_t* goc_io_getnameinfo(const struct sockaddr* addr, int flags)
 
 /* -------------------------------------------------------------------------
  * Common alloc callback used by both stream read and UDP recv.
+ *
+ * malloc is used here (not goc_malloc) because libuv writes into buf->base
+ * and holds a reference to it until the read/recv callback fires.  Since
+ * libuv's internal state is not GC-visible, using goc_malloc would risk
+ * premature collection of the buffer between alloc and the data callback.
+ * The buffer is copied into a GC-managed uv_buf_t inside on_read_cb and
+ * on_udp_recv_cb, and the malloc'd original is freed there.
  * ---------------------------------------------------------------------- */
 
 static void goc_alloc_cb(uv_handle_t* handle, size_t suggested_size,
@@ -577,27 +575,30 @@ static void on_read_cb(uv_stream_t* stream, ssize_t nread,
         return;
     }
 
-    if (nread < 0) {
-        /* EOF or error: deliver a final result with the error code, then
-         * close the channel and free the context. */
+    goc_io_read_t* res = (goc_io_read_t*)goc_malloc(sizeof(goc_io_read_t));
+    res->nread = nread;
+
+    if (nread > 0) {
+        /* Normal data: copy into GC-managed buffer and free the malloc'd one. */
+        uv_buf_t* gc_buf = (uv_buf_t*)goc_malloc(sizeof(uv_buf_t));
+        gc_buf->base = (char*)goc_malloc((size_t)nread);
+        gc_buf->len  = (size_t)nread;
+        memcpy(gc_buf->base, buf->base, (size_t)nread);
         free(buf->base);
-        goc_io_read_t* res = (goc_io_read_t*)goc_malloc(sizeof(goc_io_read_t));
-        res->nread    = nread;
-        res->buf.base = NULL;
-        res->buf.len  = 0;
-        uv_handle_chan_unregister(ctx->ch);
+        res->buf = gc_buf;
         goc_put_cb(ctx->ch, res, NULL, NULL);
-        goc_close(ctx->ch);
-        free(ctx);
-        stream->data = NULL;
         return;
     }
 
-    /* Normal data: wrap and deliver.  buf.base ownership transfers to res. */
-    goc_io_read_t* res = (goc_io_read_t*)goc_malloc(sizeof(goc_io_read_t));
-    res->nread = nread;
-    res->buf   = *buf;
+    /* nread < 0: EOF or error.  Free the unused malloc'd buffer, deliver
+     * final result, close channel. */
+    free(buf->base);
+    res->buf = NULL;
+    uv_handle_chan_unregister(ctx->ch);
     goc_put_cb(ctx->ch, res, NULL, NULL);
+    goc_close(ctx->ch);
+    free(ctx);
+    stream->data = NULL;
 }
 
 typedef struct {
@@ -619,9 +620,8 @@ static void on_read_start_dispatch(uv_async_t* h)
     if (rc < 0) {
         /* Failed to start: deliver error and close channel. */
         goc_io_read_t* res = (goc_io_read_t*)goc_malloc(sizeof(goc_io_read_t));
-        res->nread    = rc;
-        res->buf.base = NULL;
-        res->buf.len  = 0;
+        res->nread = rc;
+        res->buf   = NULL;
         uv_handle_chan_unregister(d->ch);
         goc_put_cb(d->ch, res, NULL, NULL);
         goc_close(d->ch);
@@ -695,10 +695,8 @@ typedef struct {
 static void on_write_cb(uv_write_t* req, int status)
 {
     goc_write_ctx_t* ctx = (goc_write_ctx_t*)req;
-    goc_io_write_t*     res = (goc_io_write_t*)goc_malloc(sizeof(goc_io_write_t));
-    res->status = status;
     uv_handle_chan_unregister(ctx->ch);
-    goc_put_cb(ctx->ch, res, NULL, NULL);
+    goc_put_cb(ctx->ch, SCALAR(status), NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -719,10 +717,8 @@ static void on_write_dispatch(uv_async_t* h)
     ctx->ch = d->ch;
     int rc = uv_write(&ctx->req, d->handle, d->bufs, d->nbufs, on_write_cb);
     if (rc < 0) {
-        goc_io_write_t* res = (goc_io_write_t*)goc_malloc(sizeof(goc_io_write_t));
-        res->status = rc;
         uv_handle_chan_unregister(ctx->ch);
-        goc_put_cb(ctx->ch, res, NULL, NULL);
+        goc_put_cb(ctx->ch, SCALAR(rc), NULL, NULL);
         goc_close(ctx->ch);
         free(ctx);
     }
@@ -730,7 +726,7 @@ static void on_write_dispatch(uv_async_t* h)
 }
 
 goc_chan* goc_io_write_ch(uv_stream_t* handle,
-                       const uv_buf_t bufs[], unsigned int nbufs)
+                          const uv_buf_t bufs[], unsigned int nbufs)
 {
     goc_chan*             ch = goc_chan_make(1);
     goc_write_dispatch_t* d  = (goc_write_dispatch_t*)malloc(
@@ -746,12 +742,12 @@ goc_chan* goc_io_write_ch(uv_stream_t* handle,
     return ch;
 }
 
-goc_io_write_t* goc_io_write(uv_stream_t* handle,
-                        const uv_buf_t bufs[], unsigned int nbufs)
+int goc_io_write(uv_stream_t* handle,
+                 const uv_buf_t bufs[], unsigned int nbufs)
 {
     goc_chan*  ch = goc_io_write_ch(handle, bufs, nbufs);
     goc_val_t* v  = goc_take(ch);
-    return (goc_io_write_t*)v->val;
+    return INT_VAL(v);
 }
 
 /* -------------------------------------------------------------------------
@@ -767,10 +763,8 @@ typedef struct {
 static void on_write2_cb(uv_write_t* req, int status)
 {
     goc_write2_ctx_t* ctx = (goc_write2_ctx_t*)req;
-    goc_io_write_t*      res = (goc_io_write_t*)goc_malloc(sizeof(goc_io_write_t));
-    res->status = status;
     uv_handle_chan_unregister(ctx->ch);
-    goc_put_cb(ctx->ch, res, NULL, NULL);
+    goc_put_cb(ctx->ch, SCALAR(status), NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -794,10 +788,8 @@ static void on_write2_dispatch(uv_async_t* h)
     int rc = uv_write2(&ctx->req, d->handle, d->bufs, d->nbufs,
                        d->send_handle, on_write2_cb);
     if (rc < 0) {
-        goc_io_write_t* res = (goc_io_write_t*)goc_malloc(sizeof(goc_io_write_t));
-        res->status = rc;
         uv_handle_chan_unregister(ctx->ch);
-        goc_put_cb(ctx->ch, res, NULL, NULL);
+        goc_put_cb(ctx->ch, SCALAR(rc), NULL, NULL);
         goc_close(ctx->ch);
         free(ctx);
     }
@@ -805,8 +797,8 @@ static void on_write2_dispatch(uv_async_t* h)
 }
 
 goc_chan* goc_io_write2_ch(uv_stream_t* handle,
-                        const uv_buf_t bufs[], unsigned int nbufs,
-                        uv_stream_t* send_handle)
+                           const uv_buf_t bufs[], unsigned int nbufs,
+                           uv_stream_t* send_handle)
 {
     goc_chan*              ch = goc_chan_make(1);
     goc_write2_dispatch_t* d  = (goc_write2_dispatch_t*)malloc(
@@ -823,13 +815,13 @@ goc_chan* goc_io_write2_ch(uv_stream_t* handle,
     return ch;
 }
 
-goc_io_write_t* goc_io_write2(uv_stream_t* handle,
-                         const uv_buf_t bufs[], unsigned int nbufs,
-                         uv_stream_t* send_handle)
+int goc_io_write2(uv_stream_t* handle,
+                  const uv_buf_t bufs[], unsigned int nbufs,
+                  uv_stream_t* send_handle)
 {
     goc_chan*  ch = goc_io_write2_ch(handle, bufs, nbufs, send_handle);
     goc_val_t* v  = goc_take(ch);
-    return (goc_io_write_t*)v->val;
+    return INT_VAL(v);
 }
 
 /* -------------------------------------------------------------------------
@@ -844,10 +836,8 @@ typedef struct {
 static void on_shutdown_cb(uv_shutdown_t* req, int status)
 {
     goc_shutdown_ctx_t* ctx = (goc_shutdown_ctx_t*)req;
-    goc_io_shutdown_t*     res = (goc_io_shutdown_t*)goc_malloc(sizeof(goc_io_shutdown_t));
-    res->status = status;
     uv_handle_chan_unregister(ctx->ch);
-    goc_put_cb(ctx->ch, res, NULL, NULL);
+    goc_put_cb(ctx->ch, SCALAR(status), NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -867,10 +857,8 @@ static void on_shutdown_dispatch(uv_async_t* h)
     ctx->ch = d->ch;
     int rc = uv_shutdown(&ctx->req, d->handle, on_shutdown_cb);
     if (rc < 0) {
-        goc_io_shutdown_t* res = (goc_io_shutdown_t*)goc_malloc(sizeof(goc_io_shutdown_t));
-        res->status = rc;
         uv_handle_chan_unregister(ctx->ch);
-        goc_put_cb(ctx->ch, res, NULL, NULL);
+        goc_put_cb(ctx->ch, SCALAR(rc), NULL, NULL);
         goc_close(ctx->ch);
         free(ctx);
     }
@@ -891,11 +879,11 @@ goc_chan* goc_io_shutdown_stream_ch(uv_stream_t* handle)
     return ch;
 }
 
-goc_io_shutdown_t* goc_io_shutdown_stream(uv_stream_t* handle)
+int goc_io_shutdown_stream(uv_stream_t* handle)
 {
     goc_chan*  ch = goc_io_shutdown_stream_ch(handle);
     goc_val_t* v  = goc_take(ch);
-    return (goc_io_shutdown_t*)v->val;
+    return INT_VAL(v);
 }
 
 /* -------------------------------------------------------------------------
@@ -910,10 +898,8 @@ typedef struct {
 static void on_connect_cb(uv_connect_t* req, int status)
 {
     goc_connect_ctx_t* ctx = (goc_connect_ctx_t*)req;
-    goc_io_connect_t*     res = (goc_io_connect_t*)goc_malloc(sizeof(goc_io_connect_t));
-    res->status = status;
     uv_handle_chan_unregister(ctx->ch);
-    goc_put_cb(ctx->ch, res, NULL, NULL);
+    goc_put_cb(ctx->ch, SCALAR(status), NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -936,10 +922,8 @@ static void on_tcp_connect_dispatch(uv_async_t* h)
                             (const struct sockaddr*)&d->addr,
                             on_connect_cb);
     if (rc < 0) {
-        goc_io_connect_t* res = (goc_io_connect_t*)goc_malloc(sizeof(goc_io_connect_t));
-        res->status = rc;
         uv_handle_chan_unregister(ctx->ch);
-        goc_put_cb(ctx->ch, res, NULL, NULL);
+        goc_put_cb(ctx->ch, SCALAR(rc), NULL, NULL);
         goc_close(ctx->ch);
         free(ctx);
     }
@@ -967,11 +951,11 @@ goc_chan* goc_io_tcp_connect_ch(uv_tcp_t* handle, const struct sockaddr* addr)
     return ch;
 }
 
-goc_io_connect_t* goc_io_tcp_connect(uv_tcp_t* handle, const struct sockaddr* addr)
+int goc_io_tcp_connect(uv_tcp_t* handle, const struct sockaddr* addr)
 {
     goc_chan*  ch = goc_io_tcp_connect_ch(handle, addr);
     goc_val_t* v  = goc_take(ch);
-    return (goc_io_connect_t*)v->val;
+    return INT_VAL(v);
 }
 
 /* -------------------------------------------------------------------------
@@ -1015,11 +999,11 @@ goc_chan* goc_io_pipe_connect_ch(uv_pipe_t* handle, const char* name)
     return ch;
 }
 
-goc_io_connect_t* goc_io_pipe_connect(uv_pipe_t* handle, const char* name)
+int goc_io_pipe_connect(uv_pipe_t* handle, const char* name)
 {
     goc_chan*  ch = goc_io_pipe_connect_ch(handle, name);
     goc_val_t* v  = goc_take(ch);
-    return (goc_io_connect_t*)v->val;
+    return INT_VAL(v);
 }
 
 /* =========================================================================
@@ -1038,10 +1022,8 @@ typedef struct {
 static void on_udp_send_cb(uv_udp_send_t* req, int status)
 {
     goc_udp_send_ctx_t* ctx = (goc_udp_send_ctx_t*)req;
-    goc_io_udp_send_t*     res = (goc_io_udp_send_t*)goc_malloc(sizeof(goc_io_udp_send_t));
-    res->status = status;
     uv_handle_chan_unregister(ctx->ch);
-    goc_put_cb(ctx->ch, res, NULL, NULL);
+    goc_put_cb(ctx->ch, SCALAR(status), NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -1065,10 +1047,8 @@ static void on_udp_send_dispatch(uv_async_t* h)
     int rc = uv_udp_send(&ctx->req, d->handle, d->bufs, d->nbufs,
                          (const struct sockaddr*)&d->addr, on_udp_send_cb);
     if (rc < 0) {
-        goc_io_udp_send_t* res = (goc_io_udp_send_t*)goc_malloc(sizeof(goc_io_udp_send_t));
-        res->status = rc;
         uv_handle_chan_unregister(ctx->ch);
-        goc_put_cb(ctx->ch, res, NULL, NULL);
+        goc_put_cb(ctx->ch, SCALAR(rc), NULL, NULL);
         goc_close(ctx->ch);
         free(ctx);
     }
@@ -1076,8 +1056,8 @@ static void on_udp_send_dispatch(uv_async_t* h)
 }
 
 goc_chan* goc_io_udp_send_ch(uv_udp_t* handle,
-                          const uv_buf_t bufs[], unsigned int nbufs,
-                          const struct sockaddr* addr)
+                             const uv_buf_t bufs[], unsigned int nbufs,
+                             const struct sockaddr* addr)
 {
     goc_chan*                ch = goc_chan_make(1);
     goc_udp_send_dispatch_t* d  = (goc_udp_send_dispatch_t*)malloc(
@@ -1097,13 +1077,13 @@ goc_chan* goc_io_udp_send_ch(uv_udp_t* handle,
     return ch;
 }
 
-goc_io_udp_send_t* goc_io_udp_send(uv_udp_t* handle,
-                              const uv_buf_t bufs[], unsigned int nbufs,
-                              const struct sockaddr* addr)
+int goc_io_udp_send(uv_udp_t* handle,
+                    const uv_buf_t bufs[], unsigned int nbufs,
+                    const struct sockaddr* addr)
 {
     goc_chan*  ch = goc_io_udp_send_ch(handle, bufs, nbufs, addr);
     goc_val_t* v  = goc_take(ch);
-    return (goc_io_udp_send_t*)v->val;
+    return INT_VAL(v);
 }
 
 /* -------------------------------------------------------------------------
@@ -1126,36 +1106,43 @@ static void on_udp_recv_cb(uv_udp_t* handle, ssize_t nread,
         return;
     }
 
-    if (nread < 0) {
-        /* Error: deliver final result with error code and close channel. */
+    goc_io_udp_recv_t* res = (goc_io_udp_recv_t*)goc_malloc(sizeof(goc_io_udp_recv_t));
+    res->nread = nread;
+
+    if (nread > 0) {
+        /* Normal datagram: copy into GC-managed buffer and addr. */
+        uv_buf_t* gc_buf = (uv_buf_t*)goc_malloc(sizeof(uv_buf_t));
+        gc_buf->base = (char*)goc_malloc((size_t)nread);
+        gc_buf->len  = (size_t)nread;
+        memcpy(gc_buf->base, buf->base, (size_t)nread);
         free(buf->base);
-        goc_io_udp_recv_t* res = (goc_io_udp_recv_t*)goc_malloc(sizeof(goc_io_udp_recv_t));
-        res->nread    = nread;
-        res->buf.base = NULL;
-        res->buf.len  = 0;
-        memset(&res->addr, 0, sizeof(res->addr));
-        res->flags    = 0;
-        uv_handle_chan_unregister(ctx->ch);
+        res->buf = gc_buf;
+
+        if (addr) {
+            size_t addr_size = (addr->sa_family == AF_INET6)
+                             ? sizeof(struct sockaddr_in6)
+                             : sizeof(struct sockaddr_in);
+            struct sockaddr* gc_addr = (struct sockaddr*)goc_malloc(addr_size);
+            memcpy(gc_addr, addr, addr_size);
+            res->addr = gc_addr;
+        } else {
+            res->addr = NULL;
+        }
+        res->flags = flags;
         goc_put_cb(ctx->ch, res, NULL, NULL);
-        goc_close(ctx->ch);
-        free(ctx);
-        handle->data = NULL;
         return;
     }
 
-    /* Normal datagram: wrap and deliver. */
-    goc_io_udp_recv_t* res = (goc_io_udp_recv_t*)goc_malloc(sizeof(goc_io_udp_recv_t));
-    res->nread = nread;
-    res->buf   = *buf;
-    if (addr)
-        memcpy(&res->addr, addr,
-               addr->sa_family == AF_INET6
-                   ? sizeof(struct sockaddr_in6)
-                   : sizeof(struct sockaddr_in));
-    else
-        memset(&res->addr, 0, sizeof(res->addr));
-    res->flags = flags;
+    /* nread < 0: Error. */
+    free(buf->base);
+    res->buf  = NULL;
+    res->addr = NULL;
+    res->flags = 0;
+    uv_handle_chan_unregister(ctx->ch);
     goc_put_cb(ctx->ch, res, NULL, NULL);
+    goc_close(ctx->ch);
+    free(ctx);
+    handle->data = NULL;
 }
 
 typedef struct {
@@ -1177,11 +1164,10 @@ static void on_udp_recv_start_dispatch(uv_async_t* h)
     int rc = uv_udp_recv_start(d->handle, goc_alloc_cb, on_udp_recv_cb);
     if (rc < 0) {
         goc_io_udp_recv_t* res = (goc_io_udp_recv_t*)goc_malloc(sizeof(goc_io_udp_recv_t));
-        res->nread    = rc;
-        res->buf.base = NULL;
-        res->buf.len  = 0;
-        memset(&res->addr, 0, sizeof(res->addr));
-        res->flags    = 0;
+        res->nread = rc;
+        res->buf   = NULL;
+        res->addr  = NULL;
+        res->flags = 0;
         uv_handle_chan_unregister(d->ch);
         goc_put_cb(d->ch, res, NULL, NULL);
         goc_close(d->ch);

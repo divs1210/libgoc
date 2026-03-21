@@ -9,44 +9,46 @@
  * Each libuv operation is exposed in two forms:
  *
  *   goc_io_XXX_ch(...)  → goc_chan*
- *       Initiates the async I/O and returns a channel that delivers a single
- *       goc_io_XXX_t* result when the operation completes.  The channel is
- *       closed immediately after the result is delivered.  This form is safe
- *       to call from both fiber context and OS thread context, and is
- *       compatible with goc_alts() for select-style multiplexing across I/O
- *       operations.
+ *       Initiates the async I/O and returns a channel that delivers the
+ *       result when the operation completes.  For operations that return a
+ *       composite result (goc_io_read_t*, goc_io_fs_stat_t*, etc.) the
+ *       channel delivers a GC-managed pointer.  For operations whose only
+ *       result is a scalar (status code, byte count, file descriptor), the
+ *       channel delivers the scalar encoded as (void*)(intptr_t)value.
+ *       The channel is closed immediately after delivery.
+ *       Safe to call from both fiber context and OS thread context, and is
+ *       compatible with goc_alts() for select-style multiplexing.
  *
- *   goc_io_XXX(...)  → goc_io_XXX_t*
+ *   goc_io_XXX(...)  → scalar or struct*
  *       Convenience wrapper: calls goc_io_XXX_ch() then goc_take() and
- *       returns the unwrapped result.  Must only be called from fiber context
- *       (i.e. goc_in_fiber() == true).
+ *       returns the unwrapped result.  Must only be called from fiber
+ *       context (i.e. goc_in_fiber() == true).
  *
  * Streaming operations (uv_read_start, uv_udp_recv_start) are inherently
- * multi-shot and return only the channel form; a matching stop function is
+ * multi-shot and expose only the channel form; a matching stop function is
  * provided to close the channel and halt I/O.
  *
  * Thread safety
  * -------------
  * File-system (uv_fs_*) and DNS (uv_getaddrinfo, uv_getnameinfo) operations
- * are safe to initiate from any thread; libuv routes them through its internal
- * worker-thread pool and fires the callback on the event loop.
+ * are safe to initiate from any thread; libuv routes them through its
+ * internal worker-thread pool and fires the callback on the event loop.
  *
  * Stream and UDP operations (uv_write, uv_read_start, etc.) require the
- * libuv handle to be used from the event loop thread.  The *_ch wrappers use
- * a uv_async_t bridge so they can be called safely from fiber or OS-thread
- * context.  The caller is responsible for initialising and configuring the
- * handle (uv_tcp_init, uv_tcp_bind, etc.) on the event loop thread before
- * passing it to these wrappers.
+ * libuv handle to be used from the event loop thread.  The *_ch wrappers
+ * use a uv_async_t bridge so they can be called safely from fiber or
+ * OS-thread context.  The caller is responsible for initialising and
+ * configuring the handle (uv_tcp_init, uv_tcp_bind, etc.) on the event
+ * loop thread before passing it to these wrappers.
  *
- * Buffer lifetime
- * ---------------
- * For write / send operations the caller must keep the uv_buf_t array and
- * all buf.base pointers valid until the result channel delivers its value
- * (i.e. the operation has completed).  This matches the libuv contract.
+ * Buffer / result lifetime
+ * ------------------------
+ * All composite result structs (goc_io_read_t*, goc_io_fs_stat_t*, etc.)
+ * are allocated on the GC heap.  The caller does not need to free them;
+ * Boehm GC reclaims them automatically once they become unreachable.
  *
- * For read / recv operations each delivered goc_io_read_t or goc_io_udp_recv_t
- * carries a malloc-allocated buf.base that is owned by the caller; the
- * caller must free(result->buf.base) after consuming the data.
+ * Embedded pointer fields (buf, addr) inside result structs are likewise
+ * GC-managed.  libgoc does not free them; nor is the caller required to.
  *
  * Compile requirements: -std=c11
  *   Include this header explicitly: #include "goc_io.h"
@@ -77,73 +79,41 @@ extern "C" {
 /**
  * goc_io_read_t — result of one read callback fired by goc_io_read_start.
  *
- * nread : bytes read (>= 0).  On error this is a negative libuv error code.
- * buf   : buffer containing the data.  buf.base is malloc-allocated and
- *         owned by the caller; call free(buf.base) after use.
+ * nread : bytes read (> 0) on a data event.  On error this is a negative
+ *         libuv error code.
+ * buf   : GC-managed buffer containing the data.  Valid when nread > 0;
+ *         NULL when nread <= 0.  libgoc does not free buf.
  *
  * When nread < 0 the channel is already closed; this is the last value.
  */
 typedef struct {
-    ssize_t  nread;
-    uv_buf_t buf;
+    ssize_t   nread;
+    uv_buf_t* buf;
 } goc_io_read_t;
-
-/**
- * goc_io_write_t — result of goc_io_write / goc_io_write2.
- *
- * status : 0 on success, a negative libuv error code on failure.
- */
-typedef struct {
-    int status;
-} goc_io_write_t;
-
-/**
- * goc_io_shutdown_t — result of goc_io_shutdown_stream.
- *
- * status : 0 on success, a negative libuv error code on failure.
- */
-typedef struct {
-    int status;
-} goc_io_shutdown_t;
-
-/**
- * goc_io_connect_t — result of goc_io_tcp_connect / goc_io_pipe_connect.
- *
- * status : 0 on success, a negative libuv error code on failure.
- */
-typedef struct {
-    int status;
-} goc_io_connect_t;
 
 /* -------------------------------------------------------------------------
  * UDP
  * ---------------------------------------------------------------------- */
 
 /**
- * goc_io_udp_send_t — result of goc_io_udp_send.
+ * goc_io_udp_recv_t — result of one receive callback fired by
+ * goc_io_udp_recv_start.
  *
- * status : 0 on success, a negative libuv error code on failure.
- */
-typedef struct {
-    int status;
-} goc_io_udp_send_t;
-
-/**
- * goc_io_udp_recv_t — result of one receive callback fired by goc_io_udp_recv_start.
- *
- * nread : bytes received (>= 0).  On error this is a negative libuv error code.
- * buf   : buffer containing the datagram data.  buf.base is malloc-allocated
- *         and owned by the caller; call free(buf.base) after use.
- * addr  : source address of the datagram (copied; always valid).
+ * nread : bytes received (> 0) on a datagram event.  On error this is a
+ *         negative libuv error code.
+ * buf   : GC-managed buffer containing the datagram data.  Valid when
+ *         nread > 0; NULL otherwise.  libgoc does not free buf.
+ * addr  : GC-managed copy of the source address.  NULL when nread <= 0 or
+ *         no address was provided.  libgoc does not free addr.
  * flags : libuv-defined receive flags.
  *
  * When nread < 0 the channel is already closed; this is the last value.
  */
 typedef struct {
-    ssize_t                nread;
-    uv_buf_t               buf;
-    struct sockaddr_storage addr;
-    unsigned               flags;
+    ssize_t          nread;
+    uv_buf_t*        buf;
+    struct sockaddr* addr;
+    unsigned         flags;
 } goc_io_udp_recv_t;
 
 /* -------------------------------------------------------------------------
@@ -151,82 +121,15 @@ typedef struct {
  * ---------------------------------------------------------------------- */
 
 /**
- * goc_io_fs_open_t — result of goc_io_fs_open.
- *
- * result : file descriptor (>= 0) on success, a negative libuv error code
- *          on failure.
- */
-typedef struct {
-    uv_file result;
-} goc_io_fs_open_t;
-
-/**
- * goc_io_fs_close_t — result of goc_io_fs_close.
- *
- * result : 0 on success, a negative libuv error code on failure.
- */
-typedef struct {
-    int result;
-} goc_io_fs_close_t;
-
-/**
- * goc_io_fs_read_t — result of goc_io_fs_read.
- *
- * result : bytes read (>= 0) on success, a negative libuv error code on
- *          failure.
- */
-typedef struct {
-    ssize_t result;
-} goc_io_fs_read_t;
-
-/**
- * goc_io_fs_write_t — result of goc_io_fs_write.
- *
- * result : bytes written (>= 0) on success, a negative libuv error code on
- *          failure.
- */
-typedef struct {
-    ssize_t result;
-} goc_io_fs_write_t;
-
-/**
- * goc_io_fs_unlink_t — result of goc_io_fs_unlink.
- *
- * result : 0 on success, a negative libuv error code on failure.
- */
-typedef struct {
-    int result;
-} goc_io_fs_unlink_t;
-
-/**
  * goc_io_fs_stat_t — result of goc_io_fs_stat.
  *
- * result  : 0 on success, a negative libuv error code on failure.
- * statbuf : populated when result == 0.
+ * ok      : GOC_OK on success, GOC_CLOSED on failure.
+ * statbuf : populated when ok == GOC_OK.
  */
 typedef struct {
-    int       result;
-    uv_stat_t statbuf;
+    goc_status_t ok;
+    uv_stat_t    statbuf;
 } goc_io_fs_stat_t;
-
-/**
- * goc_io_fs_rename_t — result of goc_io_fs_rename.
- *
- * result : 0 on success, a negative libuv error code on failure.
- */
-typedef struct {
-    int result;
-} goc_io_fs_rename_t;
-
-/**
- * goc_io_fs_sendfile_t — result of goc_io_fs_sendfile.
- *
- * result : bytes sent (>= 0) on success, a negative libuv error code on
- *          failure.
- */
-typedef struct {
-    ssize_t result;
-} goc_io_fs_sendfile_t;
 
 /* -------------------------------------------------------------------------
  * DNS & resolution
@@ -235,27 +138,27 @@ typedef struct {
 /**
  * goc_io_getaddrinfo_t — result of goc_io_getaddrinfo.
  *
- * status : 0 on success, a negative libuv / EAI error code on failure.
- * res    : linked list of addrinfo results allocated by libuv.  The caller
- *          must release it with uv_freeaddrinfo(res) when done.
- *          NULL when status != 0.
+ * ok  : GOC_OK on success, GOC_CLOSED on failure.
+ * res : linked list of addrinfo results allocated by libuv.  The caller
+ *       must release it with uv_freeaddrinfo(res) when done.
+ *       NULL when ok != GOC_OK.
  */
 typedef struct {
-    int              status;
+    goc_status_t     ok;
     struct addrinfo* res;
 } goc_io_getaddrinfo_t;
 
 /**
  * goc_io_getnameinfo_t — result of goc_io_getnameinfo.
  *
- * status   : 0 on success, a negative libuv / EAI error code on failure.
- * hostname : resolved host name (NUL-terminated).  Empty when status != 0.
- * service  : resolved service name (NUL-terminated).  Empty when status != 0.
+ * ok       : GOC_OK on success, GOC_CLOSED on failure.
+ * hostname : resolved host name (NUL-terminated).  Empty when ok != GOC_OK.
+ * service  : resolved service name (NUL-terminated).  Empty when ok != GOC_OK.
  */
 typedef struct {
-    int  status;
-    char hostname[NI_MAXHOST];
-    char service[NI_MAXSERV];
+    goc_status_t ok;
+    char         hostname[NI_MAXHOST];
+    char         service[NI_MAXSERV];
 } goc_io_getnameinfo_t;
 
 /* =========================================================================
@@ -267,12 +170,13 @@ typedef struct {
  *
  * stream : an initialised and connected libuv stream handle.
  *
- * Returns a channel that delivers goc_io_read_t* values, one per read callback
- * fired by libuv.  The channel is closed when EOF or an unrecoverable error
- * is encountered; the last delivered value carries the error code in nread.
+ * Returns a channel that delivers goc_io_read_t* values, one per read
+ * callback fired by libuv.  The channel is closed when EOF or an
+ * unrecoverable error is encountered; the last delivered value carries the
+ * error code in nread.
  * Call goc_io_read_stop() to stop reading before EOF and close the channel.
  *
- * This function is safe to call from any context (fiber or OS thread).
+ * Safe to call from any context (fiber or OS thread).
  */
 goc_chan* goc_io_read_start(uv_stream_t* stream);
 
@@ -297,54 +201,61 @@ int goc_io_read_stop(uv_stream_t* stream);
  * bufs   : array of nbufs buffers to write.
  * nbufs  : number of buffers.
  *
- * Returns a channel that delivers a single goc_io_write_t* when the write
- * completes.  The channel is closed after delivery.
+ * Returns a channel that delivers (void*)(intptr_t)status when the write
+ * completes; 0 on success, a negative libuv error code on failure.
+ * The channel is closed after delivery.
  *
  * Safe to call from any context.
  */
 goc_chan* goc_io_write_ch(uv_stream_t* handle,
-                       const uv_buf_t bufs[], unsigned int nbufs);
+                          const uv_buf_t bufs[], unsigned int nbufs);
 
 /**
  * goc_io_write() — Async stream write; block until complete (fiber context).
  *
+ * Returns 0 on success, a negative libuv error code on failure.
  * Calls goc_io_write_ch() then goc_take().  Must only be called from fiber
  * context.
- *
- * Returns a GC-managed goc_io_write_t*.
  */
-goc_io_write_t* goc_io_write(uv_stream_t* handle,
-                        const uv_buf_t bufs[], unsigned int nbufs);
+int goc_io_write(uv_stream_t* handle,
+                 const uv_buf_t bufs[], unsigned int nbufs);
 
 /**
  * goc_io_write2_ch() — Initiate an async write with handle passing (IPC).
  *
  * Same as goc_io_write_ch() with an additional send_handle for IPC streams.
+ * Returns a channel delivering (void*)(intptr_t)status on completion.
  */
 goc_chan* goc_io_write2_ch(uv_stream_t* handle,
-                        const uv_buf_t bufs[], unsigned int nbufs,
-                        uv_stream_t* send_handle);
+                           const uv_buf_t bufs[], unsigned int nbufs,
+                           uv_stream_t* send_handle);
 
 /**
  * goc_io_write2() — Async write with handle passing (fiber context).
+ *
+ * Returns 0 on success, a negative libuv error code on failure.
  */
-goc_io_write_t* goc_io_write2(uv_stream_t* handle,
-                         const uv_buf_t bufs[], unsigned int nbufs,
-                         uv_stream_t* send_handle);
+int goc_io_write2(uv_stream_t* handle,
+                  const uv_buf_t bufs[], unsigned int nbufs,
+                  uv_stream_t* send_handle);
 
 /**
- * goc_io_shutdown_stream_ch() — Initiate a stream shutdown; return result channel.
+ * goc_io_shutdown_stream_ch() — Initiate a stream shutdown; return result
+ * channel.
  *
  * handle : stream to shut down (half-close the write side).
  *
- * Returns a channel delivering goc_io_shutdown_t* on completion.
+ * Returns a channel delivering (void*)(intptr_t)status on completion;
+ * 0 on success, a negative libuv error code on failure.
  */
 goc_chan* goc_io_shutdown_stream_ch(uv_stream_t* handle);
 
 /**
  * goc_io_shutdown_stream() — Shutdown a stream; block until complete (fiber).
+ *
+ * Returns 0 on success, a negative libuv error code on failure.
  */
-goc_io_shutdown_t* goc_io_shutdown_stream(uv_stream_t* handle);
+int goc_io_shutdown_stream(uv_stream_t* handle);
 
 /**
  * goc_io_tcp_connect_ch() — Initiate a TCP connection; return result channel.
@@ -352,29 +263,35 @@ goc_io_shutdown_t* goc_io_shutdown_stream(uv_stream_t* handle);
  * handle : an initialised and bound (optional) uv_tcp_t handle.
  * addr   : target address.
  *
- * Returns a channel delivering goc_io_connect_t* on connection completion.
+ * Returns a channel delivering (void*)(intptr_t)status on completion;
+ * 0 on success, a negative libuv error code on failure.
  */
 goc_chan* goc_io_tcp_connect_ch(uv_tcp_t* handle, const struct sockaddr* addr);
 
 /**
  * goc_io_tcp_connect() — TCP connect; block until complete (fiber context).
+ *
+ * Returns 0 on success, a negative libuv error code on failure.
  */
-goc_io_connect_t* goc_io_tcp_connect(uv_tcp_t* handle, const struct sockaddr* addr);
+int goc_io_tcp_connect(uv_tcp_t* handle, const struct sockaddr* addr);
 
 /**
- * goc_io_pipe_connect_ch() — Initiate a pipe (named pipe / Unix socket) connect.
+ * goc_io_pipe_connect_ch() — Initiate a pipe connect; return result channel.
  *
  * handle : an initialised uv_pipe_t handle.
  * name   : path to the named pipe / Unix domain socket.
  *
- * Returns a channel delivering goc_io_connect_t* on completion.
+ * Returns a channel delivering (void*)(intptr_t)status on completion;
+ * 0 on success, a negative libuv error code on failure.
  */
 goc_chan* goc_io_pipe_connect_ch(uv_pipe_t* handle, const char* name);
 
 /**
  * goc_io_pipe_connect() — Pipe connect; block until complete (fiber context).
+ *
+ * Returns 0 on success, a negative libuv error code on failure.
  */
-goc_io_connect_t* goc_io_pipe_connect(uv_pipe_t* handle, const char* name);
+int goc_io_pipe_connect(uv_pipe_t* handle, const char* name);
 
 /* =========================================================================
  * 2. UDP (Datagrams)
@@ -388,28 +305,30 @@ goc_io_connect_t* goc_io_pipe_connect(uv_pipe_t* handle, const char* name);
  * nbufs  : number of buffers.
  * addr   : destination address.
  *
- * Returns a channel delivering a single goc_io_udp_send_t* when the datagram
- * has been sent (or failed).
+ * Returns a channel delivering (void*)(intptr_t)status when the datagram
+ * has been sent (or failed); 0 on success, negative libuv error on failure.
  */
 goc_chan* goc_io_udp_send_ch(uv_udp_t* handle,
-                          const uv_buf_t bufs[], unsigned int nbufs,
-                          const struct sockaddr* addr);
+                             const uv_buf_t bufs[], unsigned int nbufs,
+                             const struct sockaddr* addr);
 
 /**
  * goc_io_udp_send() — Async UDP send; block until complete (fiber context).
+ *
+ * Returns 0 on success, a negative libuv error code on failure.
  */
-goc_io_udp_send_t* goc_io_udp_send(uv_udp_t* handle,
-                              const uv_buf_t bufs[], unsigned int nbufs,
-                              const struct sockaddr* addr);
+int goc_io_udp_send(uv_udp_t* handle,
+                    const uv_buf_t bufs[], unsigned int nbufs,
+                    const struct sockaddr* addr);
 
 /**
  * goc_io_udp_recv_start() — Begin receiving UDP datagrams.
  *
  * handle : an initialised and bound uv_udp_t handle.
  *
- * Returns a channel that delivers goc_io_udp_recv_t* values, one per datagram
- * received.  The channel is closed on unrecoverable error; the last delivered
- * value carries the error code in nread.
+ * Returns a channel that delivers goc_io_udp_recv_t* values, one per
+ * datagram received.  The channel is closed on unrecoverable error; the
+ * last delivered value carries the error code in nread.
  * Call goc_io_udp_recv_stop() to stop receiving and close the channel.
  */
 goc_chan* goc_io_udp_recv_start(uv_udp_t* handle);
@@ -434,23 +353,36 @@ int goc_io_udp_recv_stop(uv_udp_t* handle);
  * flags : open flags (O_RDONLY, O_WRONLY | O_CREAT, ...).
  * mode  : permission bits used when creating a new file.
  *
- * Returns a channel delivering goc_io_fs_open_t*.
+ * Returns a channel delivering (void*)(intptr_t)fd; fd >= 0 on success,
+ * a negative libuv error code on failure.
  * Safe to call from any context.
  */
 goc_chan* goc_io_fs_open_ch(const char* path, int flags, int mode);
 
-/** goc_io_fs_open() — Open a file; block until complete (fiber context). */
-goc_io_fs_open_t* goc_io_fs_open(const char* path, int flags, int mode);
+/**
+ * goc_io_fs_open() — Open a file; block until complete (fiber context).
+ *
+ * Returns the file descriptor (>= 0) on success, a negative libuv error
+ * code on failure.
+ */
+uv_file goc_io_fs_open(const char* path, int flags, int mode);
 
 /**
  * goc_io_fs_close_ch() — Initiate an async file close; return result channel.
  *
  * file : file descriptor returned by goc_io_fs_open.
+ *
+ * Returns a channel delivering (void*)(intptr_t)result; 0 on success,
+ * a negative libuv error code on failure.
  */
 goc_chan* goc_io_fs_close_ch(uv_file file);
 
-/** goc_io_fs_close() — Close a file; block until complete (fiber context). */
-goc_io_fs_close_t* goc_io_fs_close(uv_file file);
+/**
+ * goc_io_fs_close() — Close a file; block until complete (fiber context).
+ *
+ * Returns 0 on success, a negative libuv error code on failure.
+ */
+int goc_io_fs_close(uv_file file);
 
 /**
  * goc_io_fs_read_ch() — Initiate an async file read; return result channel.
@@ -459,15 +391,23 @@ goc_io_fs_close_t* goc_io_fs_close(uv_file file);
  * bufs   : array of nbufs buffers to read into.
  * nbufs  : number of buffers.
  * offset : file offset (-1 to use current position).
+ *
+ * Returns a channel delivering (void*)(intptr_t)result; bytes read (>= 0)
+ * on success, a negative libuv error code on failure.
  */
 goc_chan* goc_io_fs_read_ch(uv_file file,
-                         const uv_buf_t bufs[], unsigned int nbufs,
-                         int64_t offset);
-
-/** goc_io_fs_read() — Read from a file; block until complete (fiber context). */
-goc_io_fs_read_t* goc_io_fs_read(uv_file file,
                             const uv_buf_t bufs[], unsigned int nbufs,
                             int64_t offset);
+
+/**
+ * goc_io_fs_read() — Read from a file; block until complete (fiber context).
+ *
+ * Returns bytes read (>= 0) on success, a negative libuv error code on
+ * failure.
+ */
+ssize_t goc_io_fs_read(uv_file file,
+                       const uv_buf_t bufs[], unsigned int nbufs,
+                       int64_t offset);
 
 /**
  * goc_io_fs_write_ch() — Initiate an async file write; return result channel.
@@ -476,46 +416,76 @@ goc_io_fs_read_t* goc_io_fs_read(uv_file file,
  * bufs   : array of nbufs buffers to write.
  * nbufs  : number of buffers.
  * offset : file offset (-1 to use current position).
+ *
+ * Returns a channel delivering (void*)(intptr_t)result; bytes written (>= 0)
+ * on success, a negative libuv error code on failure.
  */
 goc_chan* goc_io_fs_write_ch(uv_file file,
-                          const uv_buf_t bufs[], unsigned int nbufs,
-                          int64_t offset);
-
-/** goc_io_fs_write() — Write to a file; block until complete (fiber context). */
-goc_io_fs_write_t* goc_io_fs_write(uv_file file,
-                              const uv_buf_t bufs[], unsigned int nbufs,
-                              int64_t offset);
+                             const uv_buf_t bufs[], unsigned int nbufs,
+                             int64_t offset);
 
 /**
- * goc_io_fs_unlink_ch() — Initiate an async file deletion; return result channel.
+ * goc_io_fs_write() — Write to a file; block until complete (fiber context).
+ *
+ * Returns bytes written (>= 0) on success, a negative libuv error code on
+ * failure.
+ */
+ssize_t goc_io_fs_write(uv_file file,
+                        const uv_buf_t bufs[], unsigned int nbufs,
+                        int64_t offset);
+
+/**
+ * goc_io_fs_unlink_ch() — Initiate an async file deletion; return result
+ * channel.
  *
  * path : path of the file to delete.
+ *
+ * Returns a channel delivering (void*)(intptr_t)result; 0 on success,
+ * a negative libuv error code on failure.
  */
 goc_chan* goc_io_fs_unlink_ch(const char* path);
 
-/** goc_io_fs_unlink() — Delete a file; block until complete (fiber context). */
-goc_io_fs_unlink_t* goc_io_fs_unlink(const char* path);
+/**
+ * goc_io_fs_unlink() — Delete a file; block until complete (fiber context).
+ *
+ * Returns 0 on success, a negative libuv error code on failure.
+ */
+int goc_io_fs_unlink(const char* path);
 
 /**
  * goc_io_fs_stat_ch() — Initiate an async file stat; return result channel.
  *
  * path : path of the file to stat.
+ *
+ * Returns a channel delivering goc_io_fs_stat_t*.
  */
 goc_chan* goc_io_fs_stat_ch(const char* path);
 
-/** goc_io_fs_stat() — Stat a file; block until complete (fiber context). */
+/**
+ * goc_io_fs_stat() — Stat a file; block until complete (fiber context).
+ *
+ * Returns a GC-managed goc_io_fs_stat_t*.
+ */
 goc_io_fs_stat_t* goc_io_fs_stat(const char* path);
 
 /**
- * goc_io_fs_rename_ch() — Initiate an async file rename; return result channel.
+ * goc_io_fs_rename_ch() — Initiate an async file rename; return result
+ * channel.
  *
  * path     : current file path.
  * new_path : new file path.
+ *
+ * Returns a channel delivering (void*)(intptr_t)result; 0 on success,
+ * a negative libuv error code on failure.
  */
 goc_chan* goc_io_fs_rename_ch(const char* path, const char* new_path);
 
-/** goc_io_fs_rename() — Rename a file; block until complete (fiber context). */
-goc_io_fs_rename_t* goc_io_fs_rename(const char* path, const char* new_path);
+/**
+ * goc_io_fs_rename() — Rename a file; block until complete (fiber context).
+ *
+ * Returns 0 on success, a negative libuv error code on failure.
+ */
+int goc_io_fs_rename(const char* path, const char* new_path);
 
 /**
  * goc_io_fs_sendfile_ch() — Initiate an async sendfile; return result channel.
@@ -524,41 +494,54 @@ goc_io_fs_rename_t* goc_io_fs_rename(const char* path, const char* new_path);
  * in_fd     : source file descriptor.
  * in_offset : offset within the source file to start reading from.
  * length    : number of bytes to transfer.
+ *
+ * Returns a channel delivering (void*)(intptr_t)result; bytes transferred
+ * (>= 0) on success, a negative libuv error code on failure.
  */
 goc_chan* goc_io_fs_sendfile_ch(uv_file out_fd, uv_file in_fd,
-                             int64_t in_offset, size_t length);
+                                int64_t in_offset, size_t length);
 
-/** goc_io_fs_sendfile() — Sendfile; block until complete (fiber context). */
-goc_io_fs_sendfile_t* goc_io_fs_sendfile(uv_file out_fd, uv_file in_fd,
-                                   int64_t in_offset, size_t length);
+/**
+ * goc_io_fs_sendfile() — Sendfile; block until complete (fiber context).
+ *
+ * Returns bytes transferred (>= 0) on success, a negative libuv error
+ * code on failure.
+ */
+ssize_t goc_io_fs_sendfile(uv_file out_fd, uv_file in_fd,
+                           int64_t in_offset, size_t length);
 
 /* =========================================================================
  * 4. DNS & Resolution
  * ====================================================================== */
 
 /**
- * goc_io_getaddrinfo_ch() — Initiate an async getaddrinfo; return result channel.
+ * goc_io_getaddrinfo_ch() — Initiate an async getaddrinfo; return result
+ * channel.
  *
  * node    : host name or numeric address string (may be NULL).
  * service : service name or port number string (may be NULL).
  * hints   : address hints (may be NULL).
  *
- * Returns a channel delivering goc_io_getaddrinfo_t*.  On success the caller
- * must release result->res with uv_freeaddrinfo().
+ * Returns a channel delivering goc_io_getaddrinfo_t*.  On success
+ * (ok == GOC_OK) the caller must release result->res with uv_freeaddrinfo().
  *
  * Safe to call from any context.
  */
 goc_chan* goc_io_getaddrinfo_ch(const char* node, const char* service,
-                             const struct addrinfo* hints);
+                                const struct addrinfo* hints);
 
 /**
- * goc_io_getaddrinfo() — Async getaddrinfo; block until complete (fiber context).
+ * goc_io_getaddrinfo() — Async getaddrinfo; block until complete (fiber
+ * context).
+ *
+ * Returns a GC-managed goc_io_getaddrinfo_t*.
  */
 goc_io_getaddrinfo_t* goc_io_getaddrinfo(const char* node, const char* service,
-                                   const struct addrinfo* hints);
+                                         const struct addrinfo* hints);
 
 /**
- * goc_io_getnameinfo_ch() — Initiate an async getnameinfo; return result channel.
+ * goc_io_getnameinfo_ch() — Initiate an async getnameinfo; return result
+ * channel.
  *
  * addr  : address to resolve.
  * flags : NI_* flags.
@@ -570,7 +553,10 @@ goc_io_getaddrinfo_t* goc_io_getaddrinfo(const char* node, const char* service,
 goc_chan* goc_io_getnameinfo_ch(const struct sockaddr* addr, int flags);
 
 /**
- * goc_io_getnameinfo() — Async getnameinfo; block until complete (fiber context).
+ * goc_io_getnameinfo() — Async getnameinfo; block until complete (fiber
+ * context).
+ *
+ * Returns a GC-managed goc_io_getnameinfo_t*.
  */
 goc_io_getnameinfo_t* goc_io_getnameinfo(const struct sockaddr* addr, int flags);
 
