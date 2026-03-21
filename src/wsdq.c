@@ -89,19 +89,24 @@ goc_entry* wsdeque_pop_bottom(goc_wsdeque* dq) {
      * the thief's acquire load of bottom, preventing double-delivery of the
      * last element on weak memory models (ARM, POWER). */
     size_t old_b = atomic_fetch_sub_explicit(&dq->bottom, 1, memory_order_seq_cst);
-    size_t new_b = old_b - 1;
 
     goc_entry** buf = atomic_load_explicit(&dq->buf, memory_order_acquire);
     size_t cap = dq->capacity;
 
     size_t t = atomic_load_explicit(&dq->top, memory_order_acquire);
 
-    if (new_b < t) {
-        /* Deque was empty before the decrement. Restore bottom. */
-        atomic_store_explicit(&dq->bottom, t, memory_order_relaxed);
+    /* Use old_b (pre-decrement value) for the emptiness check to avoid
+     * unsigned wraparound when bottom == 0.  new_b = old_b - 1 would wrap
+     * to SIZE_MAX if old_b == 0, and SIZE_MAX < t would be FALSE, causing
+     * a spurious non-empty result and bottom corruption. */
+    if (old_b <= t) {
+        /* Deque was empty before the decrement (or a thief raced ahead).
+         * Restore bottom to its pre-decrement value and return NULL. */
+        atomic_store_explicit(&dq->bottom, old_b, memory_order_relaxed);
         return NULL;
     }
 
+    size_t new_b = old_b - 1;  /* safe: old_b > t >= 0, so old_b >= 1 */
     goc_entry* entry = buf[new_b % cap];
 
     if (new_b > t) {
