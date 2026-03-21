@@ -646,12 +646,21 @@ At the **top of `goc_take` and `goc_put`**, immediately after acquiring the lock
 ## Thread Pool
 
 ```c
+typedef struct {
+    pthread_t      thread;
+    goc_wsdeque    deque;       /* Chase–Lev work-stealing deque (owner-push/pop + thief-steal) */
+    goc_injector   injector;    /* MPSC queue: external callers push here; owner pops */
+    uv_sem_t       idle_sem;    /* posted when work is available; worker sleeps on this */
+    size_t         index;       /* worker index in pool->workers[] */
+    goc_pool*      pool;        /* back-pointer to owning pool */
+} goc_worker;
+
 typedef struct goc_pool {
-    pthread_t*      threads;
-    size_t          thread_count;
-    goc_runq        runq;           /* two-lock MPMC queue of goc_entry* */
-    uv_sem_t        work_sem;       /* signalled when runq becomes non-empty */
-    _Atomic int     shutdown;       /* set to 1 to stop workers */
+    goc_worker*        workers;        /* array of thread_count workers */
+    size_t             thread_count;
+    _Atomic size_t     idle_count;     /* number of workers currently sleeping on idle_sem */
+    _Atomic size_t     next_push_idx;  /* round-robin index for external injector pushes */
+    _Atomic int        shutdown;       /* set to 1 to stop workers */
 
     /* Drain synchronisation — used by goc_pool_destroy to wait until all
        in-flight fibers have completed before joining worker threads. */
@@ -679,12 +688,35 @@ typedef struct goc_pool {
 
 The default pool is created by `goc_init` with `max(4, hardware_concurrency)` worker threads. This can be overridden by setting the `GOC_POOL_THREADS` environment variable before calling `goc_init`.
 
-Each worker thread runs a loop:
+Each worker thread runs a 4-stage work-stealing loop:
 
 ```
 while not shutdown:
-    wait on work_sem
-    goc_entry* entry = runq_pop()
+    /* Stage 1: drain own injector (entries from external callers) */
+    entry = injector_pop(worker.injector)
+    if entry != NULL: goto run
+
+    /* Stage 2: pop from own deque (LIFO, cache-warm) */
+    entry = wsdeque_pop_bottom(worker.deque)
+    if entry != NULL: goto run
+
+    /* Stage 3: steal from other workers (randomised start offset) */
+    for each other worker (random offset, excluding self):
+        entry = wsdeque_steal_top(other.deque)
+        if entry != NULL: goto run
+
+    /* Stage 4: go idle — sleep-miss race closure */
+    atomic_fetch_add(idle_count, 1, seq_cst)  /* must be seq_cst — pairs with post seq_cst fence */
+    entry = injector_pop(worker.injector)      /* double-check: close race with concurrent post */
+    if entry == NULL: entry = wsdeque_pop_bottom(worker.deque)
+    if entry != NULL:
+        atomic_fetch_sub(idle_count, 1, relaxed)
+        goto run
+    uv_sem_wait(worker.idle_sem)               /* sleep until posted by post_to_run_queue */
+    atomic_fetch_sub(idle_count, 1, relaxed)
+    continue
+
+run:
     if *entry->stack_canary_ptr != GOC_STACK_CANARY:
         abort()                        /* stack overflow — deterministic crash, not silent corruption
                                           applies to ALL entry kinds: launch entries AND goc_alts
@@ -701,6 +733,12 @@ while not shutdown:
     mco_resume(coro)                   /* run fiber until next mco_yield or return */
 
     GC_set_stackbottom(NULL, &orig_sb) /* restore OS thread stack bottom */
+
+    fe = mco_get_user_data(coro)
+    if fe != NULL: atomic_store(fe->parked, 1, release)  /* release yield-gate; see Yield-Gate below */
+    if mco_status(coro) == MCO_SUSPENDED and fe != NULL:
+        goc_fiber_root_update_sp(fe->fiber_root_handle, coro)  /* update cached SP for GC */
+
     lock(drain_mutex); active_count--; unlock(drain_mutex)
     /* active_count is decremented unconditionally.  The lock is released before
        checking MCO_DEAD to avoid holding drain_mutex across mco_destroy. */
@@ -716,6 +754,9 @@ while not shutdown:
        broadcast here: live_count > 0 still holds, so goc_pool_destroy /
        goc_pool_destroy_timeout will not see a spurious drain-complete. */
 ```
+
+> **Sleep-miss race closure.** A poster calling `post_to_run_queue` must not miss a sleeping worker. Protocol: (1) worker increments `idle_count` with `seq_cst` *before* its double-check; (2) poster completes its write (deque push or injector mutex-unlock, both full-barrier), then reads `idle_count` with `seq_cst`. The C11 total order on seq_cst operations guarantees that if the poster sees `idle_count == 0`, the worker's double-check will see the posted entry; if the poster sees `idle_count > 0`, it posts `idle_sem` to wake the worker.
+
 
 > **Why `coro` is snapshotted before `mco_resume`.** When a fiber suspends inside `goc_take`, it stack-allocates a `goc_entry` (the parking entry) on its own coroutine stack and parks. The pool worker's `entry` pointer therefore points into the fiber's stack for the duration of that park. If the fiber is immediately re-scheduled on the same resume call (i.e. it runs to completion without yielding again), minicoro recycles the stack — and the memory `entry` pointed at is gone by the time `mco_resume` returns. Reading `entry->coro` after the resume is therefore a use-after-free and a potential segfault. The `mco_coro` object itself is minicoro heap-allocated and remains valid until `mco_destroy`, so snapshotting `coro = entry->coro` *before* the resume is always safe and eliminates the hazard entirely. See [Unified Wakeup](#unified-wakeup) for the analogous `e->next` snapshot requirement in `chan_put_to_taker` and `chan_take_from_putter`.
 
@@ -756,43 +797,36 @@ The invariant is:
 
 
 
-`runq` is a **two-lock MPMC linked queue** (Michael & Scott 1996) with a `head_lock` on the consumer side and a `tail_lock` on the producer side. Any thread (pool or loop) may push; only pool worker threads pop.
+Each pool uses per-worker **Chase–Lev work-stealing deques** (`goc_wsdeque`) and per-worker **MPSC injector queues** (`goc_injector`) instead of a single shared run queue.
 
 ```c
-typedef struct goc_runq_node {
-    goc_entry*           entry;
-    struct goc_runq_node* next;   /* GC-allocated node */
-} goc_runq_node;
-
+/* goc_wsdeque — Chase–Lev circular work-stealing deque */
 typedef struct {
-    goc_runq_node* head;       /* consumer end; protected by head_lock */
-    goc_runq_node* tail;       /* producer end; protected by tail_lock */
-    uv_mutex_t     head_lock;
-    uv_mutex_t     tail_lock;
-} goc_runq;
+    _Atomic size_t       bottom;     /* owner's push/pop cursor (write end) */
+    _Atomic size_t       top;        /* thieves' steal cursor (read end) */
+    _Atomic(goc_entry**) buf;        /* circular buffer, capacity always a power of two */
+    size_t               capacity;
+    uv_mutex_t           steal_lock; /* serialises concurrent thieves; not held by owner */
+} goc_wsdeque;
+
+/* goc_injector — MPSC queue (mutex-protected singly-linked list) */
+typedef struct {
+    goc_injector_node* head;   /* pop end (owner only) */
+    goc_injector_node* tail;   /* push end (any thread) */
+    uv_mutex_t         lock;
+} goc_injector;
 ```
 
-```
-runq_push(q, entry):
-    node = goc_malloc(sizeof(goc_runq_node))
-    node->entry = entry; node->next = NULL
-    uv_mutex_lock(&q->tail_lock)
-    q->tail->next = node
-    q->tail = node
-    uv_mutex_unlock(&q->tail_lock)
+`wsdeque_push_bottom` / `wsdeque_pop_bottom` are called only by the owning worker (no lock on the fast path). `wsdeque_steal_top` is called by any thread under `steal_lock`. `wsdeque_pop_bottom` uses `atomic_fetch_sub(seq_cst)` to decrement `bottom` and checks emptiness using `old_b <= top` (pre-decrement value) to avoid unsigned wraparound when `bottom == 0`.
 
-runq_pop(q) → goc_entry* or NULL:
-    uv_mutex_lock(&q->head_lock)
-    node = q->head->next          /* head is a sentinel */
-    if node == NULL:
-        uv_mutex_unlock(&q->head_lock) → return NULL
-    q->head = node
-    entry = node->entry
-    uv_mutex_unlock(&q->head_lock)
-    return entry
-```
+`post_to_run_queue` routes entries as follows:
+
+- **Internal caller** (a fiber running on a pool thread, i.e. `tl_worker != NULL && tl_worker->pool == pool`): pushes to the executing worker's own deque, then posts `idle_sem` to one idle worker (if any) so it can steal.
+- **External caller** (main thread, libuv loop, another pool): pushes into a round-robin target worker's injector, then posts that worker's `idle_sem` if any worker is idle.
 
 All threads — pool workers and the uv loop thread — are created via `gc_pthread_create`. On POSIX (Linux/macOS), `gc_pthread_create` is a macro alias for `GC_pthread_create`, which wraps the thread start with `GC_call_with_stack_base` so each thread is automatically registered with the collector; no manual `GC_register_my_thread` / `GC_unregister_my_thread` call is needed or permitted on POSIX. On Windows, `gc_pthread_create` calls `pthread_create` with a trampoline (`gc_thread_trampoline` in `gc.c`) that calls `GC_register_my_thread` at thread start and `GC_unregister_my_thread` at thread exit.
+
+> **`_Thread_local` and minicoro.** `tl_worker` is a `_Thread_local` pointer to the currently executing `goc_worker`. minicoro switches stacks, not OS threads, so `tl_worker` always reflects the OS thread running the fiber and is always correct for internal/external routing decisions. A stolen fiber running on a different worker correctly sees `tl_worker == &workers[thief_index]` after the steal.
 
 ---
 
