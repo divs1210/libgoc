@@ -126,8 +126,8 @@ int gc_pthread_join(pthread_t t, void** retval)
 
 typedef struct {
     goc_entry*      entry;      /* GC root: keeps the fiber's goc_entry alive */
-    void*           stack_top;  /* high end of fiber stack (const after init) */
-    _Atomic(void*)  scan_from;  /* low end of scan range; updated post-yield */
+    _Atomic(void*)  stack_top;  /* high end of fiber stack; NULL until materialised */
+    _Atomic(void*)  scan_from;  /* low end of scan range; NULL until materialised; updated post-yield */
 } fiber_root_slot;
 
 /* fiber_root_chunks[c] is malloc'd (not GC-heap) for the same reason as the
@@ -166,10 +166,17 @@ static void push_fiber_roots(void)
                 GC_push_all_eager(&s->entry,
                                   (char*)&s->entry + sizeof(goc_entry*));
 
-                /* Scan the used portion of the fiber stack. */
+                /* Scan the used portion of the fiber stack.
+                 * scan_from is NULL until goc_fiber_root_set_stack() runs
+                 * (deferred materialisation path); skip the scan in that case
+                 * — the entry is still kept alive by the push above. */
                 void* scan_from = atomic_load_explicit(
                     &s->scan_from, memory_order_relaxed);
-                GC_push_all_eager(scan_from, s->stack_top);
+                if (scan_from != NULL) {
+                    void* top = atomic_load_explicit(
+                        &s->stack_top, memory_order_relaxed);
+                    GC_push_all_eager(scan_from, top);
+                }
 
                 bword &= bword - 1; /* clear lowest set bit */
             }
@@ -228,19 +235,50 @@ void* goc_fiber_root_register(mco_coro* coro, void* top, goc_entry* entry)
     }
 
     /* Write slot data.  Visible to the GC callback only after the bitmap bit
-     * is set (which happened above, under the mutex). */
+     * is set (which happened above, under the mutex).
+     *
+     * When coro == NULL the fiber has not been materialised yet (deferred
+     * creation path).  stack_top and scan_from are left NULL; push_fiber_roots
+     * skips the stack scan for such slots while still keeping entry alive.
+     * goc_fiber_root_set_stack() fills them in before the first mco_resume. */
     size_t           chunk_idx = slot_idx / FIBER_ROOT_CHUNK_SIZE;
     size_t           offset    = slot_idx % FIBER_ROOT_CHUNK_SIZE;
     fiber_root_slot* s         = &fiber_root_chunks[chunk_idx][offset];
-    s->entry     = entry;
-    s->stack_top = top;
-    void* initial_sp = mco_get_suspended_sp(coro);
-    atomic_store_explicit(&s->scan_from,
-                          initial_sp ? initial_sp : coro->stack_base,
-                          memory_order_relaxed);
+    s->entry = entry;
+    if (coro != NULL) {
+        atomic_store_explicit(&s->stack_top, top, memory_order_relaxed);
+        void* initial_sp = mco_get_suspended_sp(coro);
+        atomic_store_explicit(&s->scan_from,
+                              initial_sp ? initial_sp : coro->stack_base,
+                              memory_order_relaxed);
+    } else {
+        atomic_store_explicit(&s->stack_top, NULL, memory_order_relaxed);
+        atomic_store_explicit(&s->scan_from, NULL,  memory_order_relaxed);
+    }
 
     uv_mutex_unlock(&fiber_root_mutex);
     return (void*)(uintptr_t)slot_idx;
+}
+
+void goc_fiber_root_set_stack(void* handle, mco_coro* coro, void* top)
+{
+    /* Called by goc_fiber_materialize (deferred creation path) after mco_create.
+     * Installs the fiber's stack bounds into the pre-registered slot so that
+     * push_fiber_roots starts scanning the stack from the next GC cycle.
+     *
+     * Ordering: write stack_top before scan_from (both with release semantics).
+     * push_fiber_roots checks scan_from != NULL as the "materialised" signal;
+     * writing stack_top first guarantees stack_top is visible whenever
+     * scan_from is observed non-NULL (stop-the-world provides a full fence). */
+    size_t           slot_idx  = (size_t)(uintptr_t)handle;
+    size_t           chunk_idx = slot_idx / FIBER_ROOT_CHUNK_SIZE;
+    size_t           offset    = slot_idx % FIBER_ROOT_CHUNK_SIZE;
+    fiber_root_slot* s         = &fiber_root_chunks[chunk_idx][offset];
+    atomic_store_explicit(&s->stack_top, top, memory_order_release);
+    void* initial_sp = mco_get_suspended_sp(coro);
+    atomic_store_explicit(&s->scan_from,
+                          initial_sp ? initial_sp : coro->stack_base,
+                          memory_order_release);
 }
 
 void goc_fiber_root_unregister(void* handle)

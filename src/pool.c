@@ -201,7 +201,12 @@ static void* pool_worker_fn(void* arg) {
         continue;   /* re-check shutdown and try again */
 
 run:
-        /* --- from here, identical to old pool_worker_fn --- */
+        /* Deferred initialisation: create the coroutine on first dispatch.
+         * goc_go_on leaves entry->coro == NULL to keep spawn cheap; the
+         * stack allocation and GC-root registration happen here, on the
+         * worker thread that will actually run the fiber. */
+        if (entry->coro == NULL)
+            goc_fiber_materialize(entry);
 
         /* Canary check — abort on stack overflow before corrupting anything. */
         goc_stack_canary_check(entry->stack_canary_ptr);
