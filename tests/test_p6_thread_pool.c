@@ -63,16 +63,22 @@
  *          double-delivery, no loss, no hang)
  *   P6.18  pool internal post: burst of child fibers (spawned inside a fiber
  *          via goc_go_on) all complete — verifies that idle workers beyond
- *          the fixed (w->index+1)%N neighbor are eventually woken/utilized
+ *          the fixed (w->index+1)%N neighbor are eventually woken/utilized;
+ *          also catches deferred-materialization GC race under burst spawning
+ *          (SIGABRT from BDW-GC if concurrent goc_fiber_materialize calls
+ *          corrupt or exhaust the GC root registration table)
  *   P6.19  pool external post sleep-miss: serial external posts with forced
  *          idle windows — verifies that a worker sleeping in uv_sem_wait is
  *          reliably woken when an external caller pushes to its injector
  *   P6.20  pool external post targets busy worker: injected tasks still
  *          complete even when the round-robin target worker is inside
- *          mco_resume and its idle_sem post is consumed after the fact
+ *          mco_resume and its idle_sem post is consumed after the fact;
+ *          also catches deferred-materialization GC race (same as P6.18)
+ *          when the burst of deferred tasks are materialized concurrently
  *   P6.21  pool idle steal gap: work that becomes stealable after a worker's
  *          double-check (but before uv_sem_wait) is still processed within
- *          deadline, not silently dropped
+ *          deadline, not silently dropped; also catches deferred-
+ *          materialization GC race under a larger burst (1000 children)
  *
  * Notes:
  *   - goc_init() is called once in main() before any test runs.
@@ -1044,7 +1050,9 @@ done:;
 
 /* ---- P6.18: internal post — burst of child fibers all complete ---- */
 /*
- * Bug being tested (pool.c internal path in post_to_run_queue):
+ * Bugs being tested:
+ *
+ * (A) pool.c internal path in post_to_run_queue (bug #4):
  *   When a fiber posts work internally, the code always wakes
  *   workers[(w->index + 1) % N] regardless of which worker is actually idle.
  *   If that fixed neighbor is busy, other idle workers beyond it are never
@@ -1053,14 +1061,27 @@ done:;
  *   entries pile up in the spawner's deque and may never reach the idle
  *   workers at index+2, index+3, …
  *
+ * (B) Deferred fiber materialization GC race (introduced by work-stealing
+ *   commit): goc_go_on now defers goc_fiber_materialize to the first
+ *   dispatch on a worker thread (entry->coro == NULL at spawn time).  Under
+ *   a large burst multiple workers race to call goc_fiber_materialize
+ *   concurrently; each call registers a GC root via goc_fiber_root_register.
+ *   If the registration logic has a race or the root table is exhausted
+ *   before slots are reused, BDW-GC aborts with signal 6 (SIGABRT /
+ *   "Too many root sets").  A crash (not just a timeout) from this test
+ *   indicates that race.
+ *
  * Test strategy:
  *   A parent fiber (running on some worker W) calls goc_go_on N_CHILDREN
  *   times.  Each call takes the internal path: push entry to W's deque,
  *   then unconditionally wake workers[(W+1)%N].  The parent then exits.
  *   Each child atomically increments a shared counter; when it reaches
  *   N_CHILDREN the last child signals done.  The main thread waits with a
- *   3-second deadline.  A timeout indicates that idle workers were not
- *   notified and entries stagnated in W's deque.
+ *   3-second deadline.
+ *   - A timeout indicates bug (A): idle workers were not notified and
+ *     entries stagnated in W's deque.
+ *   - A crash (SIGABRT from GC) indicates bug (B): deferred materialization
+ *     race under concurrent burst spawning.
  */
 #define P6_18_WORKERS  4
 #define P6_18_CHILDREN 500
@@ -1183,7 +1204,9 @@ done:;
 
 /* ---- P6.20: external post targets busy worker — tasks still complete ---- */
 /*
- * Bug being tested (pool.c external path — item #6):
+ * Bugs being tested:
+ *
+ * (A) pool.c external path — wasted sem post to busy worker (bug #6):
  *   post_to_run_queue's external path both pushes the entry into
  *   workers[idx].injector AND posts workers[idx].idle_sem.  If workers[idx]
  *   is currently inside mco_resume (busy running a fiber), the sem post is
@@ -1192,6 +1215,14 @@ done:;
  *   injector (injectors are not stealable), so they cannot help.  The entry
  *   sits in workers[idx].injector until workers[idx] itself loops back and
  *   drains it.
+ *
+ * (B) Deferred fiber materialization GC race (introduced by work-stealing
+ *   commit): the burst of externally-posted tasks all have entry->coro == NULL
+ *   at dispatch time.  When the busy worker eventually drains its injector and
+ *   processes each entry, it calls goc_fiber_materialize for each one.
+ *   Multiple workers may race to materialize concurrently, contending on the
+ *   GC root registration table.  A SIGABRT crash from BDW-GC during this test
+ *   indicates that race (same underlying issue as in P6.18).
  *
  * Test strategy:
  *   1. 2-worker pool so round-robin alternates strictly between workers 0 and 1.
@@ -1205,7 +1236,10 @@ done:;
  *      idle_sem is wasted; worker 1 cannot steal worker 0's injector.
  *   4. Assert all N tasks complete within 3 seconds (they must, once the
  *      spinner exits and worker 0 drains its injector).
- *   A hang means the wasted sem post caused the queued entries to be lost.
+ *   - A timeout means bug (A): the wasted sem post caused queued entries to
+ *     stagnate indefinitely.
+ *   - A crash (SIGABRT from GC) means bug (B): deferred materialization
+ *     of the burst tasks raced against concurrent GC root registration.
  */
 #define P6_20_WORKERS  2
 #define P6_20_TASKS    200
@@ -1275,7 +1309,9 @@ done:;
 
 /* ---- P6.21: idle steal gap — stealable work after double-check ---- */
 /*
- * Bug being tested (pool.c worker loop — item #7):
+ * Bugs being tested:
+ *
+ * (A) pool.c worker loop — idle double-check skips steal phase (bug #7):
  *   The idle double-check (step 4 in pool_worker_fn) re-checks only the
  *   worker's own injector and its own deque before sleeping.  It does NOT
  *   re-run the steal phase (step 3).  Combined with the fixed-neighbor
@@ -1290,18 +1326,25 @@ done:;
  *     3. W1 is woken K times by the K sem posts, but it may not steal all K
  *        entries fast enough while W2 … W(N-1) stay sleeping — they were
  *        past the steal check and will not retry it before sleeping.
+ *   A timeout indicates this bug.
  *
- *   Test strategy: N=4 workers, spawner creates 1000 entries via internal
- *   posts.  All entries must be processed within 5 seconds.  A timeout
- *   means some entries were stranded because the only notified worker (W1)
- *   couldn't keep up and the sleeping workers (W2, W3) never retried the
- *   steal phase before sleeping.
+ * (B) Deferred fiber materialization GC race (introduced by work-stealing
+ *   commit): all 1000 child entries have entry->coro == NULL at spawn time.
+ *   When workers steal and run them they call goc_fiber_materialize
+ *   concurrently, racing on GC root registration.  A SIGABRT crash from
+ *   BDW-GC during this test indicates that race (same issue as P6.18/P6.20).
  *
- *   Distinction from P6.18: P6.18 uses 4 workers + 500 children with a
- *   3s deadline.  P6.21 uses 4 workers + 1000 children with an explicit
- *   "deep-idle" pre-settle (usleep before the spawner starts) to maximise
- *   the probability that W1-W3 are all past their steal check when the
- *   burst arrives, specifically exercising the double-check gap.
+ * Test strategy: N=4 workers, spawner creates 1000 entries via internal
+ * posts.  All entries must be processed within 5 seconds.
+ *   - A timeout means bug (A): workers stuck past the steal double-check
+ *     were never re-woken and entries stagnated in W0's deque.
+ *   - A crash (SIGABRT from GC) means bug (B): concurrent materialization
+ *     race under the large burst.
+ *
+ * Distinction from P6.18: P6.18 uses 500 children + 3s deadline.
+ * P6.21 uses 1000 children with an explicit "deep-idle" pre-settle
+ * (usleep before the spawner) to maximise the probability that W1-W3
+ * are past their steal check when the burst arrives.
  */
 #define P6_21_WORKERS  4
 #define P6_21_CHILDREN 1000
