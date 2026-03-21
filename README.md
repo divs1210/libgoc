@@ -378,8 +378,8 @@ goc_close(ch);
 
 | Function | Signature | Description |
 |---|---|---|
-| `goc_go` | `goc_chan* goc_go(void (*fn)(void*), void* arg)` | Spawn a fiber on the default pool. Stack is managed by minicoro. Returns a **join channel** that is closed automatically when the fiber returns. Pass the join channel as an arm to `goc_alts` or call `goc_take`/`goc_take_sync` on it to await fiber completion. The join channel may be ignored if no join is needed. |
-| `goc_go_on` | `goc_chan* goc_go_on(goc_pool* pool, void (*fn)(void*), void* arg)` | Spawn on a specific pool. Stack is managed by minicoro. Returns a join channel with the same semantics as `goc_go`. |
+| `goc_go` | `goc_chan* goc_go(void (*fn)(void*), void* arg)` | Spawn a fiber on the default pool. Fiber stack allocation is **deferred** to the first dispatch on a worker thread, keeping spawn itself cheap. Returns a **join channel** that is closed automatically when the fiber returns. Pass the join channel as an arm to `goc_alts` or call `goc_take`/`goc_take_sync` on it to await fiber completion. The join channel may be ignored if no join is needed. |
+| `goc_go_on` | `goc_chan* goc_go_on(goc_pool* pool, void (*fn)(void*), void* arg)` | Spawn on a specific pool. Fiber stack allocation is deferred to first dispatch. Returns a join channel with the same semantics as `goc_go`. |
 
 ```c
 typedef struct { goc_chan* ch; int n; } args_t;

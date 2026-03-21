@@ -427,19 +427,18 @@ goc_chan* goc_go_on(goc_pool*, void (*fn)(void*), void* arg);
 
 ### Launch (`goc_go`)
 
+Fiber creation is **split into two phases** to keep `goc_go` / `goc_go_on` cheap:
+
+**Phase 1 — spawn (caller thread, in `goc_go_on`):**
+
 ```c
 goc_chan* join_ch = goc_chan_make(0);   /* unbuffered; closed when fiber exits */
 entry->join_ch = join_ch;
+entry->coro    = NULL;                  /* deferred — no stack allocated yet */
 
-mco_desc desc = mco_desc_init(trampoline, stack_sz);
-desc.user_data = entry;
-mco_coro* coro;
-mco_create(&coro, &desc);
-entry->coro = coro;
-
-/* write canary at the lowest address of the newly-created stack */
-entry->stack_canary_ptr = (uint32_t*)coro->stack_base;
-*entry->stack_canary_ptr = GOC_STACK_CANARY;
+/* Pre-register as a GC root (NULL stack range) so the entry stays alive
+   in the malloc'd run queue until the worker picks it up. */
+entry->fiber_root_handle = goc_fiber_root_register(NULL, NULL, entry);
 
 /* Increment live_count exactly once for this new fiber before queuing it.
    pool_fiber_born must precede post_to_run_queue so that live_count is
@@ -448,6 +447,25 @@ pool_fiber_born(pool);
 post_to_run_queue(pool, entry);
 return join_ch;
 ```
+
+**Phase 2 — materialisation (worker thread, `goc_fiber_materialize`, called from `pool_worker_fn` on first dispatch):**
+
+```c
+mco_desc desc = mco_desc_init(trampoline, stack_sz);
+desc.user_data = entry;
+mco_create(&entry->coro, &desc);
+
+/* Fill in the fiber stack bounds into the pre-registered GC root slot
+   so that future GC cycles scan the actual stack. */
+void* fiber_stack_top = coro->stack_base + coro->stack_size;
+goc_fiber_root_set_stack(entry->fiber_root_handle, entry->coro, fiber_stack_top);
+
+/* write canary at the lowest address of the newly-created stack */
+entry->stack_canary_ptr = (uint32_t*)entry->coro->stack_base;
+*entry->stack_canary_ptr = GOC_STACK_CANARY;
+```
+
+This makes `goc_go` a pure closure-post operation with no stack allocation on the calling thread. The expensive `mco_create` (56 KB stack per fiber in canary mode) is deferred to the worker that will run the fiber, amortising it into the runtime cost rather than the spawn cost.
 
 ### Join Channel
 
@@ -720,6 +738,14 @@ while not shutdown:
     continue
 
 run:
+    /* Deferred materialisation: if this is the first dispatch of a newly
+       spawned fiber, create its coroutine stack now on the worker thread
+       rather than on the calling thread.  goc_go_on leaves entry->coro == NULL
+       to keep spawn cheap; goc_fiber_materialize does mco_create + fills
+       the stack bounds into the pre-registered GC root slot. */
+    if entry->coro == NULL:
+        goc_fiber_materialize(entry)
+
     if *entry->stack_canary_ptr != GOC_STACK_CANARY:
         abort()                        /* stack overflow — deterministic crash, not silent corruption
                                           applies to ALL entry kinds: launch entries AND goc_alts
@@ -774,9 +800,11 @@ run:
 > **Handle.** `goc_fiber_root_register` returns the slot index cast to `void*`.  This keeps the handle valid across potential future growth (which appends new chunks without moving old ones).
 >
 > **Slot fields.** Each `fiber_root_slot` stores three fields:
-> - `scan_from` (`_Atomic(void*)`) — cached saved RSP/SP of the suspended fiber, initialised by `mco_get_suspended_sp` at birth and updated by `goc_fiber_root_update_sp` (called in `pool_worker_fn` after each `mco_resume` returns with `MCO_SUSPENDED`).
-> - `stack_top` (`void*`) — high end of the fiber stack (constant after init).
+> - `scan_from` (`_Atomic(void*)`) — cached saved RSP/SP of the suspended fiber, initialised by `mco_get_suspended_sp` at birth and updated by `goc_fiber_root_update_sp` (called in `pool_worker_fn` after each `mco_resume` returns with `MCO_SUSPENDED`).  For fibers registered before materialisation (deferred creation path), this field is **NULL** until `goc_fiber_root_set_stack` is called; `push_fiber_roots` skips the stack scan when `scan_from == NULL` while still pushing `entry` to keep it alive.
+> - `stack_top` (`_Atomic(void*)`) — high end of the fiber stack; NULL until `goc_fiber_root_set_stack` fills it in after `mco_create`.
 > - `entry` (`goc_entry*`) — the fiber's GC-allocated entry; explicitly pushed via `GC_push_all_eager(&s->entry, …)` to keep it alive (the run queue node referencing it is `malloc`'d, not GC-managed).
+>
+> **Deferred registration.** `goc_go_on` calls `goc_fiber_root_register(NULL, NULL, entry)` to claim a slot and store the entry pointer *before* `mco_create`, so the GC root is live from the moment the entry is posted to the run queue.  `goc_fiber_materialize` (called on the worker at first dispatch) then calls `goc_fiber_root_set_stack(handle, coro, stack_top)` to atomically fill in `stack_top` and `scan_from` — writing `stack_top` with `memory_order_release` first, then `scan_from` with `memory_order_release`.  `push_fiber_roots` uses `scan_from != NULL` as the "stack is ready" signal; the release/acquire ordering ensures `stack_top` is always visible when `scan_from` is non-NULL.
 >
 > **Shutdown cleanup.** `goc_shutdown()` frees all chunk arrays, zeros the used bitmap words, resets `fiber_root_num_chunks` to 0, and destroys `fiber_root_mutex`.
 
