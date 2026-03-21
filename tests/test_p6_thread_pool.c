@@ -59,6 +59,8 @@
  *   P6.14  injector push/pop round-trip (FIFO, single-threaded)
  *   P6.15  injector_pop on empty returns NULL
  *   P6.16  injector concurrent push from multiple threads
+ *   P6.17  wsdq pop_bottom / steal_top race on the last element (no
+ *          double-delivery, no loss, no hang)
  *
  * Notes:
  *   - goc_init() is called once in main() before any test runs.
@@ -936,6 +938,75 @@ static void test_p6_16(void) {
 done:;
 }
 
+/* ---- P6.17: pop_bottom / steal_top race on last element ---- */
+/*
+ * Stress-tests the last-element race between wsdq_pop_bottom (owner, no
+ * lock) and wsdq_steal_top (thief, holds steal_lock).  One entry is pushed
+ * per round; a pthread_barrier synchronises the owner pop and the thief steal
+ * so they start simultaneously.  Exactly one must win each round — no double-
+ * delivery, no loss, and no hang.
+ */
+#define P6_17_ROUNDS 100000
+
+typedef struct {
+    goc_wsdq*          dq;
+    _Atomic int*       thief_got;
+    pthread_barrier_t* barrier;
+    int                rounds;
+} p6_17_thief_arg;
+
+static void* p6_17_thief(void* arg) {
+    p6_17_thief_arg* a = (p6_17_thief_arg*)arg;
+    for (int r = 0; r < a->rounds; r++) {
+        pthread_barrier_wait(a->barrier);   /* race start */
+        goc_entry* e = wsdq_steal_top(a->dq);
+        if (e != NULL) {
+            atomic_fetch_add_explicit(a->thief_got, 1, memory_order_relaxed);
+            free(e);
+        }
+        pthread_barrier_wait(a->barrier);   /* round end */
+    }
+    return NULL;
+}
+
+static void test_p6_17(void) {
+    TEST_BEGIN("P6.17  pop_bottom/steal_top last-element race: no double-delivery, no hang");
+
+    goc_wsdq dq;
+    wsdq_init(&dq, 2);
+
+    _Atomic int thief_got = 0;
+    pthread_barrier_t barrier;
+    pthread_barrier_init(&barrier, NULL, 2);
+
+    p6_17_thief_arg ta = { &dq, &thief_got, &barrier, P6_17_ROUNDS };
+    pthread_t thief;
+    pthread_create(&thief, NULL, p6_17_thief, &ta);
+
+    int owner_got = 0;
+    for (int r = 0; r < P6_17_ROUNDS; r++) {
+        wsdq_push_bottom(&dq, make_entry(0));
+        pthread_barrier_wait(&barrier);   /* race start: both race for the single entry */
+        goc_entry* e = wsdq_pop_bottom(&dq);
+        if (e != NULL) {
+            owner_got++;
+            free(e);
+        }
+        pthread_barrier_wait(&barrier);   /* round end: thief has finished its steal attempt */
+    }
+
+    pthread_join(thief, NULL);
+    pthread_barrier_destroy(&barrier);
+
+    /* Every pushed entry must be consumed exactly once (no double-delivery, no loss). */
+    int total = owner_got + atomic_load_explicit(&thief_got, memory_order_relaxed);
+    ASSERT(total == P6_17_ROUNDS);
+
+    wsdq_destroy(&dq);
+    TEST_PASS();
+done:;
+}
+
 /* =========================================================================
  * main
  *
@@ -972,6 +1043,7 @@ int main(void) {
     test_p6_14();
     test_p6_15();
     test_p6_16();
+    test_p6_17();
     printf("\n");
 
     goc_shutdown();
