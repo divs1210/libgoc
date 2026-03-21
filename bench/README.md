@@ -223,14 +223,14 @@ Prime sieve: 2262 primes up to 20000 in 4212ms (537 primes/s)
 
 ## Report: libgoc vs. Go Baseline (+ Clojure)
 
-This report evaluates the performance of **libgoc canary**, **libgoc vmem**, and **Clojure core.async** relative to the **Go** runtime. All figures represent operations per second; the multiplier in parentheses indicates performance relative to the Go baseline (e.g., **1.10x** represents 10% faster, while **0.50x** represents half the speed).
+This report evaluates the performance of **libgoc (post-optimization)**, **libgoc vmem**, and **Clojure core.async** relative to the **Go** runtime. All figures represent operations per second; the multiplier in parentheses indicates performance relative to the Go baseline (e.g., **1.10x** represents 10% faster, while **0.50x** represents half the speed).
 
 ---
 
 ### Channel ping-pong (round trips/s)
 *Measures overhead of basic synchronization and context switching.*
 
-| Pool | Go (Baseline) | libgoc canary | libgoc vmem | Clojure |
+| Pool | Go (Baseline) | libgoc | libgoc vmem | Clojure |
 | :--- | :--- | :--- | :--- | :--- |
 | **1** | 1,526,518 | 2,592,082 **(1.70x)** | 2,577,912 **(1.69x)** | 1,197,631 **(0.78x)** |
 | **2** | 1,489,831 | 1,918,550 **(1.29x)** | 1,901,673 **(1.28x)** | 805,824 **(0.54x)** |
@@ -240,7 +240,7 @@ This report evaluates the performance of **libgoc canary**, **libgoc vmem**, and
 ### Ring (hops/s)
 *Measures message passing latency across a circular topology.*
 
-| Pool | Go (Baseline) | libgoc canary | libgoc vmem | Clojure |
+| Pool | Go (Baseline) | libgoc | libgoc vmem | Clojure |
 | :--- | :--- | :--- | :--- | :--- |
 | **1** | 1,619,735 | 2,553,508 **(1.58x)** | 2,483,812 **(1.53x)** | 2,937,427 **(1.81x)** |
 | **2** | 1,513,880 | 1,821,430 **(1.20x)** | 1,826,997 **(1.21x)** | 1,866,505 **(1.23x)** |
@@ -250,7 +250,7 @@ This report evaluates the performance of **libgoc canary**, **libgoc vmem**, and
 ### Selective receive / fan-out / fan-in (msg/s)
 *Evaluates complex orchestration and selection logic.*
 
-| Pool | Go (Baseline) | libgoc canary | libgoc vmem | Clojure |
+| Pool | Go (Baseline) | libgoc | libgoc vmem | Clojure |
 | :--- | :--- | :--- | :--- | :--- |
 | **1** | 391,272 | 329,946 **(0.84x)** | 326,836 **(0.84x)** | 308,529 **(0.79x)** |
 | **2** | 397,010 | 541,717 **(1.36x)** | 528,516 **(1.33x)** | 346,304 **(0.87x)** |
@@ -260,7 +260,7 @@ This report evaluates the performance of **libgoc canary**, **libgoc vmem**, and
 ### Spawn idle tasks (tasks/s)
 *Tests the efficiency of task creation and scheduling.*
 
-| Pool | Go (Baseline) | libgoc canary | libgoc vmem | Clojure |
+| Pool | Go (Baseline) | libgoc | libgoc vmem | Clojure |
 | :--- | :--- | :--- | :--- | :--- |
 | **1** | 144,932 | 15,047 **(0.10x)** | 16,057 **(0.11x)** | 711,577 **(4.91x)** |
 | **2** | 236,451 | 21,023 **(0.09x)** | 22,022 **(0.09x)** | 773,872 **(3.27x)** |
@@ -270,7 +270,7 @@ This report evaluates the performance of **libgoc canary**, **libgoc vmem**, and
 ### Prime sieve (primes/s)
 *High-concurrency filtering test.*
 
-| Pool | Go (Baseline) | libgoc canary | libgoc vmem | Clojure |
+| Pool | Go (Baseline) | libgoc | libgoc vmem | Clojure |
 | :--- | :--- | :--- | :--- | :--- |
 | **1** | 1,280 | 3,773 **(2.95x)** | 3,697 **(2.89x)** | 1,781 **(1.39x)** |
 | **2** | 2,517 | 5,118 **(2.03x)** | 5,004 **(1.99x)** | 1,844 **(0.73x)** |
