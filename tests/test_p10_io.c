@@ -21,7 +21,7 @@
  *   P10.6  goc_io_fs_unlink_ch: delete the file; subsequent stat fails
  *   P10.7  goc_io_fs_open + goc_io_fs_close blocking wrappers (fiber context)
  *   P10.8  goc_io_fs_open_ch with invalid path: fd < 0 (error code)
- *   P10.9  goc_io_getaddrinfo_ch: resolve "localhost"; ok == GOC_OK, res != NULL
+ *   P10.9  goc_io_getaddrinfo_ch: resolve "localhost"; ok == GOC_IO_OK, res != NULL
  *   P10.10 goc_io_getaddrinfo_ch with empty node and service: returns error
  *   P10.11 goc_io_write_ch / goc_io_write2_ch / goc_io_shutdown_stream_ch channel
  *          variants compile and return non-NULL channels (no network I/O)
@@ -192,7 +192,7 @@ static void fiber_p10_4(void* arg)
 {
     fiber_result_t* r = (fiber_result_t*)arg;
     goc_io_fs_stat_t* st = goc_io_fs_stat(TMP_PATH);
-    if (!st || st->ok != GOC_OK) goto done;
+    if (!st || st->ok != GOC_IO_OK) goto done;
     if ((int64_t)st->statbuf.st_size != CONTENT_LEN) goto done;
     r->ok = 1;
 done:;
@@ -221,11 +221,11 @@ static void fiber_p10_5(void* arg)
 
     /* Old path should no longer exist */
     goc_io_fs_stat_t* old_st = goc_io_fs_stat(TMP_PATH);
-    if (!old_st || old_st->ok == GOC_OK) goto done;  /* still exists = fail */
+    if (!old_st || old_st->ok == GOC_IO_OK) goto done;  /* still exists = fail */
 
     /* New path should exist with the same size */
     goc_io_fs_stat_t* new_st = goc_io_fs_stat(TMP_PATH2);
-    if (!new_st || new_st->ok != GOC_OK) goto done;
+    if (!new_st || new_st->ok != GOC_IO_OK) goto done;
     if ((int64_t)new_st->statbuf.st_size != CONTENT_LEN) goto done;
 
     r->ok = 1;
@@ -255,7 +255,7 @@ static void fiber_p10_6(void* arg)
 
     /* File should no longer exist */
     goc_io_fs_stat_t* st = goc_io_fs_stat(TMP_PATH2);
-    if (!st || st->ok == GOC_OK) goto done;  /* still exists = fail */
+    if (!st || st->ok == GOC_IO_OK) goto done;  /* still exists = fail */
 
     r->ok = 1;
 done:;
@@ -344,7 +344,7 @@ static void fiber_p10_9(void* arg)
     goc_val_t*          v  = goc_take(ch);
     if (!v || v->ok != GOC_OK) goto done;
     goc_io_getaddrinfo_t*  res = (goc_io_getaddrinfo_t*)v->val;
-    if (!res || res->ok != GOC_OK || res->res == NULL) goto done;
+    if (!res || res->ok != GOC_IO_OK || res->res == NULL) goto done;
     uv_freeaddrinfo(res->res);
     r->ok = 1;
 done:;
@@ -374,7 +374,7 @@ static void fiber_p10_10(void* arg)
     goc_io_getaddrinfo_t* res = (goc_io_getaddrinfo_t*)v->val;
     if (!res) goto done;
     /* libuv returns an error (EAI_NONAME or similar) when both are NULL */
-    if (res->ok == GOC_OK && res->res != NULL)
+    if (res->ok == GOC_IO_OK && res->res != NULL)
         uv_freeaddrinfo(res->res);
     /* Test passes regardless of status — we just need no crash */
     r->ok = 1;
@@ -405,7 +405,7 @@ static void test_p10_11(void)
     goc_val_t* v = goc_take_sync(ch);
     if (v && v->ok == GOC_OK && v->val) {
         goc_io_getaddrinfo_t* res = (goc_io_getaddrinfo_t*)v->val;
-        if (res->ok == GOC_OK && res->res)
+        if (res->ok == GOC_IO_OK && res->res)
             uv_freeaddrinfo(res->res);
     }
     TEST_PASS();

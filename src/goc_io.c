@@ -286,7 +286,7 @@ static void on_fs_stat(uv_fs_t* req)
 {
     goc_fs_ctx_t*     ctx = (goc_fs_ctx_t*)req;
     goc_io_fs_stat_t* res = (goc_io_fs_stat_t*)goc_malloc(sizeof(goc_io_fs_stat_t));
-    res->ok = (req->result == 0) ? GOC_OK : GOC_CLOSED;
+    res->ok = (req->result == 0) ? GOC_IO_OK : GOC_IO_ERR;
     if (req->result == 0)
         res->statbuf = req->statbuf;
     uv_fs_req_cleanup(req);
@@ -305,7 +305,7 @@ goc_chan* goc_io_fs_stat_ch(const char* path)
     int rc = uv_fs_stat(g_loop, &ctx->req, path, on_fs_stat);
     if (rc < 0) {
         goc_io_fs_stat_t* res = (goc_io_fs_stat_t*)goc_malloc(sizeof(goc_io_fs_stat_t));
-        res->ok = GOC_CLOSED;
+        res->ok = GOC_IO_ERR;
         goc_put_cb(ch, res, NULL, NULL);
         goc_close(ch);
         free(ctx);
@@ -424,7 +424,7 @@ static void on_getaddrinfo(uv_getaddrinfo_t* req, int status,
     goc_getaddrinfo_ctx_t* ctx = (goc_getaddrinfo_ctx_t*)req;
     goc_io_getaddrinfo_t*  r   = (goc_io_getaddrinfo_t*)goc_malloc(
                                      sizeof(goc_io_getaddrinfo_t));
-    r->ok  = (status == 0) ? GOC_OK : GOC_CLOSED;
+    r->ok  = (status == 0) ? GOC_IO_OK : GOC_IO_ERR;
     r->res = res;
     uv_handle_chan_unregister(ctx->ch);
     goc_put_cb(ctx->ch, r, NULL, NULL);
@@ -445,7 +445,7 @@ goc_chan* goc_io_getaddrinfo_ch(const char* node, const char* service,
     if (rc < 0) {
         goc_io_getaddrinfo_t* r = (goc_io_getaddrinfo_t*)goc_malloc(
                                    sizeof(goc_io_getaddrinfo_t));
-        r->ok  = GOC_CLOSED;
+        r->ok  = GOC_IO_ERR;
         r->res = NULL;
         goc_put_cb(ch, r, NULL, NULL);
         goc_close(ch);
@@ -479,7 +479,7 @@ static void on_getnameinfo(uv_getnameinfo_t* req, int status,
     goc_getnameinfo_ctx_t* ctx = (goc_getnameinfo_ctx_t*)req;
     goc_io_getnameinfo_t*  r   = (goc_io_getnameinfo_t*)goc_malloc(
                                      sizeof(goc_io_getnameinfo_t));
-    r->ok = (status == 0) ? GOC_OK : GOC_CLOSED;
+    r->ok = (status == 0) ? GOC_IO_OK : GOC_IO_ERR;
     if (hostname)
         strncpy(r->hostname, hostname, sizeof(r->hostname) - 1);
     else
@@ -507,7 +507,7 @@ goc_chan* goc_io_getnameinfo_ch(const struct sockaddr* addr, int flags)
     if (rc < 0) {
         goc_io_getnameinfo_t* r = (goc_io_getnameinfo_t*)goc_malloc(
                                    sizeof(goc_io_getnameinfo_t));
-        r->ok         = GOC_CLOSED;
+        r->ok         = GOC_IO_ERR;
         r->hostname[0] = '\0';
         r->service[0]  = '\0';
         goc_put_cb(ch, r, NULL, NULL);
@@ -534,7 +534,7 @@ goc_io_getnameinfo_t* goc_io_getnameinfo(const struct sockaddr* addr, int flags)
  *
  * The streaming read and stop operations store a context pointer in
  * handle->data.  The caller must not use handle->data for other purposes
- * while a goc_io_read_start / goc_io_read_stop pair is active on that handle.
+ * while a goc_io_read_start_ch / goc_io_read_stop pair is active on that handle.
  * ====================================================================== */
 
 /* -------------------------------------------------------------------------
@@ -557,7 +557,7 @@ static void goc_alloc_cb(uv_handle_t* handle, size_t suggested_size,
 }
 
 /* -------------------------------------------------------------------------
- * goc_io_read_start
+ * goc_io_read_start_ch
  * ---------------------------------------------------------------------- */
 
 typedef struct {
@@ -632,7 +632,7 @@ static void on_read_start_dispatch(uv_async_t* h)
     uv_close((uv_handle_t*)h, free_io_handle);
 }
 
-goc_chan* goc_io_read_start(uv_stream_t* stream)
+goc_chan* goc_io_read_start_ch(uv_stream_t* stream)
 {
     goc_chan*                   ch = goc_chan_make(16);
     goc_read_start_dispatch_t*  d  = (goc_read_start_dispatch_t*)malloc(
@@ -1087,7 +1087,7 @@ int goc_io_udp_send(uv_udp_t* handle,
 }
 
 /* -------------------------------------------------------------------------
- * goc_io_udp_recv_start / goc_io_udp_recv_stop
+ * goc_io_udp_recv_start_ch / goc_io_udp_recv_stop
  * ---------------------------------------------------------------------- */
 
 typedef struct {
@@ -1178,7 +1178,7 @@ static void on_udp_recv_start_dispatch(uv_async_t* h)
     uv_close((uv_handle_t*)h, free_io_handle);
 }
 
-goc_chan* goc_io_udp_recv_start(uv_udp_t* handle)
+goc_chan* goc_io_udp_recv_start_ch(uv_udp_t* handle)
 {
     goc_chan*                      ch = goc_chan_make(16);
     goc_udp_recv_start_dispatch_t* d  = (goc_udp_recv_start_dispatch_t*)malloc(

@@ -69,6 +69,19 @@ extern "C" {
 #endif
 
 /* =========================================================================
+ * I/O operation status
+ * ====================================================================== */
+
+typedef enum {
+    GOC_IO_ERR =  0,  /* I/O operation failed                  */
+    GOC_IO_OK  =  1,  /* I/O operation completed successfully   */
+} goc_io_status_t;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* =========================================================================
  * Result types
  * ====================================================================== */
 
@@ -77,7 +90,7 @@ extern "C" {
  * ---------------------------------------------------------------------- */
 
 /**
- * goc_io_read_t — result of one read callback fired by goc_io_read_start.
+ * goc_io_read_t — result of one read callback fired by goc_io_read_start_ch.
  *
  * nread : bytes read (> 0) on a data event.  On error this is a negative
  *         libuv error code.
@@ -97,7 +110,7 @@ typedef struct {
 
 /**
  * goc_io_udp_recv_t — result of one receive callback fired by
- * goc_io_udp_recv_start.
+ * goc_io_udp_recv_start_ch.
  *
  * nread : bytes received (> 0) on a datagram event.  On error this is a
  *         negative libuv error code.
@@ -124,10 +137,10 @@ typedef struct {
  * goc_io_fs_stat_t — result of goc_io_fs_stat.
  *
  * ok      : GOC_OK on success, GOC_CLOSED on failure.
- * statbuf : populated when ok == GOC_OK.
+ * statbuf : populated when ok == GOC_IO_OK.
  */
 typedef struct {
-    goc_status_t ok;
+    goc_io_status_t ok;
     uv_stat_t    statbuf;
 } goc_io_fs_stat_t;
 
@@ -141,7 +154,7 @@ typedef struct {
  * ok  : GOC_OK on success, GOC_CLOSED on failure.
  * res : linked list of addrinfo results allocated by libuv.  The caller
  *       must release it with uv_freeaddrinfo(res) when done.
- *       NULL when ok != GOC_OK.
+ *       NULL when ok != GOC_IO_OK.
  */
 typedef struct {
     goc_status_t     ok;
@@ -152,11 +165,11 @@ typedef struct {
  * goc_io_getnameinfo_t — result of goc_io_getnameinfo.
  *
  * ok       : GOC_OK on success, GOC_CLOSED on failure.
- * hostname : resolved host name (NUL-terminated).  Empty when ok != GOC_OK.
- * service  : resolved service name (NUL-terminated).  Empty when ok != GOC_OK.
+ * hostname : resolved host name (NUL-terminated).  Empty when ok != GOC_IO_OK.
+ * service  : resolved service name (NUL-terminated).  Empty when ok != GOC_IO_OK.
  */
 typedef struct {
-    goc_status_t ok;
+    goc_io_status_t ok;
     char         hostname[NI_MAXHOST];
     char         service[NI_MAXSERV];
 } goc_io_getnameinfo_t;
@@ -166,7 +179,7 @@ typedef struct {
  * ====================================================================== */
 
 /**
- * goc_io_read_start() — Begin receiving data from a stream.
+ * goc_io_read_start_ch() — Begin receiving data from a stream.
  *
  * stream : an initialised and connected libuv stream handle.
  *
@@ -178,17 +191,17 @@ typedef struct {
  *
  * Safe to call from any context (fiber or OS thread).
  */
-goc_chan* goc_io_read_start(uv_stream_t* stream);
+goc_chan* goc_io_read_start_ch(uv_stream_t* stream);
 
 /**
  * goc_io_read_stop() — Stop reading from a stream previously started with
- * goc_io_read_start().
+ * goc_io_read_start_ch().
  *
  * Dispatches uv_read_stop() to the event loop thread and closes the
  * associated read channel.  Returns 0; the actual stop happens
  * asynchronously on the event loop thread.
  *
- * stream : the same handle passed to goc_io_read_start().
+ * stream : the same handle passed to goc_io_read_start_ch().
  *
  * Safe to call from any context.
  */
@@ -322,7 +335,7 @@ int goc_io_udp_send(uv_udp_t* handle,
                     const struct sockaddr* addr);
 
 /**
- * goc_io_udp_recv_start() — Begin receiving UDP datagrams.
+ * goc_io_udp_recv_start_ch() — Begin receiving UDP datagrams.
  *
  * handle : an initialised and bound uv_udp_t handle.
  *
@@ -331,7 +344,7 @@ int goc_io_udp_send(uv_udp_t* handle,
  * last delivered value carries the error code in nread.
  * Call goc_io_udp_recv_stop() to stop receiving and close the channel.
  */
-goc_chan* goc_io_udp_recv_start(uv_udp_t* handle);
+goc_chan* goc_io_udp_recv_start_ch(uv_udp_t* handle);
 
 /**
  * goc_io_udp_recv_stop() — Stop receiving UDP datagrams.
@@ -523,7 +536,7 @@ ssize_t goc_io_fs_sendfile(uv_file out_fd, uv_file in_fd,
  * hints   : address hints (may be NULL).
  *
  * Returns a channel delivering goc_io_getaddrinfo_t*.  On success
- * (ok == GOC_OK) the caller must release result->res with uv_freeaddrinfo().
+ * (ok == GOC_IO_OK) the caller must release result->res with uv_freeaddrinfo().
  *
  * Safe to call from any context.
  */

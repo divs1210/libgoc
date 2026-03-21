@@ -97,7 +97,7 @@ Single-result operations (write, connect, open, read, etc.) return scalars direc
 Composite result types (channel delivers a GC-managed pointer):
 
 ```c
-/* goc_io_read_t — result of one read callback fired by goc_io_read_start.
+/* goc_io_read_t — result of one read callback fired by goc_io_read_start_ch.
  * nread > 0: bytes read; nread < 0: libuv error (channel closed after this).
  * buf: GC-managed buffer. Valid when nread > 0; NULL otherwise.
  * libgoc does not free buf. */
@@ -119,14 +119,14 @@ typedef struct {
 } goc_io_udp_recv_t;
 
 /* goc_io_fs_stat_t — result of goc_io_fs_stat.
- * ok == GOC_OK: success (statbuf populated).  ok == GOC_CLOSED: failure. */
+ * ok == GOC_IO_OK: success (statbuf populated).  ok == GOC_IO_ERR: failure. */
 typedef struct {
-    goc_status_t ok;
+    goc_io_status_t ok;
     uv_stat_t    statbuf;
 } goc_io_fs_stat_t;
 
 /* goc_io_getaddrinfo_t — result of goc_io_getaddrinfo.
- * ok == GOC_OK: success (res populated).  ok == GOC_CLOSED: failure.
+ * ok == GOC_IO_OK: success (res populated).  ok == GOC_IO_ERR: failure.
  * Release res with uv_freeaddrinfo() when done. */
 typedef struct {
     goc_status_t     ok;
@@ -134,9 +134,9 @@ typedef struct {
 } goc_io_getaddrinfo_t;
 
 /* goc_io_getnameinfo_t — result of goc_io_getnameinfo.
- * ok == GOC_OK: success (hostname/service populated). */
+ * ok == GOC_IO_OK: success (hostname/service populated). */
 typedef struct {
-    goc_status_t ok;
+    goc_io_status_t ok;
     char         hostname[NI_MAXHOST];
     char         service[NI_MAXSERV];
 } goc_io_getnameinfo_t;
@@ -150,13 +150,13 @@ typedef struct {
 
 | Function | Signature | Description |
 |---|---|---|
-| `goc_io_read_start` | `goc_chan* goc_io_read_start(uv_stream_t* stream)` | Begin receiving data from a stream. Returns a channel that delivers `goc_io_read_t*` values, one per read callback. The channel is closed on EOF or unrecoverable error; the last delivered value carries the error code in `nread`. Call `goc_io_read_stop()` to stop before EOF. Safe from any context. |
+| `goc_io_read_start_ch` | `goc_chan* goc_io_read_start_ch(uv_stream_t* stream)` | Begin receiving data from a stream. Returns a channel that delivers `goc_io_read_t*` values, one per read callback. The channel is closed on EOF or unrecoverable error; the last delivered value carries the error code in `nread`. Call `goc_io_read_stop()` to stop before EOF. Safe from any context. |
 | `goc_io_read_stop` | `int goc_io_read_stop(uv_stream_t* stream)` | Dispatch `uv_read_stop()` to the event loop thread and close the read channel. Returns 0; the stop takes effect asynchronously. Safe from any context. |
 
 ```c
-goc_chan* rch = goc_io_read_start(stream);
+goc_chan* rch = goc_io_read_start_ch(stream);
 goc_val_t* v;
-while ((v = goc_take(rch))->ok == GOC_OK) {
+while ((v = goc_take(rch))->ok == GOC_IO_OK) {
     goc_io_read_t* rd = (goc_io_read_t*)v->val;
     if (rd->nread < 0) break;          /* error */
     fwrite(rd->buf->base, 1, (size_t)rd->nread, stdout);
@@ -192,7 +192,7 @@ while ((v = goc_take(rch))->ok == GOC_OK) {
 |---|---|---|
 | `goc_io_udp_send_ch` | `goc_chan* goc_io_udp_send_ch(uv_udp_t* handle, const uv_buf_t bufs[], unsigned int nbufs, const struct sockaddr* addr)` | Initiate an async UDP send; return result channel delivering `goc_io_udp_send_t*`. |
 | `goc_io_udp_send` | `int goc_io_udp_send(uv_udp_t* handle, const uv_buf_t bufs[], unsigned int nbufs, const struct sockaddr* addr)` | Async UDP send; block until complete. Returns 0 on success. Fiber context only. |
-| `goc_io_udp_recv_start` | `goc_chan* goc_io_udp_recv_start(uv_udp_t* handle)` | Begin receiving UDP datagrams. Returns a channel delivering `goc_io_udp_recv_t*` values, one per datagram. Channel is closed on unrecoverable error. Call `goc_io_udp_recv_stop()` to stop. |
+| `goc_io_udp_recv_start_ch` | `goc_chan* goc_io_udp_recv_start_ch(uv_udp_t* handle)` | Begin receiving UDP datagrams. Returns a channel delivering `goc_io_udp_recv_t*` values, one per datagram. Channel is closed on unrecoverable error. Call `goc_io_udp_recv_stop()` to stop. |
 | `goc_io_udp_recv_stop` | `int goc_io_udp_recv_stop(uv_udp_t* handle)` | Stop receiving UDP datagrams and close the receive channel. Returns 0; takes effect asynchronously. |
 
 ---
@@ -276,7 +276,7 @@ Both functions are safe to call from any context.
 static void dns_fiber(void* _) {
     goc_io_getaddrinfo_t* result =
         goc_io_getaddrinfo("example.com", "https", NULL);
-    if (result->ok == GOC_OK) {
+    if (result->ok == GOC_IO_OK) {
         char host[256];
         getnameinfo(result->res->ai_addr, result->res->ai_addrlen,
                     host, sizeof(host), NULL, 0, NI_NUMERICHOST);
