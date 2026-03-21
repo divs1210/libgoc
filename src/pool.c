@@ -16,6 +16,7 @@
  */
 
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
@@ -150,7 +151,7 @@ static void* pool_worker_fn(void* arg) {
 
     /* Per-worker PRNG seed for randomised steal order (anti-thundering-herd).
      * Combines index with the worker pointer for uniqueness. */
-    unsigned int seed = (unsigned int)(tl_worker->index ^ (uintptr_t)tl_worker);
+    uint32_t seed = (uint32_t)(tl_worker->index ^ (uintptr_t)tl_worker);
 
     goc_entry* entry;
 
@@ -168,7 +169,9 @@ static void* pool_worker_fn(void* arg) {
          *    randomised offset to avoid thundering-herd on a fixed victim.
          *    Self is explicitly excluded. */
         if (pool->thread_count > 1) {
-            size_t offset = 1 + (size_t)(rand_r(&seed) % (int)(pool->thread_count - 1));
+            /* xorshift32 — portable thread-local PRNG (no rand_r on Windows). */
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+            size_t offset = 1 + (size_t)(seed % (uint32_t)(pool->thread_count - 1));
             for (size_t i = 0; i < pool->thread_count; i++) {
                 size_t victim = (tl_worker->index + offset + i) % pool->thread_count;
                 if (victim == tl_worker->index) continue;
