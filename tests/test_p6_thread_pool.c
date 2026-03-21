@@ -61,6 +61,12 @@
  *   P6.16  injector concurrent push from multiple threads
  *   P6.17  wsdq pop_bottom / steal_top race on the last element (no
  *          double-delivery, no loss, no hang)
+ *   P6.18  pool internal post: burst of child fibers (spawned inside a fiber
+ *          via goc_go_on) all complete — verifies that idle workers beyond
+ *          the fixed (w->index+1)%N neighbor are eventually woken/utilized
+ *   P6.19  pool external post sleep-miss: serial external posts with forced
+ *          idle windows — verifies that a worker sleeping in uv_sem_wait is
+ *          reliably woken when an external caller pushes to its injector
  *
  * Notes:
  *   - goc_init() is called once in main() before any test runs.
@@ -118,6 +124,29 @@ static void done_wait(done_t* d) {
 static void done_destroy(done_t* d) {
     pthread_mutex_destroy(&d->mtx);
     pthread_cond_destroy(&d->cond);
+}
+
+/*
+ * done_wait_timeout — like done_wait but gives up after timeout_ms.
+ * Returns true if the flag was set, false if the deadline was reached.
+ */
+static bool done_wait_timeout(done_t* d, int timeout_ms) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec  += timeout_ms / 1000;
+    ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&d->mtx);
+    int rc = 0;
+    while (!d->flag && rc == 0)
+        rc = pthread_cond_timedwait(&d->cond, &d->mtx, &ts);
+    bool got = (d->flag != 0);
+    d->flag = 0;
+    pthread_mutex_unlock(&d->mtx);
+    return got;
 }
 
 /* =========================================================================
@@ -1007,6 +1036,145 @@ static void test_p6_17(void) {
 done:;
 }
 
+/* ---- P6.18: internal post — burst of child fibers all complete ---- */
+/*
+ * Bug being tested (pool.c internal path in post_to_run_queue):
+ *   When a fiber posts work internally, the code always wakes
+ *   workers[(w->index + 1) % N] regardless of which worker is actually idle.
+ *   If that fixed neighbor is busy, other idle workers beyond it are never
+ *   notified and their steal loops only run after they happen to wake for
+ *   another reason.  Under a burst of N_CHILDREN internal posts this means
+ *   entries pile up in the spawner's deque and may never reach the idle
+ *   workers at index+2, index+3, …
+ *
+ * Test strategy:
+ *   A parent fiber (running on some worker W) calls goc_go_on N_CHILDREN
+ *   times.  Each call takes the internal path: push entry to W's deque,
+ *   then unconditionally wake workers[(W+1)%N].  The parent then exits.
+ *   Each child atomically increments a shared counter; when it reaches
+ *   N_CHILDREN the last child signals done.  The main thread waits with a
+ *   3-second deadline.  A timeout indicates that idle workers were not
+ *   notified and entries stagnated in W's deque.
+ */
+#define P6_18_WORKERS  4
+#define P6_18_CHILDREN 500
+
+typedef struct {
+    goc_pool*    pool;
+    done_t*      done;
+    _Atomic int* completed;
+    int          total;
+} p6_18_arg_t;
+
+static void p6_18_child_fn(void* arg) {
+    p6_18_arg_t* a = (p6_18_arg_t*)arg;
+    /* Signal when the last child finishes. */
+    if (atomic_fetch_add_explicit(a->completed, 1, memory_order_acq_rel) + 1
+            == a->total)
+        done_signal(a->done);
+}
+
+static void p6_18_spawner_fn(void* arg) {
+    p6_18_arg_t* a = (p6_18_arg_t*)arg;
+    /* All goc_go_on calls here take the *internal* post path because
+     * tl_worker != NULL (we are running inside a pool worker fiber). */
+    for (int i = 0; i < a->total; i++)
+        goc_go_on(a->pool, p6_18_child_fn, a);
+}
+
+static void test_p6_18(void) {
+    TEST_BEGIN("P6.18  internal post: burst of child fibers all complete");
+
+    done_t done;
+    done_init(&done);
+    _Atomic int completed = 0;
+
+    goc_pool* pool = goc_pool_make(P6_18_WORKERS);
+    ASSERT(pool != NULL);
+
+    p6_18_arg_t args = { pool, &done, &completed, P6_18_CHILDREN };
+
+    /* Dispatch the spawner via *external* post so tl_worker is set when the
+     * spawner runs, making every child dispatch hit the internal path. */
+    goc_go_on(pool, p6_18_spawner_fn, &args);
+
+    /* 3-second deadline: a timeout means idle workers were never woken and
+     * entries stagnated in the spawner's deque. */
+    bool ok = done_wait_timeout(&done, 3000);
+    ASSERT(ok);
+
+    goc_pool_destroy(pool);
+    done_destroy(&done);
+    TEST_PASS();
+done:;
+}
+
+/* ---- P6.19: external post sleep-miss — worker wakes reliably ---- */
+/*
+ * Bug being tested (pool.c external path in post_to_run_queue):
+ *   The external path relies on the mutex unlock inside injector_push to
+ *   supply the seq_cst barrier needed to close the sleep-miss race.  A
+ *   C11 mutex unlock is a *release*, not seq_cst.  On ARM/POWER the
+ *   injector_push unlock may not order before the subsequent seq_cst
+ *   idle_count read, so the poster could observe idle_count == 0 (stale),
+ *   skip the sem_post, and leave a sleeping worker with work in its injector.
+ *
+ * Test strategy:
+ *   Repeat N_ROUNDS times:
+ *     1. Wait for the previous fiber to complete (guarantees all workers
+ *        have had time to drain their deques and go idle in uv_sem_wait).
+ *     2. usleep(500) to let all workers settle into sem_wait.
+ *     3. Post one fiber via goc_go_on (external path — called from the
+ *        main OS thread, so tl_worker == NULL).
+ *     4. Wait up to 2 seconds for it to signal done.
+ *   A timeout on any round means an external post was lost: the sleep-miss
+ *   race fired and the injected entry sat unseen in a worker's injector.
+ */
+#define P6_19_WORKERS 4
+#define P6_19_ROUNDS  200
+
+typedef struct {
+    done_t* done;
+} p6_19_arg_t;
+
+static void p6_19_fiber_fn(void* arg) {
+    p6_19_arg_t* a = (p6_19_arg_t*)arg;
+    done_signal(a->done);
+}
+
+static void test_p6_19(void) {
+    TEST_BEGIN("P6.19  external post sleep-miss: worker wakes reliably after idle");
+
+    done_t done;
+    done_init(&done);
+
+    goc_pool* pool = goc_pool_make(P6_19_WORKERS);
+    ASSERT(pool != NULL);
+
+    p6_19_arg_t args = { &done };
+
+    for (int i = 0; i < P6_19_ROUNDS; i++) {
+        /* Give workers time to drain and enter uv_sem_wait. */
+        usleep(500);
+
+        /* External post: main thread → tl_worker == NULL → injector path. */
+        goc_go_on(pool, p6_19_fiber_fn, &args);
+
+        /* 2-second deadline per round. Timeout = sleep-miss: posted entry
+         * sat in injector while the worker slept without being woken. */
+        bool ok = done_wait_timeout(&done, 2000);
+        if (!ok) {
+            ASSERT(false);  /* print location and jump to cleanup */
+            break;
+        }
+    }
+
+    goc_pool_destroy(pool);
+    done_destroy(&done);
+    TEST_PASS();
+done:;
+}
+
 /* =========================================================================
  * main
  *
@@ -1044,6 +1212,8 @@ int main(void) {
     test_p6_15();
     test_p6_16();
     test_p6_17();
+    test_p6_18();
+    test_p6_19();
     printf("\n");
 
     goc_shutdown();
