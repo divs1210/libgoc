@@ -79,6 +79,10 @@
  *          double-check (but before uv_sem_wait) is still processed within
  *          deadline, not silently dropped; also catches deferred-
  *          materialization GC race under a larger burst (1000 children)
+ *   P6.22  double-resume via stack-address reuse: many ping-pong pairs on
+ *          unbuffered channels with a high worker count; verifies that
+ *          heap-allocated parking entries prevent a waker spinning on the
+ *          old entry from claiming the new entry at the same stack address
  *
  * Notes:
  *   - goc_init() is called once in main() before any test runs.
@@ -1397,6 +1401,137 @@ static void test_p6_21(void) {
 done:;
 }
 
+/* ---- P6.22: double-resume via stack-address reuse ---- */
+/*
+ * Bug being tested (channel.c slow path — fixed by commit "GC allocate parked
+ * entries to avoid race condition"):
+ *
+ *   goc_take and goc_put originally stack-allocated the parking goc_entry:
+ *     goc_entry e = {0};  // on the fiber's coroutine stack
+ *   When the fiber parked, it appended &e to the channel's takers/putters
+ *   list, then yielded.
+ *
+ *   Race sequence (requires work-stealing):
+ *     1. Fiber A calls goc_take(ch) → slow path → stack entry at address X
+ *        with woken=0, appended to takers list.
+ *     2. Fiber B calls goc_put(ch) → wake(e_at_X):
+ *          a. CAS: woken 0→1 on entry X.
+ *          b. Spin: waiting for fe->parked to become 1 (fiber A truly yielded).
+ *          c. post_to_run_queue dispatches A to B's deque (entry at addr Y).
+ *     3. Worker W2 STEALS Y from B's deque and resumes A before B's spin ends.
+ *     4. A returns from goc_take (local_result/e.ok read), immediately calls
+ *        goc_take(ch) again in a loop — same call depth → new goc_entry e
+ *        at the SAME stack address X, with woken=0, parked=1.
+ *     5. B's spin completes (parked==1 from the NEW entry at X), reads
+ *        woken==0 on the new entry, wins a SECOND CAS, posts A again.
+ *     6. A is double-resumed: one worker resumes an already-running coro →
+ *        MCO abort / stall / data corruption.
+ *
+ *   Fix: heap-allocate the parking entry via goc_malloc so each parking
+ *   instance has a unique address; old entries are never confused with new.
+ *
+ * Test strategy:
+ *   P6_22_PAIRS pairs of fibers, each pair doing P6_22_ROUNDS of ping-pong
+ *   on an unbuffered channel pair (req + ack).  Sender and receiver each
+ *   park on goc_take in a tight loop — re-parking at the exact same stack
+ *   offset on every iteration.  A large pool (P6_22_WORKERS) maximises the
+ *   steal probability that opens the race window.
+ *
+ *   If the bug is present: one fiber in a pair is double-resumed; its
+ *   partner hangs waiting for a rendezvous that never comes → test times out.
+ *   If the fix holds: all pairs complete within the deadline.
+ *
+ *   A timeout from this test has two possible causes:
+ *   (1) Double-resume (this bug): a waker posts a fiber twice; the second
+ *       resume races against the first, corrupting coroutine state so the
+ *       partner fiber stalls forever waiting for a rendezvous that never
+ *       arrives.
+ *   (2) Scheduler wakeup bugs (#4 fixed-neighbor wakeup, #7 idle steal gap):
+ *       partner fibers are never scheduled because the workers that hold
+ *       their entries are not notified.  P6.18 and P6.21 isolate those bugs
+ *       in isolation; this test intentionally exercises both simultaneously
+ *       with a high worker count (P6_22_WORKERS=8) to maximise concurrency
+ *       and will also fail if either scheduler issue causes a stall.
+ */
+#define P6_22_WORKERS 8
+#define P6_22_PAIRS   20
+#define P6_22_ROUNDS  300
+
+typedef struct {
+    goc_chan*    req;
+    goc_chan*    ack;
+    _Atomic int* finished;
+    int          expected;
+    done_t*      done;
+} p6_22_pair_t;
+
+static void p6_22_sender_fn(void* arg) {
+    p6_22_pair_t* p = (p6_22_pair_t*)arg;
+    for (int i = 0; i < P6_22_ROUNDS; i++) {
+        /* slow-path put: parks if no receiver is waiting */
+        goc_put(p->req, (void*)(uintptr_t)(i + 1));
+        /* slow-path take at the SAME call depth on every iteration;
+         * re-uses the same stack slot for the parking goc_entry each time */
+        goc_take(p->ack);
+    }
+    if (atomic_fetch_add_explicit(p->finished, 1, memory_order_acq_rel) + 1
+            == p->expected)
+        done_signal(p->done);
+}
+
+static void p6_22_receiver_fn(void* arg) {
+    p6_22_pair_t* p = (p6_22_pair_t*)arg;
+    for (int i = 0; i < P6_22_ROUNDS; i++) {
+        /* slow-path take: same re-use pattern as the sender */
+        goc_take(p->req);
+        goc_put(p->ack, NULL);
+    }
+    if (atomic_fetch_add_explicit(p->finished, 1, memory_order_acq_rel) + 1
+            == p->expected)
+        done_signal(p->done);
+}
+
+static void test_p6_22(void) {
+    TEST_BEGIN("P6.22  double-resume/stack-address reuse: ping-pong completes without hang");
+
+    done_t done;
+    done_init(&done);
+    _Atomic int finished = 0;
+
+    goc_pool* pool = goc_pool_make(P6_22_WORKERS);
+    ASSERT(pool != NULL);
+
+    p6_22_pair_t pairs[P6_22_PAIRS];
+    for (int i = 0; i < P6_22_PAIRS; i++) {
+        pairs[i].req      = goc_chan_make(0);   /* unbuffered: always slow path */
+        pairs[i].ack      = goc_chan_make(0);
+        pairs[i].finished = &finished;
+        pairs[i].expected = P6_22_PAIRS * 2;   /* both sender and receiver count */
+        pairs[i].done     = &done;
+        ASSERT(pairs[i].req != NULL);
+        ASSERT(pairs[i].ack != NULL);
+    }
+
+    for (int i = 0; i < P6_22_PAIRS; i++) {
+        goc_go_on(pool, p6_22_sender_fn,   &pairs[i]);
+        goc_go_on(pool, p6_22_receiver_fn, &pairs[i]);
+    }
+
+    /* Generous deadline: only a double-resume (hang) causes a timeout.
+     * A double-resume crash would appear as SIGABRT / signal 11 here. */
+    bool ok = done_wait_timeout(&done, 5000);
+    ASSERT(ok);
+
+    for (int i = 0; i < P6_22_PAIRS; i++) {
+        goc_close(pairs[i].req);
+        goc_close(pairs[i].ack);
+    }
+    goc_pool_destroy(pool);
+    done_destroy(&done);
+    TEST_PASS();
+done:;
+}
+
 /* =========================================================================
  * main
  *
@@ -1438,6 +1573,7 @@ int main(void) {
     test_p6_19();
     test_p6_20();
     test_p6_21();
+    test_p6_22();
     printf("\n");
 
     goc_shutdown();
