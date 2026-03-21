@@ -769,7 +769,8 @@ static void on_write2_cb(uv_write_t* req, int status)
     goc_write2_ctx_t* ctx = (goc_write2_ctx_t*)req;
     goc_write_t*      res = (goc_write_t*)goc_malloc(sizeof(goc_write_t));
     res->status = status;
-    goc_put_sync(ctx->ch, res);
+    uv_handle_chan_unregister(ctx->ch);
+    goc_put_cb(ctx->ch, res, NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -795,7 +796,8 @@ static void on_write2_dispatch(uv_async_t* h)
     if (rc < 0) {
         goc_write_t* res = (goc_write_t*)goc_malloc(sizeof(goc_write_t));
         res->status = rc;
-        goc_put_sync(ctx->ch, res);
+        uv_handle_chan_unregister(ctx->ch);
+        goc_put_cb(ctx->ch, res, NULL, NULL);
         goc_close(ctx->ch);
         free(ctx);
     }
@@ -815,6 +817,7 @@ goc_chan* goc_write2_ch(uv_stream_t* handle,
     d->nbufs       = nbufs;
     d->send_handle = send_handle;
     d->ch          = ch;
+    uv_handle_chan_register(ch);
     uv_async_init(g_loop, &d->async, on_write2_dispatch);
     uv_async_send(&d->async);
     return ch;
@@ -843,7 +846,8 @@ static void on_shutdown_cb(uv_shutdown_t* req, int status)
     goc_shutdown_ctx_t* ctx = (goc_shutdown_ctx_t*)req;
     goc_shutdown_t*     res = (goc_shutdown_t*)goc_malloc(sizeof(goc_shutdown_t));
     res->status = status;
-    goc_put_sync(ctx->ch, res);
+    uv_handle_chan_unregister(ctx->ch);
+    goc_put_cb(ctx->ch, res, NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -865,7 +869,8 @@ static void on_shutdown_dispatch(uv_async_t* h)
     if (rc < 0) {
         goc_shutdown_t* res = (goc_shutdown_t*)goc_malloc(sizeof(goc_shutdown_t));
         res->status = rc;
-        goc_put_sync(ctx->ch, res);
+        uv_handle_chan_unregister(ctx->ch);
+        goc_put_cb(ctx->ch, res, NULL, NULL);
         goc_close(ctx->ch);
         free(ctx);
     }
@@ -880,6 +885,7 @@ goc_chan* goc_shutdown_stream_ch(uv_stream_t* handle)
     assert(d);
     d->handle = handle;
     d->ch     = ch;
+    uv_handle_chan_register(ch);
     uv_async_init(g_loop, &d->async, on_shutdown_dispatch);
     uv_async_send(&d->async);
     return ch;
@@ -906,7 +912,8 @@ static void on_connect_cb(uv_connect_t* req, int status)
     goc_connect_ctx_t* ctx = (goc_connect_ctx_t*)req;
     goc_connect_t*     res = (goc_connect_t*)goc_malloc(sizeof(goc_connect_t));
     res->status = status;
-    goc_put_sync(ctx->ch, res);
+    uv_handle_chan_unregister(ctx->ch);
+    goc_put_cb(ctx->ch, res, NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -931,7 +938,8 @@ static void on_tcp_connect_dispatch(uv_async_t* h)
     if (rc < 0) {
         goc_connect_t* res = (goc_connect_t*)goc_malloc(sizeof(goc_connect_t));
         res->status = rc;
-        goc_put_sync(ctx->ch, res);
+        uv_handle_chan_unregister(ctx->ch);
+        goc_put_cb(ctx->ch, res, NULL, NULL);
         goc_close(ctx->ch);
         free(ctx);
     }
@@ -953,6 +961,7 @@ goc_chan* goc_tcp_connect_ch(uv_tcp_t* handle, const struct sockaddr* addr)
                ? sizeof(struct sockaddr_in6)
                : sizeof(struct sockaddr_in));
     d->ch = ch;
+    uv_handle_chan_register(ch);
     uv_async_init(g_loop, &d->async, on_tcp_connect_dispatch);
     uv_async_send(&d->async);
     return ch;
@@ -1000,6 +1009,7 @@ goc_chan* goc_pipe_connect_ch(uv_pipe_t* handle, const char* name)
     d->name   = strdup(name);   /* copied so the caller's string can be freed */
     assert(d->name);
     d->ch = ch;
+    uv_handle_chan_register(ch);
     uv_async_init(g_loop, &d->async, on_pipe_connect_dispatch);
     uv_async_send(&d->async);
     return ch;
@@ -1030,7 +1040,8 @@ static void on_udp_send_cb(uv_udp_send_t* req, int status)
     goc_udp_send_ctx_t* ctx = (goc_udp_send_ctx_t*)req;
     goc_udp_send_t*     res = (goc_udp_send_t*)goc_malloc(sizeof(goc_udp_send_t));
     res->status = status;
-    goc_put_sync(ctx->ch, res);
+    uv_handle_chan_unregister(ctx->ch);
+    goc_put_cb(ctx->ch, res, NULL, NULL);
     goc_close(ctx->ch);
     free(ctx);
 }
@@ -1056,7 +1067,8 @@ static void on_udp_send_dispatch(uv_async_t* h)
     if (rc < 0) {
         goc_udp_send_t* res = (goc_udp_send_t*)goc_malloc(sizeof(goc_udp_send_t));
         res->status = rc;
-        goc_put_sync(ctx->ch, res);
+        uv_handle_chan_unregister(ctx->ch);
+        goc_put_cb(ctx->ch, res, NULL, NULL);
         goc_close(ctx->ch);
         free(ctx);
     }
@@ -1079,6 +1091,7 @@ goc_chan* goc_udp_send_ch(uv_udp_t* handle,
                ? sizeof(struct sockaddr_in6)
                : sizeof(struct sockaddr_in));
     d->ch = ch;
+    uv_handle_chan_register(ch);
     uv_async_init(g_loop, &d->async, on_udp_send_dispatch);
     uv_async_send(&d->async);
     return ch;
@@ -1122,6 +1135,7 @@ static void on_udp_recv_cb(uv_udp_t* handle, ssize_t nread,
         res->buf.len  = 0;
         memset(&res->addr, 0, sizeof(res->addr));
         res->flags    = 0;
+        uv_handle_chan_unregister(ctx->ch);
         goc_put_cb(ctx->ch, res, NULL, NULL);
         goc_close(ctx->ch);
         free(ctx);
@@ -1168,7 +1182,8 @@ static void on_udp_recv_start_dispatch(uv_async_t* h)
         res->buf.len  = 0;
         memset(&res->addr, 0, sizeof(res->addr));
         res->flags    = 0;
-        goc_put_sync(d->ch, res);
+        uv_handle_chan_unregister(d->ch);
+        goc_put_cb(d->ch, res, NULL, NULL);
         goc_close(d->ch);
         free(ctx);
         d->handle->data = NULL;
@@ -1185,6 +1200,7 @@ goc_chan* goc_udp_recv_start(uv_udp_t* handle)
     assert(d);
     d->handle = handle;
     d->ch     = ch;
+    uv_handle_chan_register(ch);
     uv_async_init(g_loop, &d->async, on_udp_recv_start_dispatch);
     uv_async_send(&d->async);
     return ch;
@@ -1203,6 +1219,7 @@ static void on_udp_recv_stop_dispatch(uv_async_t* h)
 
     if (d->handle->data) {
         goc_udp_recv_ctx_t* ctx = (goc_udp_recv_ctx_t*)d->handle->data;
+        uv_handle_chan_unregister(ctx->ch);
         goc_close(ctx->ch);
         free(ctx);
         d->handle->data = NULL;
