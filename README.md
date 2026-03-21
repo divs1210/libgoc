@@ -370,8 +370,8 @@ goc_close(ch);
 
 | Function | Signature | Description |
 |---|---|---|
-| `goc_go` | `goc_chan* goc_go(void (*fn)(void*), void* arg)` | Spawn a fiber on the default pool. Fiber stack allocation is **deferred** to the first dispatch on a worker thread, keeping spawn itself cheap. Returns a **join channel** that is closed automatically when the fiber returns. Pass the join channel as an arm to `goc_alts` or call `goc_take`/`goc_take_sync` on it to await fiber completion. The join channel may be ignored if no join is needed. |
-| `goc_go_on` | `goc_chan* goc_go_on(goc_pool* pool, void (*fn)(void*), void* arg)` | Spawn on a specific pool. Fiber stack allocation is deferred to first dispatch. Returns a join channel with the same semantics as `goc_go`. |
+| `goc_go` | `goc_chan* goc_go(void (*fn)(void*), void* arg)` | Spawn a fiber on the default pool. Fiber stack allocation is **deferred** to the first dispatch on a worker thread, keeping spawn itself cheap. In canary mode the worker also reuses a pooled `mco_coro` allocation when available, eliminating malloc overhead and page-fault cost on warm stack pages. Returns a **join channel** that is closed automatically when the fiber returns. Pass the join channel as an arm to `goc_alts` or call `goc_take`/`goc_take_sync` on it to await fiber completion. The join channel may be ignored if no join is needed. |
+| `goc_go_on` | `goc_chan* goc_go_on(goc_pool* pool, void (*fn)(void*), void* arg)` | Spawn on a specific pool. Same deferred allocation and stack pooling semantics as `goc_go`. Returns a join channel with the same semantics as `goc_go`. |
 
 ```c
 typedef struct { goc_chan* ch; int n; } args_t;
@@ -846,7 +846,7 @@ cmake -B build
 cmake -B build -DLIBGOC_VMEM=ON
 ```
 
-With canary stacks (default), fibers use a fixed-size stack with a sentinel word written at the lowest address. If the canary is overwritten (stack overflow), the runtime calls `abort()` with a diagnostic message — turning silent heap corruption into a deterministic crash.
+With canary stacks (default), fibers use a fixed-size stack with a sentinel word written at the lowest address. If the canary is overwritten (stack overflow), the runtime calls `abort()` with a diagnostic message — turning silent heap corruption into a deterministic crash. Canary mode also enables two spawn-path optimisations: **deferred materialisation** (stack allocation is deferred to the first worker dispatch, keeping `goc_go` cheap) and **coroutine stack pooling** (dead `mco_coro` allocations are reused across fibers, eliminating malloc/free round-trips and TLB/page-fault cost on the bulk of the stack). Pool size is capped at `GOC_CORO_POOL_MAX` (64) entries per worker thread.
 
 With virtual memory enabled (`-DLIBGOC_VMEM=ON`), fibers can grow their stacks dynamically. This eliminates stack overflow concerns but is heavier in space and time, and is not supported on all platforms.
 
