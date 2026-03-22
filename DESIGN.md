@@ -694,10 +694,12 @@ typedef struct goc_pool {
 The default pool is created by `goc_init` with `max(4, hardware_concurrency)` worker threads. This can be overridden by setting the `GOC_POOL_THREADS` environment variable before calling `goc_init`.
 
 Each pool also has a **live-fiber admission cap**. By default it is
-`max(256, 64 × thread_count)` in both canary and vmem builds, and it may be
-overridden with `GOC_MAX_LIVE_FIBERS` (`0` disables the cap). The cap limits
-`resident_count` — the number of fibers that have actually materialised a
-coroutine/stack — not `live_count`.
+`floor(0.77 × (available_hardware_memory / fiber_stack_size))` in both canary
+and vmem builds, and it may be overridden with `GOC_MAX_LIVE_FIBERS`
+(`0` disables the cap). The `0.77` factor intentionally keeps memory headroom
+for GC and runtime overhead while still targeting high throughput. The cap
+limits `resident_count` — the number of fibers that have actually materialised
+a coroutine/stack — not `live_count`.
 
 When an **external** caller (`main` thread, loop callback, or another pool)
 spawns a fiber and the pool is already at its cap, `goc_go` / `goc_go_on`

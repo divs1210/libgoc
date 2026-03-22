@@ -148,7 +148,21 @@ static void registry_remove(goc_pool* pool) {
  * Spawn throttling helpers
  * ---------------------------------------------------------------------- */
 
+static void pool_stack_size_probe(mco_coro* co) {
+    (void)co;
+}
+
+static size_t pool_default_stack_size_bytes(void) {
+    /* Let minicoro decide the effective stack size so this code stays aligned
+     * with minicoro defaults/constants (including MCO_DEFAULT_STACK_SIZE,
+     * MCO_MIN_STACK_SIZE, and alignment behavior) in both canary and vmem. */
+    mco_desc desc = mco_desc_init(pool_stack_size_probe, LIBGOC_STACK_SIZE);
+    return desc.stack_size;
+}
+
 static size_t pool_default_max_live_fibers(size_t threads) {
+    (void)threads;
+
     const char* env = getenv("GOC_MAX_LIVE_FIBERS");
     if (env != NULL) {
         char* end = NULL;
@@ -158,10 +172,20 @@ static size_t pool_default_max_live_fibers(size_t threads) {
         }
     }
 
-    size_t cap = threads * GOC_MAX_LIVE_FIBERS_PER_THREAD;
-    if (cap < GOC_MIN_MAX_LIVE_FIBERS)
-        cap = GOC_MIN_MAX_LIVE_FIBERS;
-    return cap;
+    /*
+     * Default admission cap is derived from memory budget and per-fiber stack
+     * size so it scales with hardware capacity while remaining conservative.
+     *
+     * Formula (no clamp):
+     *   floor(0.77 * (available_memory / stack_size))
+     *
+     * The 0.77 factor intentionally leaves ~23% headroom for GC metadata,
+     * channels/queues, allocator overhead, and the rest of the process.
+     */
+    const size_t stack_size = pool_default_stack_size_bytes();
+    const uint64_t mem_bytes = uv_get_total_memory();
+    return (size_t)(GOC_DEFAULT_LIVE_FIBER_MEMORY_FACTOR *
+                    ((double)mem_bytes / (double)stack_size));
 }
 
 static bool pool_spawn_cap_reached_locked(goc_pool* pool) {
