@@ -21,6 +21,6 @@
  * A value below 1.0 intentionally reserves headroom for GC metadata,
  * channels/queues, allocator overhead, and other process memory.
  */
-#define GOC_DEFAULT_LIVE_FIBER_MEMORY_FACTOR 0.67
+#define GOC_DEFAULT_LIVE_FIBER_MEMORY_FACTOR 0.6
 
 #endif /* GOC_CONFIG_H */
