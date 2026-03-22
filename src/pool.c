@@ -55,7 +55,6 @@ struct goc_pool {
     _Atomic int        shutdown;
     pthread_mutex_t    drain_mutex;
     pthread_cond_t     drain_cond;
-    size_t             active_count;      /* fibers currently queued or executing */
     size_t             live_count;        /* spawned fibers not yet completed (includes queued spawns) */
     size_t             resident_count;    /* fibers with an allocated coroutine/stack */
     goc_spawn_req*     pending_spawn_head;
@@ -382,10 +381,6 @@ run:
         if (fe != NULL)
             atomic_store_explicit(&fe->parked, 1, memory_order_release);
 
-        pthread_mutex_lock(&pool->drain_mutex);
-        pool->active_count--;
-        pthread_mutex_unlock(&pool->drain_mutex);
-
         if (st == MCO_DEAD) {
             if (fe != NULL)
                 goc_fiber_root_unregister(fe->fiber_root_handle);
@@ -420,10 +415,6 @@ run:
  * ---------------------------------------------------------------------- */
 
 void post_to_run_queue(goc_pool* pool, goc_entry* entry) {
-    pthread_mutex_lock(&pool->drain_mutex);
-    pool->active_count++;
-    pthread_mutex_unlock(&pool->drain_mutex);
-
     goc_worker* w = tl_worker;
     if (w != NULL && w->pool == pool) {
         /* Internal caller: push to executing worker's own deque.
@@ -505,7 +496,6 @@ goc_pool* goc_pool_make(size_t threads) {
     pthread_mutex_init(&pool->drain_mutex, NULL);
     pthread_cond_init(&pool->drain_cond, NULL);
 
-    pool->active_count      = 0;
     pool->live_count        = 0;
     pool->resident_count    = 0;
     pool->pending_spawn_head = NULL;
