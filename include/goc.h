@@ -141,6 +141,10 @@ bool goc_in_fiber(void);
  * Returns a join channel that is closed when fn returns. The caller may
  * goc_take() or goc_take_sync() on the join channel to wait for completion,
  * or ignore it entirely (the channel is GC-collected when unreachable).
+ *
+ * If the target pool's live-fiber throttle is engaged, the runtime may defer
+ * materialising the fiber until earlier fibers finish. The join channel is
+ * still returned immediately.
  */
 goc_chan* goc_go(void (*fn)(void*), void* arg);
 
@@ -152,6 +156,9 @@ goc_chan* goc_go(void (*fn)(void*), void* arg);
  * arg   : arbitrary user data passed to fn.
  *
  * Returns a join channel as with goc_go().
+ *
+ * The runtime may defer actual fiber creation when the pool is at its
+ * live-fiber cap (see GOC_MAX_LIVE_FIBERS in the project README).
  */
 goc_chan* goc_go_on(goc_pool* pool, void (*fn)(void*), void* arg);
 

@@ -614,6 +614,12 @@ goc_close(w);          /* release */
 
 The default pool is created by `goc_init` with `max(4, hardware_concurrency)` worker threads. This can be overridden by setting the `GOC_POOL_THREADS` environment variable to a positive integer before calling `goc_init`. Invalid values (non-numeric, zero, or negative) are silently ignored and the default is used.
 
+In virtual-memory stack mode (`-DLIBGOC_VMEM=ON`), pools also apply a live-fiber admission cap by default so bursty spawn patterns do not reserve an unbounded number of large vmem stacks at once. When the cap is reached, new `goc_go` / `goc_go_on` calls are accepted immediately but their actual fiber creation is deferred until earlier fibers finish. Override the cap with `GOC_MAX_LIVE_FIBERS`:
+
+- unset: use the built-in default for vmem builds (`max(256, 64 × thread_count)`) and no cap for canary builds
+- `0`: disable throttling entirely
+- positive integer: explicit per-pool live-fiber cap
+
 ```c
 typedef enum {
     GOC_DRAIN_OK      = 0,  /* all fibers finished within the deadline */
@@ -720,6 +726,8 @@ A C11 compiler is required: GCC or Clang on Linux/macOS; MinGW-w64 GCC via MSYS2
 |---|---|---|
 | `GOC_DEAD_COUNT_THRESHOLD` | `8` | Dead-entry compaction threshold for channel waiter lists |
 | `GOC_ALTS_STACK_THRESHOLD` | `8` | Max `goc_alts` arms before scratch buffer moves to heap |
+| `GOC_VMEM_MAX_LIVE_FIBERS_PER_THREAD` | `64` | Default per-thread contribution to the vmem-mode live-fiber admission cap |
+| `GOC_VMEM_MIN_MAX_LIVE_FIBERS` | `256` | Minimum default vmem-mode live-fiber cap per pool |
 
 ---
 
