@@ -98,7 +98,7 @@ void goc_init(void);
  * Calling from any non-main thread prints an error to stderr and aborts.
  * Drains all pools, stops the event loop, destroys all live channel mutexes,
  * and releases all runtime resources. No goc_* call may be made after this
- * returns (except goc_init to re-initialise).
+ * returns.
  */
 void goc_shutdown(void);
 
@@ -165,8 +165,7 @@ goc_chan* goc_go_on(goc_pool* pool, void (*fn)(void*), void* arg);
  * buf_size : capacity of the internal ring buffer (0 = rendezvous channel).
  *
  * The channel itself is GC-heap allocated. Its internal mutex is plain-malloc
- * allocated (libuv constraint) and is freed during goc_shutdown() or when
- * goc_close() triggers cleanup.
+ * allocated (libuv constraint) and is freed during goc_shutdown().
  */
 goc_chan* goc_chan_make(size_t buf_size);
 
@@ -187,7 +186,7 @@ void goc_close(goc_chan* ch);
  * Channel I/O — Fiber context
  *
  * Must only be called from within a fiber (i.e. goc_in_fiber() == true).
- * Calling from an OS thread results in undefined behaviour.
+ * Calling from an OS thread aborts with a diagnostic message.
  * ---------------------------------------------------------------------- */
 
 /**

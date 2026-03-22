@@ -184,7 +184,7 @@ struct goc_entry {
     /* Fixed stack mode: enable overflow protection */
     #define goc_stack_canary_init(entry)  do { (entry)->stack_canary_ptr = (uint32_t*)(entry)->coro->stack_base; } while(0)
     #define goc_stack_canary_set(ptr)     do { *(ptr) = GOC_STACK_CANARY; } while(0)
-    #define goc_stack_canary_check(ptr)   do { if (*(ptr) != GOC_STACK_CANARY) abort(); } while(0)
+    #define goc_stack_canary_check(ptr)   do { if (*(ptr) != GOC_STACK_CANARY) { fprintf(stderr, "libgoc: stack canary corrupted at %p (val=0x%08x); likely stack overflow\n", (void*)(ptr), *(ptr)); abort(); } } while(0)
 #endif
 
 /* ---------------------------------------------------------------------------

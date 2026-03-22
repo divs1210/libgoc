@@ -206,12 +206,10 @@ run:
         /* Canary check — abort on stack overflow before corrupting anything. */
         goc_stack_canary_check(entry->stack_canary_ptr);
 
-        /* Save coro handle before resuming: if this is a parking entry
-         * (stack-allocated inside goc_take on the fiber's own stack), the
-         * fiber may run to completion during mco_resume — clobbering the
-         * memory where `entry` lives before control returns here.  The
-         * mco_coro object itself is minicoro heap-allocated and remains valid
-         * until mco_destroy, so `coro` is safe to dereference after resume. */
+        /* Save coro handle before resuming: another worker can race and
+         * advance the coroutine lifecycle while we are in mco_resume. Keep a
+         * stable handle (`coro`) across the call; the mco_coro object remains
+         * valid until mco_destroy. */
         mco_coro* coro = entry->coro;
 
         /* Redirect GC stack scan to the fiber's stack for the duration of
@@ -226,22 +224,24 @@ run:
 
         GC_set_stackbottom(NULL, &orig_sb);
 
-        /* If the fiber just parked, release the yield-gate so that any
-         * wake() spinning on parked==0 can proceed. */
         goc_entry* fe = (goc_entry*)mco_get_user_data(coro);
-        if (fe != NULL)
-            atomic_store_explicit(&fe->parked, 1, memory_order_release);
+        mco_state st = mco_status(coro);
 
         /* Update cached fiber SP so the next GC cycle scans only the used
          * portion of the stack instead of the full vmem allocation. */
-        if (mco_status(coro) == MCO_SUSPENDED && fe != NULL)
+        if (st == MCO_SUSPENDED && fe != NULL)
             goc_fiber_root_update_sp(fe->fiber_root_handle, coro);
+
+        /* If the fiber just parked, release the yield-gate so that any
+         * wake() spinning on parked==0 can proceed. */
+        if (fe != NULL)
+            atomic_store_explicit(&fe->parked, 1, memory_order_release);
 
         pthread_mutex_lock(&pool->drain_mutex);
         pool->active_count--;
         pthread_mutex_unlock(&pool->drain_mutex);
 
-        if (mco_status(coro) == MCO_DEAD) {
+        if (st == MCO_DEAD) {
             if (fe != NULL)
                 goc_fiber_root_unregister(fe->fiber_root_handle);
             mco_destroy(coro);
@@ -285,12 +285,17 @@ void post_to_run_queue(goc_pool* pool, goc_entry* entry) {
          * total order with the worker's seq_cst increment (ARM/POWER safety). */
         atomic_thread_fence(memory_order_seq_cst);
 
-        /* Wake one idle worker (not self — self is running a fiber) so it
-         * can steal the just-pushed entry. */
+        /* Wake all other workers when any are idle, so the just-pushed entry
+         * is stolen regardless of which specific worker is sleeping.
+         * Waking a busy worker is harmless: uv_sem_post on a non-waiting
+         * semaphore is a single atomic increment; the worker drains it on its
+         * next idle double-check without sleeping.  Waking only (w+1)%N caused
+         * entries to stall whenever that fixed neighbor was busy and other
+         * workers were genuinely idle (e.g. burst-spawn from a single fiber). */
         if (atomic_load_explicit(&pool->idle_count, memory_order_seq_cst) > 0
                 && pool->thread_count > 1) {
-            size_t idx = (w->index + 1) % pool->thread_count;
-            uv_sem_post(&pool->workers[idx].idle_sem);
+            for (size_t i = 1; i < pool->thread_count; i++)
+                uv_sem_post(&pool->workers[(w->index + i) % pool->thread_count].idle_sem);
         }
     } else {
         /* External caller: push into target worker's injector (MPSC-safe).

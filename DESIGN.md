@@ -153,7 +153,11 @@ ASAN and TSAN each compile a separate instrumented copy of the `goc` static libr
    channel wakeup
 ```
 
-Pool threads execute fibers. When a timer fires or an external event completes, the uv loop thread calls `uv_async_send` to wake a pool thread, which resumes the parked fiber.
+Pool threads execute fibers. The uv loop thread never resumes fibers directly. Instead:
+
+- pool threads call `uv_async_send` only to wake the **uv loop thread** so it can drain callback work,
+- loop-thread callbacks such as timers and async handlers interact with channels,
+- channel wakeups re-enqueue fibers onto pool workers via `post_to_run_queue`.
 
 The pool threads and the event loop thread are **separate**. Fibers run on pool threads. The event loop thread only drives timers and dispatches wakeups — it never runs fiber code.
 
@@ -166,7 +170,7 @@ libuv owns **one thing**: the event loop thread.
 | libuv primitive | used for |
 |---|---|
 | `uv_loop_t` | single event loop, runs on its own thread |
-| `uv_async_t` | wake the loop from pool threads (fiber resume signal) |
+| `uv_async_t` | wake the loop from other threads so it can drain callback/shutdown work |
 | `uv_timer_t` | `goc_timeout` implementation |
 
 **All libuv handles (`uv_timer_t`, `uv_async_t`, etc.) must be allocated outside the GC heap** (e.g. plain `malloc`). libuv holds internal references to handles until `uv_close` completes; GC-allocated handles risk collection before `uv_close` fires, causing use-after-free inside the event loop.
@@ -230,7 +234,7 @@ If the fiber side needs to produce or consume multiple values, launch a fiber wi
 
 Boehm GC (bdw-gc) is a **required link-time dependency**. It is not optional and requires no configuration from the caller.
 
-`goc_init` must be **the first call in `main()`**, before any other library or application code that could trigger GC allocation. It calls `GC_INIT()` unconditionally as its very first operation, followed immediately by `GC_allow_register_threads()` — `GC_INIT()` performs all one-time GC setup, and `GC_allow_register_threads()` enables multi-thread stack registration. **Callers must not call these functions themselves.**
+`goc_init` must be **the first call in `main()`**, before any other library or application code that could trigger GC allocation. It calls `GC_INIT()` unconditionally as its very first operation, then installs the fiber-root push callback, then calls `GC_allow_register_threads()`. `GC_INIT()` performs all one-time GC setup, and `GC_allow_register_threads()` enables multi-thread stack registration. **Callers must not call these functions themselves.**
 
 On POSIX, pool workers and the uv loop thread are created via `gc_pthread_create`, which on POSIX is an alias for `GC_pthread_create` and registers each thread with the collector automatically. On Windows, `GC_pthread_create` is not available (MSYS2 bdwgc uses Win32 threads); `gc_pthread_create` calls `pthread_create` with a trampoline that manually calls `GC_register_my_thread` at startup and `GC_unregister_my_thread` at exit. On POSIX, threads must **not** call `GC_register_my_thread` manually — `GC_pthread_create` already does it; a duplicate call corrupts the GC's internal thread table.
 
@@ -240,15 +244,20 @@ On POSIX, pool workers and the uv loop thread are created via `gc_pthread_create
 
 **libuv handles must still be `malloc`-allocated** (not `goc_malloc`) — see [libuv Role](#libuv-role). The library's own internal structures also use plain `malloc` for any object whose lifetime is explicitly managed and does not need to participate in GC traversal.
 
-All other GC-managed objects (channels, fibers, entries, ring buffers) are allocated via `goc_malloc` so that pointers inside them are visible to the collector automatically.
+Most runtime objects that should participate in GC traversal (channels, fibers, parked entries, callback-queue nodes) are allocated via `goc_malloc`. Scheduler storage has a few intentional exceptions: work-stealing deque ring buffers use `GC_malloc_uncollectable` so queued `goc_entry*` values remain visible to the collector, and injector queue nodes use plain `malloc`/`free` so arbitrary producer threads do not need to perform GC allocations.
 
 ---
 
 ## Data Structures
 
-All GC-managed structs are allocated via `goc_malloc` — on the GC heap, so pointers inside them are visible to the collector automatically.
+Most GC-managed structs are allocated via `goc_malloc` — on the GC heap, so pointers inside them are visible to the collector automatically.
 
-**Exception:** libuv handles (`uv_timer_t`, `uv_mutex_t` internals, `uv_async_t`) are allocated with plain `malloc` and freed explicitly. See [libuv Role](#libuv-role) above.
+**Exceptions:**
+- libuv handles (`uv_timer_t`, `uv_mutex_t` internals, `uv_async_t`) are allocated with plain `malloc` and freed explicitly;
+- work-stealing deque ring buffers use `GC_malloc_uncollectable`;
+- injector queue nodes use plain `malloc`/`free`.
+
+See [libuv Role](#libuv-role) above.
 
 ### Portable Semaphore (`goc_sync_t`)
 
@@ -515,7 +524,7 @@ if parked putter:
 if closed:
     uv_mutex_unlock → return {NULL, GOC_CLOSED}
 else:
-    allocate goc_entry (FIBER)
+    allocate goc_entry (FIBER, GC heap)
     /* current_pool = ((goc_entry*)mco_get_user_data(mco_running()))->pool */
     entry.stack_canary_ptr = mco_running()->stack_base   /* required: pool worker checks this on re-resume */
     push onto ch->takers
@@ -526,7 +535,7 @@ else:
     return {*result_slot, entry->ok}
 ```
 
-`goc_put` is the exact mirror, with the same fiber-context assert and the same `stack_canary_ptr` initialization in its slow path. The `current_pool` retrieval is identical. Do not omit `stack_canary_ptr` from `goc_put` — the pool worker dereferences it on every resume (including re-resumes after a channel wake).
+`goc_put` is the exact mirror, with the same fiber-context assert and the same `stack_canary_ptr` initialization in its slow path. The `current_pool` retrieval is identical. Do not omit `stack_canary_ptr` from `goc_put` — the pool worker dereferences it on every resume (including re-resumes after a channel wake). When a parked fiber is woken, the runtime re-queues the coroutine's **initial** fiber entry (via `mco_get_user_data(e->coro)`), not the transient parked channel entry.
 
 ### `goc_take_cb(ch, cb, ud)` — any context
 
@@ -622,7 +631,10 @@ bool wake(goc_chan* ch, goc_entry* e, void* value) {
         *e->result_slot = value;
     e->ok = GOC_OK;
     if (e->kind == GOC_FIBER) {
-        post_to_run_queue(e->pool, e);
+        goc_entry* fe = (goc_entry*)mco_get_user_data(e->coro);
+        while (atomic_load_explicit(&fe->parked, memory_order_acquire) == 0)
+            sched_yield();
+        post_to_run_queue(fe->pool, fe);
     } else if (e->kind == GOC_CALLBACK) {
         post_callback(e, value);   /* posted via uv_async_send; cb fires on loop thread */
     } else {
@@ -637,7 +649,7 @@ At the **top of `goc_take` and `goc_put`**, immediately after acquiring the lock
 
 > **O(1) tail append via `chan_list_append`.** All slow-path append sites (`goc_take`, `goc_put`, `goc_alts`, `goc_take_cb`, `goc_put_cb`) use the `chan_list_append` helper (declared in `channel_internal.h`) instead of walking to the tail. The helper appends in O(1) when `takers_tail` / `putters_tail` is valid; it falls back to an O(N) repair walk only when the tail pointer has been invalidated by a prior removal. Removal operations in `chan_put_to_taker` and `chan_take_from_putter` invalidate the tail pointer when they remove the last remaining entry (detected by `next == NULL` after removal). Without this optimisation, `bench_spawn_idle` with N fibers all parking on a single channel performed O(N²) work during the spawn phase (N entries each requiring a full traversal), making 200k fibers take hundreds of seconds instead of tens.
 
-> **`e->next` must be saved before calling `wake()` in the splice helpers, and before any dispatch call in `goc_close`.** `chan_put_to_taker` and `chan_take_from_putter` both splice the woken entry out of its list with `*pp = e->next`. For `GOC_FIBER` entries, `wake()` calls `post_to_run_queue`, which enqueues the entry on the pool's run queue. On a multi-core system a pool thread may dequeue and resume the fiber *immediately* — before `wake()` even returns. That fiber's `mco_yield` call site resumes and the function continues to its return, deallocating the stack frame that contains the `goc_entry` (stack-allocated in `goc_take`/`goc_put` slow paths). Any subsequent read of `e->next` would be a use-after-free and a potential SIGSEGV. The fix is to snapshot `next = e->next` *before* calling `wake()`, while `ch->lock` is still held (the lock prevents concurrent modification of the list), then use `next` for the splice after `wake()` returns. The same hazard applies to `goc_close`, which iterates `ch->takers` and `ch->putters` and calls `post_to_run_queue` directly. For `goc_alts`-parked entries the `goc_entry` is GC-heap allocated, so a resumed fiber can allow the GC to collect the entry while `goc_close`'s loop is still running — `e->next` after dispatch is equally a use-after-free. `goc_close`'s loops are therefore written as `while (e != NULL) { goc_entry* next = e->next; ..dispatch..; e = next; }`. This pattern must be preserved in any future modification of these helpers and of `goc_close`.
+> **`e->next` must be saved before calling `wake()` in the splice helpers, and before any dispatch call in `goc_close`.** `chan_put_to_taker` and `chan_take_from_putter` both splice the woken entry out of its list with `*pp = e->next`. For `GOC_FIBER` entries, `wake()` can resume the waiter immediately on another worker. After that dispatch, the transient parked entry may become unreachable and collectable, so reading `e->next` is unsafe. The fix is to snapshot `next = e->next` *before* calling `wake()`, while `ch->lock` is still held (the lock prevents concurrent modification of the list), then use `next` for the splice after `wake()` returns. The same hazard applies to `goc_close`, whose loops are therefore written as `while (e != NULL) { goc_entry* next = e->next; ..dispatch..; e = next; }`. This pattern must be preserved in any future modification of these helpers and of `goc_close`.
 
 > **Why not `dead_count > buf_count + GOC_DEAD_COUNT_THRESHOLD`?** Scaling the threshold by `buf_count` would delay compaction dramatically on heavily-buffered channels — a channel with 1 024 buffered slots would accumulate 1 032 dead entries before a sweep. Comparing against a fixed threshold bounds the maximum number of stale entries regardless of buffer capacity.
 
@@ -690,10 +702,6 @@ The default pool is created by `goc_init` with `max(4, hardware_concurrency)` wo
 Each worker thread runs a 4-stage work-stealing loop:
 
 ```
-/* [Fix 3] orig_sb is computed once at thread start; fiber_sb reuses the struct. */
-GC_get_my_stackbottom(&orig_sb)
-fiber_sb = orig_sb
-
 while not shutdown:
     /* Stage 1: drain own injector (entries from external callers) */
     entry = injector_pop(worker.injector)
@@ -726,9 +734,8 @@ run:
                                           park entries; stack_canary_ptr must never be NULL */
     mco_coro* coro = entry->coro       /* snapshot handle before resume — see note below */
 
-    /* [Fix 3] Redirect GC stack scan to fiber stack.
-       orig_sb was captured once at thread start; no per-iteration
-       GC_get_my_stackbottom call needed. */
+     /* Redirect GC stack scan to fiber stack. */
+     GC_get_my_stackbottom(&orig_sb)
     fiber_sb.mem_base = coro->stack_base + coro->stack_size
     GC_set_stackbottom(NULL, &fiber_sb)
 
@@ -737,12 +744,13 @@ run:
     GC_set_stackbottom(NULL, &orig_sb) /* restore OS thread stack bottom */
 
     fe = mco_get_user_data(coro)
-    if fe != NULL: atomic_store(fe->parked, 1, release)  /* release yield-gate; see Yield-Gate below */
-    if mco_status(coro) == MCO_SUSPENDED and fe != NULL:
+    st = mco_status(coro)
+    if st == MCO_SUSPENDED and fe != NULL:
         goc_fiber_root_update_sp(fe->fiber_root_handle, coro)  /* update cached SP for GC */
+    if fe != NULL: atomic_store(fe->parked, 1, release)  /* release yield-gate after resume bookkeeping */
 
     lock(drain_mutex); active_count--; unlock(drain_mutex)
-    if mco_status(coro) == MCO_DEAD:
+    if st == MCO_DEAD:
         if fe != NULL: goc_fiber_root_unregister(fe->fiber_root_handle)  /* unregister via push_other_roots list */
         mco_destroy(coro)
         lock(drain_mutex); live_count--; broadcast(drain_cond); unlock(drain_mutex)
@@ -757,11 +765,11 @@ run:
 > **Sleep-miss race closure.** A poster calling `post_to_run_queue` must not miss a sleeping worker. Protocol: (1) worker increments `idle_count` with `seq_cst` *before* its double-check; (2) poster completes its write (deque push or injector mutex-unlock, both full-barrier), then reads `idle_count` with `seq_cst`. The C11 total order on seq_cst operations guarantees that if the poster sees `idle_count == 0`, the worker's double-check will see the posted entry; if the poster sees `idle_count > 0`, it posts `idle_sem` to wake the worker.
 
 
-> **Why `coro` is snapshotted before `mco_resume`.** When a fiber suspends inside `goc_take`, it stack-allocates a `goc_entry` (the parking entry) on its own coroutine stack and parks. The pool worker's `entry` pointer therefore points into the fiber's stack for the duration of that park. If the fiber is immediately re-scheduled on the same resume call (i.e. it runs to completion without yielding again), minicoro recycles the stack — and the memory `entry` pointed at is gone by the time `mco_resume` returns. Reading `entry->coro` after the resume is therefore a use-after-free and a potential segfault. The `mco_coro` object itself is minicoro heap-allocated and remains valid until `mco_destroy`, so snapshotting `coro = entry->coro` *before* the resume is always safe and eliminates the hazard entirely. See [Unified Wakeup](#unified-wakeup) for the analogous `e->next` snapshot requirement in `chan_put_to_taker` and `chan_take_from_putter`.
+> **Why `coro` is snapshotted before `mco_resume`.** `post_to_run_queue` may receive either a fiber's initial entry (launch/resume token) or another scheduler-visible entry that refers to the same coroutine. Snapshotting `coro = entry->coro` before `mco_resume` ensures the worker keeps a stable handle even if other state associated with the scheduling token becomes irrelevant once the coroutine advances. The `mco_coro` object itself remains valid until `mco_destroy`.
 
 > **GC Stack Bottom Redirect.** When `mco_resume` switches the CPU stack pointer (RSP) from the worker OS thread's stack into the fiber's stack, the Boehm GC stop-the-world handler captures that fiber-stack RSP as the "bottom of the stack to scan". GC then tries to scan from that RSP all the way up to the worker thread's registered OS-stack bottom — a range potentially spanning the entire virtual address space between the two stacks. That range contains unmapped pages, causing SIGSEGV inside the GC marker thread on every collection cycle.
 >
-> **Fix:** At worker-thread start, `GC_get_my_stackbottom` is called once to capture `orig_sb` (stable for the thread's lifetime — Fix 3). Before each `mco_resume`, `GC_set_stackbottom(NULL, &fiber_sb)` redirects GC's scan to `[fiber_RSP, fiber_stack_top]` — the actual fiber stack. After `mco_resume` returns (fiber has yielded or exited), `GC_set_stackbottom(NULL, &orig_sb)` restores the worker's OS-thread stack bottom. This keeps the GC scan range valid for the entire duration of fiber execution and eliminates the inter-stack SIGSEGV.
+> **Fix:** Before each `mco_resume`, the worker captures its current OS-thread stack bottom in `orig_sb`, then redirects GC scanning to `[fiber_RSP, fiber_stack_top]` with `GC_set_stackbottom(NULL, &fiber_sb)`. After `mco_resume` returns (fiber has yielded or exited), `GC_set_stackbottom(NULL, &orig_sb)` restores the worker's OS-thread stack bottom. This keeps the GC scan range valid for the entire duration of fiber execution and eliminates the inter-stack SIGSEGV.
 
 > **GC Fiber Stack Roots.** While a fiber is suspended between `mco_yield` and the next `mco_resume`, its stack is not associated with any OS-thread stack that the GC scans automatically. The fiber's local variables may hold pointers to GC-managed objects, so the fiber stack must be treated as a GC root during the suspension window.
 >
@@ -824,7 +832,7 @@ typedef struct {
 
 `post_to_run_queue` routes entries as follows:
 
-- **Internal caller** (a fiber running on a pool thread, i.e. `tl_worker != NULL && tl_worker->pool == pool`): pushes to the executing worker's own deque, then posts `idle_sem` to one idle worker (if any) so it can steal.
+- **Internal caller** (a fiber running on a pool thread, i.e. `tl_worker != NULL && tl_worker->pool == pool`): pushes to the executing worker's own deque, then posts **all other workers** when `idle_count > 0` so any sleeping worker can steal.
 - **External caller** (main thread, libuv loop, another pool): pushes into a round-robin target worker's injector, then posts that worker's `idle_sem` if any worker is idle.
 
 All threads — pool workers and the uv loop thread — are created via `gc_pthread_create`. On POSIX (Linux/macOS), `gc_pthread_create` is a macro alias for `GC_pthread_create`, which wraps the thread start with `GC_call_with_stack_base` so each thread is automatically registered with the collector; no manual `GC_register_my_thread` / `GC_unregister_my_thread` call is needed or permitted on POSIX. On Windows, `gc_pthread_create` calls `pthread_create` with a trampoline (`gc_thread_trampoline` in `gc.c`) that calls `GC_register_my_thread` at thread start and `GC_unregister_my_thread` at thread exit.
@@ -1137,12 +1145,11 @@ uv_loop_t*    goc_scheduler(void);
 | `wake` | `bool wake(goc_chan* ch, goc_entry* entry, void* value)` | `channel.c` — returns `true` when the entry is successfully claimed and dispatched; `false` when cancelled or already claimed (via `try_claim_wake`) |
 | `try_claim_wake` | `static inline bool try_claim_wake(goc_entry* e)` | `internal.h` — for `goc_alts` entries: CAS `fired` 0→1 first; if another arm already fired, returns `false`. Then CAS `woken` 0→1; returns `false` if already claimed. Returns `true` only when both CASes succeed (or `fired` is NULL for plain take/put entries). |
 | `compact_dead_entries` | `void compact_dead_entries(goc_chan* ch)` | `channel.c` |
-| `goc_chan_destroy` | `void goc_chan_destroy(goc_chan* ch)` | `channel.c` — stub only; mutex teardown is deferred to `goc_shutdown` Step 2 |
 | `chan_register` | `void chan_register(goc_chan* ch)` | `gc.c` — appends `ch` to the `live_channels` array under `g_live_mutex`; called by `goc_chan_make`. This list is the sole input to the graceful-drain wait in `goc_shutdown`. |
 | `chan_unregister` | `void chan_unregister(goc_chan* ch)` | `gc.c` — removes `ch` from `live_channels` under `g_live_mutex`; called by `goc_close`. |
 | `chan_take_from_buffer` | `static inline int chan_take_from_buffer(goc_chan*, void**)` | `channel_internal.h` — requires `struct goc_chan` in scope via `chan_type.h` |
-| `chan_take_from_putter` | `static inline int chan_take_from_putter(goc_chan*, void**)` | `channel_internal.h` — requires `struct goc_chan` in scope via `chan_type.h`; iterates the full putters queue (discarding cancelled and lost-race entries mid-queue); snapshots `e->next` before `wake()` to avoid UAF on stack-allocated entries |
-| `chan_put_to_taker` | `static inline int chan_put_to_taker(goc_chan*, void*)` | `channel_internal.h` — requires `struct goc_chan` in scope via `chan_type.h`; iterates the full takers queue (discarding cancelled and lost-race entries mid-queue); snapshots `e->next` before `wake()` to avoid UAF on stack-allocated entries |
+| `chan_take_from_putter` | `static inline int chan_take_from_putter(goc_chan*, void**)` | `channel_internal.h` — requires `struct goc_chan` in scope via `chan_type.h`; iterates the full putters queue (discarding cancelled and lost-race entries mid-queue); snapshots `e->next` before `wake()` because the parked entry may become unreachable after dispatch |
+| `chan_put_to_taker` | `static inline int chan_put_to_taker(goc_chan*, void*)` | `channel_internal.h` — requires `struct goc_chan` in scope via `chan_type.h`; iterates the full takers queue (discarding cancelled and lost-race entries mid-queue); snapshots `e->next` before `wake()` because the parked entry may become unreachable after dispatch |
 | `chan_put_to_buffer` | `static inline int chan_put_to_buffer(goc_chan*, void*)` | `channel_internal.h` — requires `struct goc_chan` in scope via `chan_type.h` |
 | `chan_set_on_close` | `void chan_set_on_close(goc_chan* ch, void (*on_close)(void*), void* ud)` | `channel.c` (declared in `channel_internal.h`) — registers a one-shot callback invoked when the channel is closed; if the channel is already closed at call time the callback fires immediately |
 
@@ -1167,19 +1174,20 @@ uv_tcp_init(goc_scheduler(), server);
 
 `goc_init` must be called exactly once, as the first call in `main()`. Calling it more than once is undefined behaviour. It performs the following steps:
 
-1. **`gc.c`** — Call `GC_INIT()` then `GC_allow_register_threads()` unconditionally. `GC_INIT()` performs all one-time GC setup; `GC_allow_register_threads()` enables multi-thread stack registration and must follow it. This must happen before any `goc_malloc` call.
-2. **`gc.c`** — Register the `push_fiber_roots` callback via `GC_set_push_other_roots`. This replaces per-fiber `GC_add_roots` / `GC_remove_roots` calls (which would exhaust BDW-GC's fixed root-set table) with a single callback that scans all live fiber stacks at each GC mark phase. Must run after `GC_INIT()` and before any fiber is created.
-3. **`gc.c`** — Initialise the `live_channels` list: a `malloc`-allocated, dynamically grown `goc_chan**` array protected by a `uv_mutex_t` (`g_live_mutex`). Must be fully initialised before the loop thread is spawned (step 6) — the loop thread could indirectly trigger `goc_chan_make`, which acquires `g_live_mutex`. `goc_chan_make` is responsible for appending to it; `goc_close` removes entries. Required by `goc_shutdown`.
-4. **`pool.c`** — Initialise the global pool registry (a `malloc`-allocated list protected by a `uv_mutex_t`). Must be fully initialised before the loop thread is spawned (step 6). Read `GOC_POOL_THREADS` from the environment; default to `max(4, hardware_concurrency)`. Every subsequent `goc_pool_make` call appends to this registry; `goc_pool_destroy` removes the entry. `goc_shutdown` iterates the registry to drain and destroy any pools that remain at teardown time.
-5. **`mutex.c`** — Initialise the global RW-mutex registry (a `malloc`-allocated list protected by a `uv_mutex_t`). `goc_mutex_make` appends to this registry so `goc_shutdown` can destroy the internal `uv_mutex_t` lock for every live `goc_mutex`.
-6. **`loop.c`** — Call `loop_init()`. Internally this: allocates and initialises `g_loop`; malloc-allocates and initialises both `uv_async_t` handles (`g_wakeup` via atomic release store, `g_shutdown_async`); calls `cb_queue_init()` to allocate the MPSC sentinel node (must precede thread spawn and requires GC already up); then spawns the dedicated loop thread via `gc_pthread_create` so thread registration is handled by Boehm's wrapper (on POSIX: `GC_pthread_create`; on Windows: a trampoline). All shared state the loop thread can reach (`g_live_mutex`, pool registry, async handles, callback queue) is fully initialised at this point. It runs `while (uv_run(g_loop, UV_RUN_ONCE)) {}` for its entire lifetime.
-7. **`pool.c`** — Call `goc_pool_make(N)` for the default pool, storing the result globally. This spawns the worker threads; done last so workers start only after the full runtime is up.
+1. **`gc.c`** — Call `GC_INIT()`.
+2. **`gc.c`** — Register the `push_fiber_roots` callback via `goc_fiber_roots_init()` / `GC_set_push_other_roots`.
+3. **`gc.c`** — Call `GC_allow_register_threads()`.
+4. **`gc.c`** — Initialise the `live_channels` list: a `malloc`-allocated, dynamically grown `goc_chan**` array protected by a `uv_mutex_t` (`g_live_mutex`).
+5. **`pool.c`** — Initialise the global pool registry.
+6. **`mutex.c`** — Initialise the global RW-mutex registry.
+7. **`loop.c`** — Call `loop_init()`: allocate/init `g_loop`, `g_wakeup`, and `g_shutdown_async`; initialise the callback queue; then spawn the loop thread.
+8. **`pool.c`** — Determine the default worker count from `GOC_POOL_THREADS` or `max(4, uv_available_parallelism())`, then call `goc_pool_make(N)` for the default pool.
 
 ---
 
 ## Shutdown Sequence
 
-`goc_shutdown` performs orderly teardown in five steps. It must be called from outside any fiber or pool thread (e.g. the application's main thread). It must not be called concurrently with any other `libgoc` function. It will block until all fibers have completed naturally — if any fiber is waiting on a channel event that will never arrive, `goc_shutdown` will hang. After it returns, the runtime is fully torn down; `goc_init` may not be called again.
+`goc_shutdown` performs orderly teardown in five steps. It must be called from outside any fiber or pool thread (e.g. the application's main thread). It must not be called concurrently with any other `libgoc` function. It will block until all fibers have completed naturally — if any fiber is waiting on a channel event that will never arrive, `goc_shutdown` will hang. After it returns, the runtime is fully torn down and further `libgoc` calls — including a second `goc_init` — are outside the supported contract.
 
 > **Post-shutdown API boundary:** Once `goc_shutdown` returns, calling any `libgoc` function is **undefined behaviour**. Step 2 destroys and frees all channel mutexes; any subsequent call that reaches `uv_mutex_lock(ch->lock)` — including `goc_close`, `goc_take_try`, `goc_chan_make`, or any other channel API — accesses freed memory. Do not retain `goc_chan*` pointers across `goc_shutdown` with the intent to use them after the call returns.
 
@@ -1204,7 +1212,7 @@ After `goc_pool_destroy` returns, iterate the `live_channels` list, calling `uv_
 
 With the pool fully destroyed, no fiber or pool thread will ever call `post_callback` again. `goc_shutdown` calls `uv_async_send(g_shutdown_async)` from the main thread. `uv_async_send` is the only libuv call documented as safe to call from any thread.
 
-The loop-thread callback `on_shutdown_signal` first drains `g_cb_queue` completely before calling `uv_close` on either handle. Although the pool is gone by this point, any entries pushed to `g_cb_queue` before the pool was destroyed and not yet flushed by a prior `on_wakeup` invocation are drained here. After draining, `on_shutdown_signal` calls `uv_close` on `g_wakeup` (with `on_wakeup_closed`) and on `g_shutdown_async` itself (with `on_shutdown_async_closed`). Both closes are performed from the loop thread, which is the only correct context: `uv_close` is not thread-safe and races against the loop's internal handle-list traversal if called from another thread.
+The loop-thread callback `on_shutdown_signal` first drains `g_cb_queue` completely before calling `uv_close` on either handle. Although the pool is gone by this point, any entries pushed to `g_cb_queue` before the pool was destroyed and not yet flushed by a prior `on_wakeup` invocation are drained here. After draining, `on_shutdown_signal` calls `uv_close` on `g_wakeup` (with `on_wakeup_closed`) and on `g_shutdown_async` itself (with `free_handle_cb`). Both closes are performed from the loop thread, which is the only correct context: `uv_close` is not thread-safe and races against the loop's internal handle-list traversal if called from another thread.
 
 Once both close callbacks have fired, the loop has no remaining active handles and `loop_thread_fn` exits. The loop thread runs `while (uv_run(g_loop, UV_RUN_ONCE)) {}` for its entire lifetime — both during normal operation and during shutdown drain. `UV_RUN_ONCE` is used rather than `UV_RUN_DEFAULT` because `UV_RUN_DEFAULT` returns as soon as there are no pending callbacks in one iteration, which may be before all `uv_close` callbacks have completed; the `UV_RUN_ONCE` spin correctly drains all remaining callbacks before returning zero.
 
@@ -1414,10 +1422,10 @@ Runs a build matrix across four configurations:
 
 | Runner | `cmake_flags` | Tests |
 |---|---|---|
-| `ubuntu-latest` | *(none — canary build)* | All phases (P1–P9) via `ctest --timeout 120`; P8.1 exercises canary abort |
-| `macos-latest` | *(none — canary build)* | All phases (P1–P9) via `ctest --timeout 120`; P8.1 exercises canary abort |
-| `windows-latest` | *(none — canary build)* | P1–P7, P9 via `ctest --timeout 120`; P8 self-skips (no `fork`) |
-| `ubuntu-latest` | `-DLIBGOC_VMEM=ON` (vmem build) | All phases (P1–P9) via `ctest --timeout 120`; P8.1 skipped (vmem build) |
+| `ubuntu-latest` | *(none — canary build)* | All phases (P1–P9) via `ctest --timeout 60`; P8.1 exercises canary abort |
+| `macos-latest` | *(none — canary build)* | All phases (P1–P9) via `ctest --timeout 60`; P8.1 exercises canary abort |
+| `windows-latest` | *(none — canary build)* | P1–P7, P9 via `ctest --timeout 60`; P8 self-skips (no `fork`) |
+| `ubuntu-latest` | `-DLIBGOC_VMEM=ON` (vmem build) | All phases (P1–P9) via `ctest --timeout 60`; P8.1 skipped (vmem build) |
 
 All four configurations run `RelWithDebInfo` builds. Dependencies per OS:
 
