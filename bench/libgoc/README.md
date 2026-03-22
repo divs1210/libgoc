@@ -35,12 +35,11 @@ make run-all
 make LIBGOC_VMEM=ON BUILD_DIR=../../build-bench-vmem build run-all
 ```
 
-In vmem builds, libgoc now throttles the number of simultaneously materialised
+In all builds, libgoc now throttles the number of simultaneously materialised
 fibers per pool by default (`GOC_MAX_LIVE_FIBERS`, default `max(256, 64 ×
-GOC_POOL_THREADS)`). This keeps mass-spawn benchmarks from reserving an
-unbounded number of large vmem stacks at once. Set `GOC_MAX_LIVE_FIBERS=0` to
-disable the throttle, or pick an explicit positive cap for repeatable stress
-testing.
+GOC_POOL_THREADS)`). This keeps mass-spawn benchmarks from materialising an
+unbounded number of fibers at once. Set `GOC_MAX_LIVE_FIBERS=0` to disable the
+throttle, or pick an explicit positive cap for repeatable stress testing.
 
 ## Benchmarks
 

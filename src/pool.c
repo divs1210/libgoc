@@ -158,14 +158,10 @@ static size_t pool_default_max_live_fibers(size_t threads) {
         }
     }
 
-#ifdef LIBGOC_VMEM_ENABLED
-    size_t cap = threads * GOC_VMEM_MAX_LIVE_FIBERS_PER_THREAD;
-    if (cap < GOC_VMEM_MIN_MAX_LIVE_FIBERS)
-        cap = GOC_VMEM_MIN_MAX_LIVE_FIBERS;
+    size_t cap = threads * GOC_MAX_LIVE_FIBERS_PER_THREAD;
+    if (cap < GOC_MIN_MAX_LIVE_FIBERS)
+        cap = GOC_MIN_MAX_LIVE_FIBERS;
     return cap;
-#else
-    return 0;
-#endif
 }
 
 static bool pool_spawn_cap_reached_locked(goc_pool* pool) {

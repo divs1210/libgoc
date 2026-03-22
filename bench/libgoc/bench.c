@@ -38,7 +38,7 @@
  *   GOC_POOL_THREADS   Number of worker threads in the default pool (default:
  *                      max(4, nproc)).  Set by the Makefile run-all target.
  *   GOC_MAX_LIVE_FIBERS
- *                      Pool live-fiber cap. In vmem mode, defaults to
+ *                      Pool live-fiber cap. Defaults to
  *                      max(256, 64 × GOC_POOL_THREADS); set to 0 to disable.
  *
  * Output format
