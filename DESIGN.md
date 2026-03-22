@@ -691,10 +691,10 @@ typedef struct goc_pool {
 The default pool is created by `goc_init` with `max(4, hardware_concurrency)` worker threads. This can be overridden by setting the `GOC_POOL_THREADS` environment variable before calling `goc_init`.
 
 Each pool also has a **live-fiber admission cap**. By default it is
-`floor(0.67 × (available_hardware_memory / fiber_stack_size))`
+`floor(0.6 × (available_hardware_memory / fiber_stack_size))`
 in both canary and vmem builds,
 and it may be overridden with `GOC_MAX_LIVE_FIBERS` (`0` disables the cap).
-The `0.67` factor intentionally keeps memory headroom for GC and runtime
+The `0.6` factor intentionally keeps memory headroom for GC and runtime
 overhead while still targeting high throughput. The cap limits
 `resident_count` — the number of fibers that
 have actually materialised a coroutine/stack — not `live_count`.
@@ -797,9 +797,10 @@ run:
 >
 > **Handle.** `goc_fiber_root_register` returns the slot index cast to `void*`.  This keeps the handle valid across potential future growth (which appends new chunks without moving old ones).
 >
-> **Slot fields.** Each `fiber_root_slot` stores three fields:
-> - `scan_from` (`_Atomic(void*)`) — cached saved RSP/SP of the suspended fiber, initialised by `mco_get_suspended_sp` at birth and updated by `goc_fiber_root_update_sp` (called in `pool_worker_fn` after each `mco_resume` returns with `MCO_SUSPENDED`).
+> **Slot fields.** Each `fiber_root_slot` stores four fields:
+> - `stack_base` (`void*`) — low end of the fiber stack (constant after init); the GC scan always starts here.
 > - `stack_top` (`void*`) — high end of the fiber stack (constant after init).
+> - `scan_from` (`_Atomic(void*)`) — cached saved RSP/SP of the suspended fiber, initialised by `mco_get_suspended_sp` at birth and updated by `goc_fiber_root_update_sp` after each `mco_resume` returns `MCO_SUSPENDED`; kept for potential future optimisation but **not currently used** for scanning — `push_fiber_roots` always scans `[stack_base, stack_top]` to avoid missing pointers in active call frames that lie below a stale saved SP.
 > - `entry` (`goc_entry*`) — the fiber's GC-allocated entry; explicitly pushed via `GC_push_all_eager(&s->entry, …)` to keep it alive (the run queue node referencing it is `malloc`'d, not GC-managed).
 >
 > **Shutdown cleanup.** `goc_shutdown()` frees all chunk arrays, zeros the used bitmap words, resets `fiber_root_num_chunks` to 0, and destroys `fiber_root_mutex`.
