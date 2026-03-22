@@ -293,6 +293,7 @@ goc_val_t* goc_take(goc_chan* ch)
     void* local_result = NULL;
 
     goc_entry* e = goc_malloc(sizeof(goc_entry));
+    *e = (goc_entry){ 0 };
     e->kind             = GOC_FIBER;
     e->coro             = mco_running();
     e->pool             = ((goc_entry*)mco_get_user_data(mco_running()))->pool;
@@ -364,6 +365,7 @@ goc_status_t goc_put(goc_chan* ch, void* val)
 
     /* Slow path: park on this channel */
     goc_entry* e = goc_malloc(sizeof(goc_entry));
+    *e = (goc_entry){ 0 };
     e->kind             = GOC_FIBER;
     e->coro             = mco_running();
     e->pool             = ((goc_entry*)mco_get_user_data(mco_running()))->pool;
