@@ -25,10 +25,11 @@
 14. [`goc_timeout` — libuv Timer](#goc_timeout--libuv-timer)
 15. [`goc_alts`](#goc_alts)
 16. [Public API](#public-api)
-17. [Initialization Sequence](#initialization-sequence)
-18. [Shutdown Sequence](#shutdown-sequence)
-19. [Testing](#testing)
-20. [CI/CD](#cicd)
+17. [Async I/O Wrappers (`goc_io`)](#async-io-wrappers-goc_io)
+18. [Initialization Sequence](#initialization-sequence)
+19. [Shutdown Sequence](#shutdown-sequence)
+20. [Testing](#testing)
+21. [CI/CD](#cicd)
 
 ---
 
@@ -1160,6 +1161,29 @@ uv_tcp_init(goc_scheduler(), server);
 ```
 
 > **Do not call `uv_run` or `uv_loop_close` on the returned pointer.** The loop lifetime is managed entirely by `libgoc`.
+
+---
+
+## Async I/O Wrappers (`goc_io`)
+
+libgoc provides channel-based wrappers for libuv I/O operations in a separate header (`goc_io.h`) and translation unit (`src/goc_io.c`). All public identifiers are prefixed `goc_io_`.
+
+**Include separately:**
+
+```c
+#include "goc.h"
+#include "goc_io.h"
+```
+
+**Two-form pattern.** Each operation is exposed as:
+- `goc_io_XXX_ch(...)` — returns `goc_chan*`; delivers one `goc_io_XXX_t*` result; safe from any context; composable with `goc_alts()`.
+- `goc_io_XXX(...)` — calls `goc_io_XXX_ch()` then `goc_take()`; fiber context only.
+
+**Thread-safety bridge.** Stream and UDP operations (`uv_write`, `uv_read_start`, etc.) touch handle internals that must run on the libuv loop thread. The `*_ch` wrappers marshal each call to the loop thread via a one-shot heap-allocated `uv_async_t`. File-system and DNS operations are submitted directly (libuv routes them through its internal thread pool).
+
+**GC safety.** All `goc_chan*` pointers passed to async context structs (which are `malloc`-allocated) are registered in the `live_uv_handles` array (see `gc.c`) for the duration of the pending I/O, preventing premature collection.
+
+> **Full API reference:** [IO.md](./IO.md)
 
 ---
 

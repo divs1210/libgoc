@@ -38,6 +38,7 @@ are available on the [Releases page](https://github.com/divs1210/libgoc/releases
 
 **Also see:**
 - [Design Doc](./DESIGN.md)
+- [Async I/O API](./IO.md)
 - [Benchmarks](/bench)
 - [TODO](./TODO.md)
 
@@ -68,6 +69,7 @@ are available on the [Releases page](https://github.com/divs1210/libgoc/releases
   - [RW mutexes](#rw-mutexes)
   - [Thread pool](#thread-pool)
   - [Scheduler loop access](#scheduler-loop-access)
+  - [Async I/O](#async-io)
 - [Best Practices](#best-practices)
 - [Benchmarks](#benchmarks)
 - [Building and Testing](#building-and-testing)
@@ -668,6 +670,25 @@ uv_tcp_init(goc_scheduler(), server);
 // ... later, to tear down:
 uv_close((uv_handle_t*)server, on_handle_closed);
 ```
+
+---
+
+### Async I/O
+
+libgoc provides channel-based async I/O wrappers for libuv operations via a separate header:
+
+```c
+#include "goc.h"
+#include "goc_io.h"
+```
+
+Functions are prefixed `goc_io_` and come in two forms:
+- **`goc_io_XXX_ch(...)`** — returns a `goc_chan*` that delivers one result; safe from any context; compatible with `goc_alts()`.
+- **`goc_io_XXX(...)`** — blocks until complete (fiber context only).
+
+Covered operations: stream read/write/connect/shutdown, UDP send/recv, file-system (open/close/read/write/stat/rename/unlink/sendfile), and DNS (getaddrinfo/getnameinfo).
+
+> **Full API reference:** [IO.md](./IO.md)
 
 ---
 
