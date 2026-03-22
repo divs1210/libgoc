@@ -38,6 +38,7 @@ typedef struct {
     goc_wsdq    deque;
     goc_injector   injector;   /* MPSC queue: external callers push here */
     uv_sem_t       idle_sem;
+    _Atomic int    sleeping;   /* 1 while blocked in uv_sem_wait */
     size_t         index;
     goc_pool*      pool;
 } goc_worker;
@@ -51,6 +52,7 @@ struct goc_pool {
     size_t             thread_count;
     _Atomic size_t     idle_count;
     _Atomic size_t     next_push_idx;
+    _Atomic size_t     next_wake_idx;
     _Atomic int        shutdown;
     pthread_mutex_t    drain_mutex;
     pthread_cond_t     drain_cond;
@@ -69,6 +71,36 @@ struct goc_pool {
  * ---------------------------------------------------------------------- */
 
 static _Thread_local goc_worker* tl_worker = NULL;
+
+/* Wake exactly one sleeping worker (optionally excluding one index). */
+static void wake_one_sleeping_worker(goc_pool* pool, size_t exclude_idx, int has_exclude) {
+    if (pool->thread_count == 0)
+        return;
+
+    size_t start = atomic_fetch_add_explicit(&pool->next_wake_idx, 1,
+                                             memory_order_relaxed)
+                   % pool->thread_count;
+
+    for (size_t i = 0; i < pool->thread_count; i++) {
+        size_t idx = (start + i) % pool->thread_count;
+        if (has_exclude && idx == exclude_idx)
+            continue;
+        if (atomic_load_explicit(&pool->workers[idx].sleeping, memory_order_acquire)) {
+            uv_sem_post(&pool->workers[idx].idle_sem);
+            return;
+        }
+    }
+
+    /* Fallback: idle_count says someone is idle but no sleeping flag was
+     * observed (race window). Nudge one worker to avoid a lost-wake corner. */
+    for (size_t i = 0; i < pool->thread_count; i++) {
+        size_t idx = (start + i) % pool->thread_count;
+        if (has_exclude && idx == exclude_idx)
+            continue;
+        uv_sem_post(&pool->workers[idx].idle_sem);
+        return;
+    }
+}
 
 /* -------------------------------------------------------------------------
  * Pool registry (file-scope; owned entirely by pool.c)
@@ -196,7 +228,9 @@ static void* pool_worker_fn(void* arg) {
             goto run;
         }
 
+        atomic_store_explicit(&tl_worker->sleeping, 1, memory_order_release);
         uv_sem_wait(&tl_worker->idle_sem);
+        atomic_store_explicit(&tl_worker->sleeping, 0, memory_order_release);
         atomic_fetch_sub_explicit(&pool->idle_count, 1, memory_order_relaxed);
         continue;   /* re-check shutdown and try again */
 
@@ -294,8 +328,7 @@ void post_to_run_queue(goc_pool* pool, goc_entry* entry) {
          * workers were genuinely idle (e.g. burst-spawn from a single fiber). */
         if (atomic_load_explicit(&pool->idle_count, memory_order_seq_cst) > 0
                 && pool->thread_count > 1) {
-            for (size_t i = 1; i < pool->thread_count; i++)
-                uv_sem_post(&pool->workers[(w->index + i) % pool->thread_count].idle_sem);
+            wake_one_sleeping_worker(pool, w->index, 1);
         }
     } else {
         /* External caller: push into target worker's injector (MPSC-safe).
@@ -372,12 +405,14 @@ goc_pool* goc_pool_make(size_t threads) {
         wsdq_init(&pool->workers[i].deque, 256);
         injector_init(&pool->workers[i].injector);
         uv_sem_init(&pool->workers[i].idle_sem, 0);
+        atomic_store_explicit(&pool->workers[i].sleeping, 0, memory_order_relaxed);
         pool->workers[i].index = i;
         pool->workers[i].pool  = pool;
     }
 
     atomic_store(&pool->idle_count,    0);
     atomic_store(&pool->next_push_idx, 0);
+    atomic_store(&pool->next_wake_idx, 0);
     atomic_store(&pool->shutdown,      0);
 
     pthread_mutex_init(&pool->drain_mutex, NULL);
@@ -387,8 +422,14 @@ goc_pool* goc_pool_make(size_t threads) {
     pool->live_count   = 0;
 
     for (size_t i = 0; i < threads; i++) {
-        gc_pthread_create(&pool->workers[i].thread, NULL,
-                          pool_worker_fn, &pool->workers[i]);
+        int rc = gc_pthread_create(&pool->workers[i].thread, NULL,
+                                   pool_worker_fn, &pool->workers[i]);
+        if (rc != 0) {
+            fprintf(stderr,
+                    "libgoc: failed to create worker thread %zu/%zu (errno=%d)\n",
+                    i + 1, threads, rc);
+            abort();
+        }
     }
 
     registry_add(pool);
