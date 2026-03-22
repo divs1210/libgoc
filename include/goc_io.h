@@ -37,18 +37,14 @@
  * Stream and UDP operations (uv_write, uv_read_start, etc.) require the
  * libuv handle to be used from the event loop thread.  The *_ch wrappers
  * use a uv_async_t bridge so they can be called safely from fiber or
- * OS-thread context.  The caller is responsible for initialising and
- * configuring the handle (uv_tcp_init, uv_tcp_bind, etc.) on the event
- * loop thread before passing it to these wrappers.
+ * OS-thread context.
  *
- * Buffer / result lifetime
- * ------------------------
- * All composite result structs (goc_io_read_t*, goc_io_fs_stat_t*, etc.)
- * are allocated on the GC heap.  The caller does not need to free them;
- * Boehm GC reclaims them automatically once they become unreachable.
- *
- * Embedded pointer fields (buf, addr) inside result structs are likewise
- * GC-managed.  libgoc does not free them; nor is the caller required to.
+ * Handle initialisation
+ * ---------------------
+ * Use goc_io_tcp_init_ch(), goc_io_pipe_init_ch(), and goc_io_udp_init_ch()
+ * to initialise stream/UDP handles on the event loop thread.  These wrappers
+ * follow the same async-dispatch pattern as the I/O wrappers and are safe to
+ * call from any context.
  *
  * Compile requirements: -std=c11
  *   Include this header explicitly: #include "goc_io.h"
@@ -173,6 +169,66 @@ typedef struct {
     char         hostname[NI_MAXHOST];
     char         service[NI_MAXSERV];
 } goc_io_getnameinfo_t;
+
+/* =========================================================================
+ * 0. Handle initialisation helpers
+ *
+ * These wrappers initialise a libuv handle on the event loop thread using
+ * the same uv_async_t dispatch pattern as the I/O wrappers.  They are safe
+ * to call from any context (fiber or OS thread).
+ * ====================================================================== */
+
+/**
+ * goc_io_tcp_init_ch() — Initialise a uv_tcp_t handle on the event loop.
+ *
+ * handle : a caller-allocated (goc_malloc) uv_tcp_t to initialise.
+ *
+ * Returns a channel delivering (void*)(intptr_t)status; 0 on success,
+ * a negative libuv error code on failure.
+ */
+goc_chan* goc_io_tcp_init_ch(uv_tcp_t* handle);
+
+/**
+ * goc_io_tcp_init() — Initialise a uv_tcp_t handle (fiber context).
+ *
+ * Returns 0 on success, a negative libuv error code on failure.
+ */
+int goc_io_tcp_init(uv_tcp_t* handle);
+
+/**
+ * goc_io_pipe_init_ch() — Initialise a uv_pipe_t handle on the event loop.
+ *
+ * handle : a caller-allocated (goc_malloc) uv_pipe_t to initialise.
+ * ipc    : non-zero to enable IPC mode.
+ *
+ * Returns a channel delivering (void*)(intptr_t)status; 0 on success,
+ * a negative libuv error code on failure.
+ */
+goc_chan* goc_io_pipe_init_ch(uv_pipe_t* handle, int ipc);
+
+/**
+ * goc_io_pipe_init() — Initialise a uv_pipe_t handle (fiber context).
+ *
+ * Returns 0 on success, a negative libuv error code on failure.
+ */
+int goc_io_pipe_init(uv_pipe_t* handle, int ipc);
+
+/**
+ * goc_io_udp_init_ch() — Initialise a uv_udp_t handle on the event loop.
+ *
+ * handle : a caller-allocated (goc_malloc) uv_udp_t to initialise.
+ *
+ * Returns a channel delivering (void*)(intptr_t)status; 0 on success,
+ * a negative libuv error code on failure.
+ */
+goc_chan* goc_io_udp_init_ch(uv_udp_t* handle);
+
+/**
+ * goc_io_udp_init() — Initialise a uv_udp_t handle (fiber context).
+ *
+ * Returns 0 on success, a negative libuv error code on failure.
+ */
+int goc_io_udp_init(uv_udp_t* handle);
 
 /* =========================================================================
  * 1. Stream I/O (TCP, Pipes, TTY)

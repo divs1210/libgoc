@@ -527,6 +527,129 @@ goc_io_getnameinfo_t* goc_io_getnameinfo(const struct sockaddr* addr, int flags)
 }
 
 /* =========================================================================
+ * 0. Handle initialisation helpers
+ * ====================================================================== */
+
+/* TCP init */
+
+typedef struct {
+    uv_async_t async;   /* MUST be first member */
+    uv_tcp_t*  handle;
+    goc_chan*   ch;
+} goc_tcp_init_dispatch_t;
+
+static void on_tcp_init_dispatch(uv_async_t* h)
+{
+    goc_tcp_init_dispatch_t* d  = (goc_tcp_init_dispatch_t*)h;
+    int rc = uv_tcp_init(g_loop, d->handle);
+    uv_handle_chan_unregister(d->ch);
+    goc_put_cb(d->ch, SCALAR(rc), NULL, NULL);
+    goc_close(d->ch);
+    uv_close((uv_handle_t*)h, free_io_handle);
+}
+
+goc_chan* goc_io_tcp_init_ch(uv_tcp_t* handle)
+{
+    goc_chan*                ch = goc_chan_make(1);
+    goc_tcp_init_dispatch_t* d  = (goc_tcp_init_dispatch_t*)malloc(
+                                       sizeof(goc_tcp_init_dispatch_t));
+    assert(d);
+    d->handle = handle;
+    d->ch     = ch;
+    uv_handle_chan_register(ch);
+    uv_async_init(g_loop, &d->async, on_tcp_init_dispatch);
+    uv_async_send(&d->async);
+    return ch;
+}
+
+int goc_io_tcp_init(uv_tcp_t* handle)
+{
+    goc_chan*  ch = goc_io_tcp_init_ch(handle);
+    goc_val_t* v  = goc_take(ch);
+    return INT_VAL(v);
+}
+
+/* Pipe init */
+
+typedef struct {
+    uv_async_t async;   /* MUST be first member */
+    uv_pipe_t* handle;
+    int        ipc;
+    goc_chan*   ch;
+} goc_pipe_init_dispatch_t;
+
+static void on_pipe_init_dispatch(uv_async_t* h)
+{
+    goc_pipe_init_dispatch_t* d  = (goc_pipe_init_dispatch_t*)h;
+    int rc = uv_pipe_init(g_loop, d->handle, d->ipc);
+    uv_handle_chan_unregister(d->ch);
+    goc_put_cb(d->ch, SCALAR(rc), NULL, NULL);
+    goc_close(d->ch);
+    uv_close((uv_handle_t*)h, free_io_handle);
+}
+
+goc_chan* goc_io_pipe_init_ch(uv_pipe_t* handle, int ipc)
+{
+    goc_chan*                 ch = goc_chan_make(1);
+    goc_pipe_init_dispatch_t* d  = (goc_pipe_init_dispatch_t*)malloc(
+                                        sizeof(goc_pipe_init_dispatch_t));
+    assert(d);
+    d->handle = handle;
+    d->ipc    = ipc;
+    d->ch     = ch;
+    uv_handle_chan_register(ch);
+    uv_async_init(g_loop, &d->async, on_pipe_init_dispatch);
+    uv_async_send(&d->async);
+    return ch;
+}
+
+int goc_io_pipe_init(uv_pipe_t* handle, int ipc)
+{
+    goc_chan*  ch = goc_io_pipe_init_ch(handle, ipc);
+    goc_val_t* v  = goc_take(ch);
+    return INT_VAL(v);
+}
+
+/* UDP init */
+
+typedef struct {
+    uv_async_t async;   /* MUST be first member */
+    uv_udp_t*  handle;
+    goc_chan*   ch;
+} goc_udp_init_dispatch_t;
+
+static void on_udp_init_dispatch(uv_async_t* h)
+{
+    goc_udp_init_dispatch_t* d  = (goc_udp_init_dispatch_t*)h;
+    int rc = uv_udp_init(g_loop, d->handle);
+    uv_handle_chan_unregister(d->ch);
+    goc_put_cb(d->ch, SCALAR(rc), NULL, NULL);
+    goc_close(d->ch);
+    uv_close((uv_handle_t*)h, free_io_handle);
+}
+
+goc_chan* goc_io_udp_init_ch(uv_udp_t* handle)
+{
+    goc_chan*                ch = goc_chan_make(1);
+    goc_udp_init_dispatch_t* d  = (goc_udp_init_dispatch_t*)malloc(
+                                       sizeof(goc_udp_init_dispatch_t));
+    assert(d);
+    d->handle = handle;
+    d->ch     = ch;
+    uv_handle_chan_register(ch);
+    uv_async_init(g_loop, &d->async, on_udp_init_dispatch);
+    uv_async_send(&d->async);
+    return ch;
+}
+
+int goc_io_udp_init(uv_udp_t* handle)
+{
+    goc_chan*  ch = goc_io_udp_init_ch(handle);
+    goc_val_t* v  = goc_take(ch);
+    return INT_VAL(v);
+}
+
+/* =========================================================================
  * 1. Stream I/O  (TCP, Pipes, TTY)
  *
  * Stream handle operations are NOT thread-safe.  They are dispatched to the

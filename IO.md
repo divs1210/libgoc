@@ -17,12 +17,13 @@
 
 - [Design](#design)
 - [Thread Safety](#thread-safety)
-- [Buffer Lifetime](#buffer-lifetime)
+- [Status Codes](#status-codes)
 - [Result Types](#result-types)
   - [Stream I/O result types](#stream-io-result-types)
   - [UDP result types](#udp-result-types)
   - [File system result types](#file-system-result-types)
   - [DNS result types](#dns-result-types)
+- [0. Handle Initialisation](#0-handle-initialisation)
 - [1. Stream I/O (TCP, Pipes, TTY)](#1-stream-io-tcp-pipes-tty)
 - [2. UDP (Datagrams)](#2-udp-datagrams)
 - [3. File System Operations](#3-file-system-operations)
@@ -60,25 +61,32 @@ File-system (`uv_fs_*`) and DNS (`uv_getaddrinfo`, `uv_getnameinfo`) operations
 are safe to initiate from any thread; libuv routes them through its internal
 worker-thread pool and fires the callback on the event loop.
 
-Stream and UDP operations (`uv_write`, `uv_read_start`, etc.) require the
-libuv handle to be used from the event loop thread. The `*_ch` wrappers use a
-`uv_async_t` bridge so they can be called safely from fiber or OS-thread
-context. The caller is responsible for initialising and configuring the handle
-(`uv_tcp_init`, `uv_tcp_bind`, etc.) on the event loop thread before passing it
-to these wrappers.
-
----
-
-## Buffer Lifetime
+Stream and UDP operations (`uv_write`, `uv_read_start`, etc.) use a
+`uv_async_t` bridge and are safe to call from fiber or OS-thread context.
+Use `goc_io_tcp_init_ch()`, `goc_io_pipe_init_ch()`, and `goc_io_udp_init_ch()`
+to initialise handles on the event loop thread before use.
 
 For **write / send** operations the caller must keep the `uv_buf_t` array and
 all `buf.base` pointers valid until the result channel delivers its value (i.e.
 the operation has completed). This matches the libuv contract.
 
-For **read / recv** operations each delivered `goc_io_read_t` or
-`goc_io_udp_recv_t` carries GC-managed `buf` and `addr` pointer fields.
-libgoc does not free these; Boehm GC reclaims them automatically once they
-become unreachable. The caller does not need to call `free()`.
+
+---
+
+## Status Codes
+
+Composite result types that can succeed or fail carry a `goc_io_status_t ok` field:
+
+```c
+typedef enum {
+    GOC_IO_ERR =  0,  /* I/O operation failed                 */
+    GOC_IO_OK  =  1,  /* I/O operation completed successfully  */
+} goc_io_status_t;
+```
+
+Scalar-returning operations (write, connect, open, read, etc.) use the raw
+libuv convention: 0 or a non-negative value on success, a negative
+`UV_E*` error code on failure.
 
 ---
 
@@ -90,7 +98,7 @@ Single-result operations (write, connect, open, read, etc.) return scalars direc
 
 | Operation | `_ch` channel delivers | `_()` blocking returns |
 |---|---|---|
-| `goc_io_write*`, `goc_io_shutdown_stream`, `goc_io_tcp_connect`, `goc_io_pipe_connect`, `goc_io_udp_send`, `goc_io_fs_close`, `goc_io_fs_unlink`, `goc_io_fs_rename` | `(void*)(intptr_t)status` — 0 on success, negative libuv error | `int` |
+| `goc_io_tcp_init`, `goc_io_pipe_init`, `goc_io_udp_init`, `goc_io_write*`, `goc_io_shutdown_stream`, `goc_io_tcp_connect`, `goc_io_pipe_connect`, `goc_io_udp_send`, `goc_io_fs_close`, `goc_io_fs_unlink`, `goc_io_fs_rename` | `(void*)(intptr_t)status` — 0 on success, negative libuv error | `int` |
 | `goc_io_fs_open` | `(void*)(intptr_t)fd` — fd >= 0 on success, negative libuv error | `uv_file` |
 | `goc_io_fs_read`, `goc_io_fs_write`, `goc_io_fs_sendfile` | `(void*)(intptr_t)result` — bytes >= 0 on success, negative libuv error | `ssize_t` |
 
@@ -140,6 +148,34 @@ typedef struct {
     char         hostname[NI_MAXHOST];
     char         service[NI_MAXSERV];
 } goc_io_getnameinfo_t;
+```
+
+---
+
+## 0. Handle Initialisation
+
+These wrappers initialise a libuv handle on the event loop thread.  They are
+safe to call from any context.
+
+| Function | Signature | Description |
+|---|---|---|
+| `goc_io_tcp_init_ch` | `goc_chan* goc_io_tcp_init_ch(uv_tcp_t* handle)` | Initialise a `uv_tcp_t` handle on the event loop. Returns a channel delivering `(void*)(intptr_t)status`. |
+| `goc_io_tcp_init` | `int goc_io_tcp_init(uv_tcp_t* handle)` | Blocking form (fiber context). |
+| `goc_io_pipe_init_ch` | `goc_chan* goc_io_pipe_init_ch(uv_pipe_t* handle, int ipc)` | Initialise a `uv_pipe_t` handle on the event loop. `ipc` enables IPC mode. |
+| `goc_io_pipe_init` | `int goc_io_pipe_init(uv_pipe_t* handle, int ipc)` | Blocking form (fiber context). |
+| `goc_io_udp_init_ch` | `goc_chan* goc_io_udp_init_ch(uv_udp_t* handle)` | Initialise a `uv_udp_t` handle on the event loop. |
+| `goc_io_udp_init` | `int goc_io_udp_init(uv_udp_t* handle)` | Blocking form (fiber context). |
+
+**Example — create and connect a TCP socket:**
+
+```c
+uv_tcp_t* tcp = goc_malloc(sizeof(uv_tcp_t));
+int rc = goc_io_tcp_init(tcp);      // initialise on event loop
+if (rc < 0) { /* handle error */ }
+
+struct sockaddr_in addr;
+uv_ip4_addr("127.0.0.1", 7000, &addr);
+rc = goc_io_tcp_connect(tcp, (struct sockaddr*)&addr);
 ```
 
 ---
