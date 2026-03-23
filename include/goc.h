@@ -123,6 +123,44 @@ uv_loop_t* goc_scheduler(void);
  */
 void* goc_malloc(size_t n);
 
+/**
+ * goc_realloc() — Resize a GC-heap allocation to n bytes.
+ *
+ * ptr  : a pointer previously returned by goc_malloc() or goc_realloc(),
+ *        or NULL (equivalent to goc_malloc(n)).
+ * n    : new size in bytes.
+ *
+ * Memory is managed by the garbage collector; callers need not free it.
+ * Aborts on allocation failure. Never returns NULL (unless n == 0).
+ */
+void* goc_realloc(void* ptr, size_t n);
+
+/* -------------------------------------------------------------------------
+ * Scalar/pointer boxing helpers
+ *
+ * libgoc channels and arrays are type-erased: they carry void* values.
+ * These macros eliminate the repetitive double-cast needed to pass scalar
+ * integers through a void* slot and to recover them afterwards.
+ *
+ *   goc_box_int(x)   — encode a signed integer (intptr_t) as void*
+ *   goc_unbox_int(p) — decode a void* back to intptr_t
+ *   goc_box_uint(x)  — encode an unsigned integer (uintptr_t) as void*
+ *   goc_unbox_uint(p)— decode a void* back to uintptr_t
+ *
+ * Example (channel):
+ *   goc_put(ch, goc_box_int(42));
+ *   intptr_t n = goc_unbox_int(goc_take(ch)->val);
+ *
+ * Example (array):
+ *   goc_array_push(arr, goc_box_int(42));
+ *   intptr_t n = goc_unbox_int(goc_array_get(arr, 0));
+ * ---------------------------------------------------------------------- */
+
+#define goc_box_int(x)    ((void*)(intptr_t)(x))
+#define goc_unbox_int(p)  ((intptr_t)(p))
+#define goc_box_uint(x)   ((void*)(uintptr_t)(x))
+#define goc_unbox_uint(p) ((uintptr_t)(p))
+
 /* -------------------------------------------------------------------------
  * Fiber launch
  * ---------------------------------------------------------------------- */
