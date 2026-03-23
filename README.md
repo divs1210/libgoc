@@ -27,6 +27,7 @@ The library provides stackful coroutines ("fibers"), channels, a select primitiv
 - Windows (x86-64)
 
 **Helper libraries:**
+- [Async I/O API](./IO.md)
 - [Dynamic Array](./ARRAY.md)
 
 **Also see:**
@@ -60,6 +61,7 @@ The library provides stackful coroutines ("fibers"), channels, a select primitiv
   - [RW mutexes](#rw-mutexes)
   - [Thread pool](#thread-pool)
   - [Scheduler loop access](#scheduler-loop-access)
+  - [Async I/O](#async-io)
 - [Best Practices](#best-practices)
 - [Benchmarks](#benchmarks)
 - [Building and Testing](#building-and-testing)
@@ -417,13 +419,13 @@ goc_take_sync(done);
 
 ### minicoro limitations
 
-libgoc uses [minicoro](https://github.com/edubart/minicoro) for fiber switching. Two hard constraints apply to all fiber entry functions:
+libgoc uses [minicoro](https://github.com/edubart/minicoro) for fiber switching. Three hard constraints apply to all fiber entry functions:
 
 **C++ exceptions are not supported.** Throwing a C++ exception that unwinds across a `mco_yield` / `mco_resume` boundary is undefined behaviour — the exception mechanism's internal state is not preserved across a coroutine switch. In mixed C/C++ codebases, all fiber entry functions must be declared `extern "C"` and must not allow any C++ exception to propagate out of them.
 
 **Stack management.** By default, libgoc uses canary-protected stacks with overflow detection. This is the portable default: canary stacks work on all platforms including restricted environments where virtual memory is unavailable, and encourage library authors to develop with a portability mindset. libgoc provides a GC heap (`goc_malloc`) for off-stack data, so fixed-size stacks are practical for most use cases. If stack overflow is detected, the runtime calls `abort()` immediately with a diagnostic message. For use cases that need large or variable stacks, the virtual memory allocator can be enabled with `-DLIBGOC_VMEM=ON`. Avoid large stack-allocated buffers and deep recursion inside fibers regardless of stack mode; use `goc_malloc`-allocated buffers on the GC heap for large data instead.
 
-**`src/minicoro.c` must be compiled without `-DGC_THREADS`.** The build system enforces this with `-UGC_THREADS` on that translation unit. This avoids a TLS interaction between minicoro and Boehm's thread wrapper during thread startup.
+**`src/minicoro.c` uses isolated compile flags.** The build system enforces `-UGC_THREADS -UGC_PTHREADS -DMCO_ZERO_MEMORY` on that translation unit (and additionally `-DMCO_USE_VMEM_ALLOCATOR` when `-DLIBGOC_VMEM=ON`). This avoids GC thread-wrapper/TLS startup interaction and enables minicoro's zeroing of pop storage for conservative-GC friendliness.
 
 ---
 
@@ -694,6 +696,23 @@ uv_close((uv_handle_t*)server, on_handle_closed);
 
 ---
 
+### Async I/O
+
+libgoc provides channel-based async I/O wrappers for libuv operations via a separate header:
+
+```c
+#include "goc.h"
+#include "goc_io.h"
+```
+
+Each function is prefixed `goc_io_` and returns a `goc_chan*` that delivers the result when the I/O completes. Safe from any context; composable with `goc_alts()`.
+
+Covered operations: stream read/write/connect/shutdown, UDP send/recv, file-system (open/close/read/write/stat/rename/unlink/sendfile), and DNS (getaddrinfo/getnameinfo).
+
+> **Full API reference:** [IO.md](./IO.md)
+
+---
+
 ## Best Practices
 
 Used the right way, **libgoc** provides a runtime environment very similar to Go's.
@@ -776,7 +795,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 
 # Or run a single phase directly for full output
-./build/test_p1_foundation
+./build/test_p01_foundation
 ```
 
 ---
@@ -818,14 +837,14 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 
 # Or run a single phase directly
-./build/test_p1_foundation
+./build/test_p01_foundation
 ```
 
 ---
 
 ### Windows
 
-libgoc uses `pthread.h` and C11 `_Atomic` directly. These are not available in MSVC builds or in the Win32-threads build of bdwgc that vcpkg produces. The recommended approach for Windows is **MSYS2/MinGW-w64 (UCRT64)**, which provides a POSIX-compatible GCC toolchain with full C11 support and a bdwgc package built with POSIX thread support.
+libgoc uses libuv thread primitives (`uv_thread_t`, etc.) and C11 atomics via `<stdatomic.h>` (`_Atomic`, `atomic_*`). MSVC builds are still not supported (notably due to bdwgc/toolchain constraints, including vcpkg's Win32-threads build), so the recommended Windows setup remains **MSYS2/MinGW-w64 (UCRT64)**.
 
 ```sh
 # 1. Install MSYS2 from https://www.msys2.org/, then in a UCRT64 shell:

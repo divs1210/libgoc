@@ -25,10 +25,11 @@
 14. [`goc_timeout` — libuv Timer](#goc_timeout--libuv-timer)
 15. [`goc_alts`](#goc_alts)
 16. [Public API](#public-api)
-17. [Initialization Sequence](#initialization-sequence)
-18. [Shutdown Sequence](#shutdown-sequence)
-19. [Testing](#testing)
-20. [CI/CD](#cicd)
+17. [Async I/O Wrappers (`goc_io`)](#async-io-wrappers-goc_io)
+18. [Initialization Sequence](#initialization-sequence)
+19. [Shutdown Sequence](#shutdown-sequence)
+20. [Testing](#testing)
+21. [CI/CD](#cicd)
 
 > **Dynamic Array:** For `goc_array` design rationale and full API see [ARRAY.md](./ARRAY.md).
 
@@ -63,23 +64,28 @@ libgoc/
 │   ├── channel.c          # Channel operations
 │   ├── mutex.c            # RW mutexes (channel-backed lock handles)
 │   ├── goc_array.c        # Dynamic array (goc_array)
+│   ├── goc_io.c           # Async I/O wrappers (libuv; see goc_io.h)
 │   ├── minicoro.c         # Instantiates minicoro (defines MINICORO_IMPL)
 │   ├── internal.h         # Internal types, helpers, and cross-module declarations
 │   ├── chan_type.h         # Authoritative struct goc_chan definition (included where concrete channel fields are accessed)
 │   ├── channel_internal.h  # Channel-only internals and inline channel helpers
 │   └── config.h           # Build configuration constants (thresholds, etc.)
+├── include/
+│   ├── goc.h              # Public API header
+│   └── goc_io.h           # Async I/O wrappers public API (separate include)
 ├── tests/
-│   ├── test_harness.h              # Shared harness macros + SIGSEGV/SIGABRT crash handler
-│   ├── test_p1_foundation.c        # Phase 1 — Foundation
-│   ├── test_goc_array.c            # Component — goc_array dynamic array
-│   ├── test_p2_channels_fibers.c   # Phase 2 — Channels and fiber launch
-│   ├── test_p3_channel_io.c        # Phase 3 — Channel I/O
-│   ├── test_p4_callbacks.c         # Phase 4 — Callbacks
-│   ├── test_p5_select_timeout.c    # Phase 5 — Select and timeout
-│   ├── test_p6_thread_pool.c       # Phase 6 — Thread pool
-│   ├── test_p7_integration.c       # Phase 7 — Integration
-│   ├── test_p8_safety.c            # Phase 8 — Safety and crash behaviour
-│   └── test_p9_mutexes.c           # Phase 9 — RW mutexes
+│   ├── test_harness.h               # Shared harness macros + SIGSEGV/SIGABRT crash handler
+│   ├── test_p01_foundation.c        # Phase 1  — Foundation
+│   ├── test_goc_array.c             # Component — goc_array dynamic array
+│   ├── test_p02_channels_fibers.c   # Phase 2  — Channels and fiber launch
+│   ├── test_p03_channel_io.c        # Phase 3  — Channel I/O
+│   ├── test_p04_callbacks.c         # Phase 4  — Callbacks
+│   ├── test_p05_select_timeout.c    # Phase 5  — Select and timeout
+│   ├── test_p06_thread_pool.c       # Phase 6  — Thread pool
+│   ├── test_p07_integration.c       # Phase 7  — Integration
+│   ├── test_p08_safety.c            # Phase 8  — Safety and crash behaviour
+│   ├── test_p09_mutexes.c           # Phase 9  — RW mutexes
+│   └── test_p10_io.c                # Phase 10 — Async I/O wrappers
 ├── bench/                           # Benchmarks (see bench/README.md)
 │   ├── go/                          # Go benchmark sources
 │   ├── libgoc/                      # C benchmark sources
@@ -101,7 +107,12 @@ Benchmarks live in `bench/` and are documented in [bench/README.md](./bench/READ
 
 minicoro is a single-header library vendored under `vendor/minicoro/`. It requires exactly one translation unit to instantiate its implementation: `src/minicoro.c` defines `MINICORO_IMPL` before including `minicoro.h`. All other files include `minicoro.h` without defining `MINICORO_IMPL`.
 
-`src/minicoro.c` **must be compiled without `-DGC_THREADS`** and **with `-DMCO_ZERO_MEMORY`** (see [minicoro Limitations](#minicoro-limitations)). `CMakeLists.txt` enforces this via `set_source_files_properties(src/minicoro.c PROPERTIES COMPILE_OPTIONS "-UGC_THREADS;-DMCO_ZERO_MEMORY")`.
+`src/minicoro.c` is compiled as an isolated translation unit with minicoro-specific flags (see [minicoro Limitations](#minicoro-limitations)). CMake enforces:
+
+- always: `-UGC_THREADS -UGC_PTHREADS -DMCO_ZERO_MEMORY`
+- when `-DLIBGOC_VMEM=ON`: additionally `-DMCO_USE_VMEM_ALLOCATOR`
+
+This is implemented via `set_source_files_properties(src/minicoro.c PROPERTIES COMPILE_OPTIONS ...)` in `CMakeLists.txt`.
 
 ---
 
@@ -113,12 +124,12 @@ The project uses CMake (≥ 3.20). `CMakeLists.txt` defines the following primar
 |---|---|---|
 | `goc` | static library | All `src/*.c` modules; always built |
 | `goc_shared` | shared library | Same sources as `goc`; built only with `-DLIBGOC_SHARED=ON`; output name `libgoc.so` / `.dylib` / `.dll` |
-| `test_p1_foundation` … `test_p9_mutexes` | executables | Phase tests, discovered via `file(GLOB tests/test_p*.c)`; each linked against the active `goc` variant + libuv + Boehm GC |
+| `test_p01_foundation` … `test_p10_io` | executables | One per phase, discovered via `file(GLOB tests/test_p*.c)`; each linked against the active `goc` variant + libuv + Boehm GC |
 | `test_goc_array` | executable | Component test for `goc_array`; discovered via `file(GLOB tests/test_goc_*.c)` |
 
 A CMake function `goc_configure_target(<target>)` centralises the options shared by every library variant: `PUBLIC` include path `include/`, `PRIVATE` paths `src/` and `vendor/minicoro/`, compile definition `GC_THREADS`, and link libraries `PkgConfig::LIBUV` and `PkgConfig::BDWGC`. All library targets (`goc`, `goc_shared`, `goc_asan`, `goc_tsan`) are configured through this function.
 
-When `-DLIBGOC_VMEM=ON` is passed, `LIBGOC_VMEM_ENABLED` is added as a `PRIVATE` compile definition on the `goc` library target **and** on every per-phase test executable. This ensures that `src/internal.h`'s canary macros are disabled and that `test_p8_safety.c` detects the vmem build at compile time (P8.1 uses `#ifdef LIBGOC_VMEM_ENABLED` to skip the canary-abort test in vmem builds, where the canary is a no-op). By default (canary mode), `LIBGOC_VMEM_ENABLED` is **not** defined and canary protection is active.
+When `-DLIBGOC_VMEM=ON` is passed, `LIBGOC_VMEM_ENABLED` is added as a `PRIVATE` compile definition on the `goc` library target **and** on every per-phase test executable. This ensures that `src/internal.h`'s canary macros are disabled and that `test_p08_safety.c` detects the vmem build at compile time (P8.1 uses `#ifdef LIBGOC_VMEM_ENABLED` to skip the canary-abort test in vmem builds, where the canary is a no-op). By default (canary mode), `LIBGOC_VMEM_ENABLED` is **not** defined and canary protection is active.
 
 Dependencies are resolved via `pkg-config` (libuv as `libuv`, Boehm GC as `bdw-gc-threaded` — **no fallback**; configure fails loudly if the threaded variant is absent). minicoro is instantiated via `src/minicoro.c` (which defines `MINICORO_IMPL`) and its header is available to all targets via `target_include_directories` pointing at `vendor/minicoro/`.
 
@@ -499,15 +510,17 @@ Each fiber's stack is registered once at birth (in `goc_go_on`, `src/fiber.c`) a
 
 ## minicoro Limitations
 
-libgoc uses [minicoro](https://github.com/edubart/minicoro) for all fiber switching. Three hard constraints apply to all fiber entry functions and must be understood by library embedders:
+libgoc uses [minicoro](https://github.com/edubart/minicoro) for all fiber switching. Four hard constraints apply to all fiber entry functions and must be understood by library embedders:
 
 **C++ exceptions are not supported.** The C++ exception mechanism maintains internal unwinding state that is not preserved across a coroutine context switch. Throwing an exception that propagates across a `mco_yield` / `mco_resume` boundary is undefined behaviour and will typically corrupt the exception handler chain or crash. In mixed C/C++ codebases all fiber entry functions must be declared `extern "C"` and must not allow any C++ exception to escape them.
 
 **Stack management.** By default, libgoc uses canary-protected stacks with overflow detection. This is the portable default and encourages library authors to develop with a platform-independent mindset. The virtual memory allocator can be enabled with `-DLIBGOC_VMEM=ON` for dynamic stack growth — useful when individual fibers need large or variable stacks. If stack overflow is detected in canary mode, the runtime calls `abort()` immediately with a diagnostic message. Avoid large stack-allocated buffers and deep recursion inside fibers regardless of stack mode — use `goc_malloc`-allocated buffers on the GC heap for large data.
 
-**`src/minicoro.c` must be compiled without `-DGC_THREADS`.** minicoro declares a `static MCO_THREAD_LOCAL mco_current_co` variable (a `thread_local` TLS slot) to track the running coroutine per thread. When Boehm GC is compiled with `GC_THREADS` it wraps `pthread_create` and invokes `GC_call_with_stack_base` during thread startup, which walks TLS descriptors. If minicoro's TLS block is visible to that walk before `mco_current_co` is initialised on a new thread, the GC faults with a SIGSEGV inside its own startup code — even if no minicoro function has yet been called. The fix is to compile `src/minicoro.c` in its own isolated translation unit with `-UGC_THREADS`, which `CMakeLists.txt` enforces via `set_source_files_properties`. minicoro never calls any GC function, so the flag is irrelevant to its correctness regardless.
+**`src/minicoro.c` must be compiled without GC thread-wrapper defines (`-UGC_THREADS` and `-UGC_PTHREADS`).** minicoro declares a `static MCO_THREAD_LOCAL mco_current_co` variable (a `thread_local` TLS slot) to track the running coroutine per thread. When Boehm GC thread wrappers are active, thread-startup bookkeeping may walk TLS state during `pthread_create` startup. If minicoro's TLS block is visible before `mco_current_co` is initialised on a new thread, the GC can fault during startup before any minicoro API has been called. The fix is to compile `src/minicoro.c` in its own isolated translation unit with `-UGC_THREADS;-UGC_PTHREADS`, which `CMakeLists.txt` enforces via `set_source_files_properties`.
 
-**`src/minicoro.c` must be compiled with `-DMCO_ZERO_MEMORY`.** minicoro's internal push/pop storage buffer is used to pass values between `mco_push`/`mco_pop` calls across a `mco_yield`/`mco_resume` boundary. When `MCO_ZERO_MEMORY` is not defined, popped bytes remain in the buffer after the pop — if those bytes held a GC-managed pointer, Boehm GC's conservative scanner may keep the referent alive indefinitely because it still sees a pointer-shaped value in the coroutine's allocation. Defining `MCO_ZERO_MEMORY` causes minicoro to `memset` the popped region to zero immediately after copying it to the caller, eliminating the stale-pointer window. This is minicoro's built-in GC-environment support and **must be enabled** when building with Boehm GC. `-UGC_THREADS` and `-DMCO_ZERO_MEMORY` are therefore complementary: the former prevents the TLS-related crash at thread startup; the latter ensures the conservative collector does not retain objects via stale references in coroutine storage.
+**`src/minicoro.c` must be compiled with `-DMCO_ZERO_MEMORY`.** minicoro's internal push/pop storage buffer is used to pass values between `mco_push`/`mco_pop` calls across a `mco_yield`/`mco_resume` boundary. When `MCO_ZERO_MEMORY` is not defined, popped bytes remain in the buffer after the pop — if those bytes held a GC-managed pointer, Boehm GC's conservative scanner may keep the referent alive indefinitely because it still sees a pointer-shaped value in the coroutine's allocation. Defining `MCO_ZERO_MEMORY` causes minicoro to `memset` the popped region to zero immediately after copying it to the caller, eliminating the stale-pointer window. This is minicoro's built-in GC-environment support and **must be enabled** when building with Boehm GC. `-UGC_THREADS;-UGC_PTHREADS` and `-DMCO_ZERO_MEMORY` are complementary: the former isolates minicoro from GC thread-wrapper startup paths; the latter ensures the conservative collector does not retain objects via stale references in coroutine storage.
+
+**When `LIBGOC_VMEM=ON`, `src/minicoro.c` must also be compiled with `-DMCO_USE_VMEM_ALLOCATOR`.** This switches minicoro to its virtual-memory-backed stack allocator, matching libgoc's vmem mode (`LIBGOC_VMEM_ENABLED`) where canary checks are compiled out and stacks can grow dynamically.
 
 ---
 
@@ -1215,6 +1228,27 @@ uv_tcp_init(goc_scheduler(), server);
 
 ---
 
+## Async I/O Wrappers (`goc_io`)
+
+libgoc provides channel-based wrappers for libuv I/O operations in a separate header (`goc_io.h`) and translation unit (`src/goc_io.c`). All public identifiers are prefixed `goc_io_`.
+
+**Include separately:**
+
+```c
+#include "goc.h"
+#include "goc_io.h"
+```
+
+**Single-form API.** Each operation is exposed as a single function that returns `goc_chan*`; the channel delivers the result when the I/O completes. Safe from any context; composable with `goc_alts()`.
+
+**Thread-safety bridge.** Stream and UDP operations (`uv_write`, `uv_read_start`, etc.) touch handle internals that must run on the libuv loop thread. Stream/UDP wrappers marshal each call to the loop thread via a one-shot heap-allocated `uv_async_t`. File-system and DNS operations are submitted directly (libuv routes them through its internal thread pool).
+
+**GC safety.** All `goc_chan*` pointers passed to async context structs (which are `malloc`-allocated) are registered in the `live_uv_handles` array (see `gc.c`) for the duration of the pending I/O, preventing premature collection.
+
+> **Full API reference:** [IO.md](./IO.md)
+
+---
+
 ## Initialization Sequence
 
 `goc_init` must be called exactly once, as the first call in `main()`. Calling it more than once is undefined behaviour. It performs the following steps:
@@ -1422,7 +1456,7 @@ The test suite is split across phase files in `tests/`, each a self-contained C 
 | P8.10 | `goc_put_sync` called from within a fiber → `abort()`; verified via `fork` + `waitpid` asserting `SIGABRT` |
 | P8.11 | `goc_alts_sync` called from within a fiber → `abort()`; verified via `fork` + `waitpid` asserting `SIGABRT` |
 
-> **Windows:** All P8 tests self-skip on Windows. `fork()`/`waitpid()` are not available in MinGW; `test_p8_safety.c` detects `_WIN32` at compile time and emits a `TEST_SKIP` stub for each of the 11 tests. The binary builds and runs cleanly; tests report `skip` rather than failing.
+> **Windows:** All P8 tests self-skip on Windows. `fork()`/`waitpid()` are not available in MinGW; `test_p08_safety.c` detects `_WIN32` at compile time and emits a `TEST_SKIP` stub for each of the 11 tests. The binary builds and runs cleanly; tests report `skip` rather than failing.
 
 **Phase 9 — RW mutexes**
 
@@ -1433,7 +1467,6 @@ The test suite is split across phase files in `tests/`, each a self-contained C 
 | P9.3 | Writer blocks while a reader is held, then acquires after reader release |
 | P9.4 | Writer preference: once a writer is queued, subsequent readers queue behind it |
 | P9.5 | Fiber parking path: reader fiber blocks behind writer and resumes after writer release |
-
 
 **goc_array component**
 
@@ -1452,6 +1485,25 @@ The test suite is split across phase files in `tests/`, each a self-contained C 
 | `test_array_empty_ops` | Pop/pop_head/slice/concat on empty arrays return NULL / zero-length array without crashing |
 | `test_array_from_empty` | `goc_array_from(NULL, 0)` returns a valid empty array |
 
+**Phase 10 — Async I/O wrappers**
+
+| Test | Description |
+|---|---|
+| P10.1 | `goc_io_fs_open`: open a new file; file descriptor >= 0 |
+| P10.2 | `goc_io_fs_write`: write data to an open file; returns correct written byte count |
+| P10.3 | `goc_io_fs_read`: read back written data; content matches |
+| P10.4 | `goc_io_fs_stat`: stat the file; `st_size` equals written byte count |
+| P10.5 | `goc_io_fs_rename`: rename the file; old path stat fails, new path stat succeeds |
+| P10.6 | `goc_io_fs_unlink`: delete the file; subsequent stat fails |
+| P10.7 | `goc_io_fs_open` with non-existent path returns negative error code |
+| P10.8 | `goc_io_getaddrinfo` resolves "localhost"; `ok == GOC_IO_OK`, `res != NULL` |
+| P10.9 | `goc_io_getaddrinfo` with NULL node and service: no crash |
+| P10.10 | `goc_io_getaddrinfo` returns non-NULL channel |
+| P10.11 | `goc_io_fs_sendfile`: copy bytes between two file descriptors; content verified |
+| P10.12 | `goc_io_fs_open` integrates with `goc_alts` (select on I/O channel vs. dummy channel) |
+
+> **Windows portability:** Temporary file paths are constructed via `GetTempPathA` on Windows and `/tmp` on POSIX. All file-system operations use `UV_FS_O_*` flags (e.g. `UV_FS_O_RDONLY`, `UV_FS_O_WRONLY | UV_FS_O_CREAT`) which are portable across all libuv platforms. Phase 10 builds and runs on Windows.
+
 ### Running
 
 ```sh
@@ -1459,7 +1511,7 @@ cmake -B build
 cmake --build build
 ctest --test-dir build --output-on-failure --timeout 120
 # or run a single phase directly:
-./build/test_p1_foundation
+./build/test_p01_foundation
 ```
 
 With sanitizers:
@@ -1497,7 +1549,7 @@ All four configurations run `RelWithDebInfo` builds. Dependencies per OS:
 - **macOS**: Homebrew: `libuv`, `bdw-gc`, `pkg-config`. Homebrew's `bdw-gc` formula does not ship a `bdw-gc-threaded.pc` pkg-config alias; the workflow creates it in `$(brew --prefix)/lib/pkgconfig`.
 - **Windows**: MSYS2/MinGW-w64 (UCRT64 environment) is used instead of MSVC+vcpkg. This is required because libgoc uses `pthread.h` and C11 `_Atomic` directly. MSYS2's MinGW packages provide a POSIX-compatible toolchain with full GCC C11 support and a bdwgc build compiled with pthreads. A `bdw-gc-threaded.pc` alias is created in `/ucrt64/lib/pkgconfig` before CMake runs.
 
-The test suite itself is portable to Windows with one exception: **Phase 8 (safety tests)** relies on `fork()`/`waitpid()` to isolate processes that call `abort()`. These POSIX APIs are not available in MinGW. `test_p8_safety.c` detects `_WIN32` at compile time and replaces each of the 11 P8 tests with a `TEST_SKIP` stub, so the binary still builds and runs cleanly — it just reports skipped tests rather than failing.
+The test suite itself is portable to Windows with one exception: **Phase 8 (safety tests)** relies on `fork()`/`waitpid()` to isolate processes that call `abort()`. These POSIX APIs are not available in MinGW. `test_p08_safety.c` detects `_WIN32` at compile time and replaces each of the 11 P8 tests with a `TEST_SKIP` stub, so the binary still builds and runs cleanly — it just reports skipped tests rather than failing.
 
 ### CD Workflow (`.github/workflows/cd.yml`)
 
