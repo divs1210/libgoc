@@ -59,6 +59,7 @@ libgoc/
 │   ├── fiber.c            # minicoro fiber mechanics
 │   ├── channel.c          # Channel operations
 │   ├── mutex.c            # RW mutexes (channel-backed lock handles)
+│   ├── stats.c            # Optional runtime instrumentation counters (LIBGOC_STATS)
 │   ├── minicoro.c         # Instantiates minicoro (defines MINICORO_IMPL)
 │   ├── internal.h         # Internal types, helpers, and cross-module declarations
 │   ├── chan_type.h         # Authoritative struct goc_chan definition (included where concrete channel fields are accessed)
@@ -87,6 +88,7 @@ libgoc/
 ├── libgoc.pc.in           # pkg-config template; expanded by CMake at configure time
 ├── README.md
 ├── DESIGN.md              # This document
+├── OPTIMIZATIONS.md       # Benchmark-driven performance roadmap
 ├── TODO.md                # Planned future work
 └── LICENSE
 ```
@@ -129,6 +131,7 @@ Optional opt-in flags, each requiring a **separate build directory**:
 | `-DLIBGOC_ASAN=ON` | `goc_asan` | AddressSanitizer; per-phase test executables link against `goc_asan`; mutually exclusive with TSAN and COVERAGE |
 | `-DLIBGOC_TSAN=ON` | `goc_tsan` | ThreadSanitizer; per-phase test executables link against `goc_tsan`; mutually exclusive with ASAN and COVERAGE |
 | `-DLIBGOC_COVERAGE=ON` | `coverage` target (if lcov/genhtml found) | Instruments `goc` with `--coverage`; runs ctest then produces `coverage_html/index.html`; mutually exclusive with ASAN and TSAN |
+| `-DLIBGOC_STATS=ON` | *(no extra target)* | Enables `LIBGOC_STATS_ENABLED` on all targets. Compiles `src/stats.c` with active `_Atomic` counters for channel scan lengths, dead-entry compaction, callback queue depth, timeout counts, and scheduler attempt/success rates. Default `OFF`; zero overhead when disabled. Intended for benchmarking and tuning only — do not ship production builds with this on. |
 
 ASAN and TSAN each compile a separate instrumented copy of the `goc` static library (`goc_asan` / `goc_tsan`) so that sanitizer flags propagate through all object files. When either sanitizer flag is active the per-phase test executables link against the instrumented variant instead of `goc`. Configuring ASAN and TSAN together, or either sanitizer with COVERAGE, in the same directory is a CMake fatal error.
 
