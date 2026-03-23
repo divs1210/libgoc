@@ -527,7 +527,7 @@ typedef struct {
 
 static void test_p7_5_worker_fn(void* arg) {
     p7_5_worker_args_t* a = (p7_5_worker_args_t*)arg;
-    uv_sleep((unsigned int)a->delay_ms);
+    goc_nanosleep((uint64_t)a->delay_ms * 1000000);
     /* Ignore the return status: the slow fiber will get GOC_CLOSED if the
      * channel has already been closed by the time it wakes up. */
     goc_put(a->result_ch, (void*)a->value);

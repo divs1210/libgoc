@@ -385,12 +385,12 @@ typedef struct {
 /*
  * Fiber entry point for P2.7.
  * Sleeps for sleep_us microseconds then signals done before returning.
- * uv_sleep() is used for cross-platform compatibility.
+ * goc_nanosleep() is used for cross-platform compatibility.
  */
 static void slow_fiber_fn(void* arg) {
     slow_fiber_args_t* a = (slow_fiber_args_t*)arg;
     /* Simulate work with a short sleep on the fiber's OS thread. */
-    uv_sleep((unsigned int)((a->sleep_us + 999) / 1000));
+    goc_nanosleep((uint64_t)a->sleep_us * 1000);
     done_signal(a->done);
 }
 

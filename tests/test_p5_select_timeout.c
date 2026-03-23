@@ -323,7 +323,7 @@ static void test_p5_3(void) {
     /* Small yield to allow the fiber to actually park inside goc_alts before
      * we put.  The ready semaphore is posted just before goc_alts is called,
      * so there is a narrow window; a brief sleep closes it reliably. */
-    uv_sleep(5); /* 5 ms */
+    goc_nanosleep(5000000); /* 5 ms */
 
     goc_status_t st = goc_put_sync(ch, (void*)(uintptr_t)0x1234);
     ASSERT(st == GOC_OK);
@@ -387,7 +387,7 @@ static void test_p5_4(void) {
     ASSERT(join != NULL);
 
     done_wait(&ready);
-    uv_sleep(5); /* 5 ms */
+    goc_nanosleep(5000000); /* 5 ms */
 
     goc_val_t* v = goc_take_sync(ch);
     ASSERT(v->ok == GOC_OK);
@@ -617,7 +617,7 @@ static void test_p5_8(void) {
     ASSERT(join != NULL);
 
     done_wait(&ready);
-    uv_sleep(5); /* 5 ms */
+    goc_nanosleep(5000000); /* 5 ms */
 
     goc_close(ch);  /* wake the parked fiber with CLOSED */
 
@@ -678,7 +678,7 @@ static void test_p5_9(void) {
     ASSERT(join != NULL);
 
     done_wait(&ready);
-    uv_sleep(5); /* 5 ms */
+    goc_nanosleep(5000000); /* 5 ms */
 
     goc_close(ch);
 
@@ -779,7 +779,7 @@ typedef struct {
 
 static void test_p5_11_sender_fn(void* arg) {
     p5_11_sender_args_t* a = (p5_11_sender_args_t*)arg;
-    uv_sleep((unsigned int)((a->delay_us + 999) / 1000));
+    goc_nanosleep((uint64_t)a->delay_us * 1000);
     goc_put(a->ch, (void*)(uintptr_t)0x9ABC);
 }
 
@@ -832,7 +832,7 @@ typedef struct {
 
 static void test_p5_12_receiver_fn(void* arg) {
     p5_12_receiver_args_t* a = (p5_12_receiver_args_t*)arg;
-    uv_sleep((unsigned int)((a->delay_us + 999) / 1000));
+    goc_nanosleep((uint64_t)a->delay_us * 1000);
     goc_val_t* v = goc_take(a->ch);
     if (v->ok == GOC_OK) {
         a->received_val = (uintptr_t)v->val;
@@ -974,7 +974,7 @@ static void test_p5_14(void) {
     ASSERT(join != NULL);
 
     done_wait(&ready);
-    uv_sleep(5); /* 5 ms */
+    goc_nanosleep(5000000); /* 5 ms */
 
     goc_close(ch1);
     goc_close(ch2);
