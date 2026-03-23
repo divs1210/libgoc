@@ -21,12 +21,10 @@ The library provides stackful coroutines ("fibers"), channels, a select primitiv
 | `libuv` | event loop, timers, cross-thread wakeup |
 | Boehm GC | garbage collection; **must be built with POSIX thread support** (`--enable-threads=posix`); linked automatically, initialised by `goc_init` |
 
-**Pre-built static libraries** for:
+**Pre-built static libraries** are available on the [Releases page](https://github.com/divs1210/libgoc/releases):
 - Linux (x86-64)
 - macOS (arm64)
 - Windows (x86-64)
-
-are available on the [Releases page](https://github.com/divs1210/libgoc/releases).
 
 **Helper libraries:**
 - [Dynamic Array](./ARRAY.md)
