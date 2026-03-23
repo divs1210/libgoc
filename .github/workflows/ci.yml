@@ -11,17 +11,13 @@ on:
       - 'CMakeLists.txt'
       - 'vendor/**'
       - '.github/workflows/ci.yml'
-  pull_request:
-    paths:
-      - 'src/**'
-      - 'include/**'
-      - 'tests/**'
-      - 'CMakeLists.txt'
-      - 'vendor/**'
-      - '.github/workflows/ci.yml'
+  pull_request_review:
+    types:
+      - submitted
 
 jobs:
   test:
+    if: github.event_name != 'pull_request_review' || github.event.review.state == 'approved'
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
