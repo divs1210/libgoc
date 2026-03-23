@@ -197,8 +197,8 @@ void loop_init(void)
     cb_queue_init();
 
     /* 6. Spawn the loop thread (GC-registered on all platforms via
-     *    gc_uv_thread_create — see internal.h). */
-    gc_uv_thread_create(&g_loop_thread, loop_thread_fn, NULL);
+     *    goc_thread_create — see internal.h). */
+    goc_thread_create(&g_loop_thread, loop_thread_fn, NULL);
 }
 
 void loop_shutdown(void)
@@ -207,7 +207,7 @@ void loop_shutdown(void)
     uv_async_send(g_shutdown_async);
 
     /* Wait for the loop thread to finish. */
-    gc_uv_thread_join(&g_loop_thread);
+    goc_thread_join(&g_loop_thread);
 
     /* All handles are closed; the loop should be idle. */
     assert(uv_loop_close(g_loop) == 0);

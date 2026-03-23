@@ -274,17 +274,17 @@ extern goc_pool*             g_default_pool;
 /* ---------------------------------------------------------------------------
  * GC-aware libuv thread wrappers
  *
- * Use gc_uv_thread_create / gc_uv_thread_join everywhere in libgoc instead
+ * Use goc_thread_create / goc_thread_join everywhere in libgoc instead
  * of calling uv_thread_create directly.
  *
  * uv_thread_create does not register new threads with Boehm GC.
- * gc_uv_thread_create uses a trampoline (gc_uv_thread_trampoline in gc.c)
+ * goc_thread_create uses a trampoline (goc_thread_trampoline in gc.c)
  * that calls GC_register_my_thread at startup and GC_unregister_my_thread
  * at exit on all platforms.  GC_allow_register_threads() must have been
  * called first — goc_init() does this.
  * --------------------------------------------------------------------------- */
 
-int gc_uv_thread_create(uv_thread_t* t, uv_thread_cb fn, void* arg);
-int gc_uv_thread_join(uv_thread_t* t);
+int goc_thread_create(uv_thread_t* t, uv_thread_cb fn, void* arg);
+int goc_thread_join(uv_thread_t* t);
 
 #endif /* GOC_INTERNAL_H */

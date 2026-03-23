@@ -5,7 +5,7 @@
  *   - goc_malloc
  *   - live-channels registry (live_channels array + g_live_mutex)
  *   - pool registry initialisation (delegates to pool.c)
- *   - gc_uv_thread_create / gc_uv_thread_join (all platforms)
+ *   - goc_thread_create / goc_thread_join (all platforms)
  */
 
 #include <stdlib.h>
@@ -22,7 +22,7 @@
 #include "internal.h"
 
 /* ---------------------------------------------------------------------------
- * gc_uv_thread_create / gc_uv_thread_join  (all platforms)
+ * goc_thread_create / goc_thread_join  (all platforms)
  *
  * libuv's uv_thread_create does not register new threads with Boehm GC.
  * This trampoline ensures every thread is registered before its body runs
@@ -35,7 +35,7 @@ typedef struct {
     void*        arg;
 } gc_thread_args_t;
 
-static void gc_uv_thread_trampoline(void* raw)
+static void goc_thread_trampoline(void* raw)
 {
     /* Extract fn/arg and free the heap-allocated carrier before we touch
      * any GC-managed memory (avoids a window where the carrier is live but
@@ -52,18 +52,18 @@ static void gc_uv_thread_trampoline(void* raw)
     GC_unregister_my_thread();
 }
 
-int gc_uv_thread_create(uv_thread_t* t, uv_thread_cb fn, void* arg)
+int goc_thread_create(uv_thread_t* t, uv_thread_cb fn, void* arg)
 {
     gc_thread_args_t* w = malloc(sizeof(gc_thread_args_t));
     if (!w) return UV_ENOMEM;
     w->fn  = fn;
     w->arg = arg;
-    int rc = uv_thread_create(t, gc_uv_thread_trampoline, w);
+    int rc = uv_thread_create(t, goc_thread_trampoline, w);
     if (rc != 0) free(w);
     return rc;
 }
 
-int gc_uv_thread_join(uv_thread_t* t)
+int goc_thread_join(uv_thread_t* t)
 {
     return uv_thread_join(t);
 }

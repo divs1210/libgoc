@@ -498,7 +498,7 @@ goc_pool* goc_pool_make(size_t threads) {
     pool->pending_spawn_tail = NULL;
 
     for (size_t i = 0; i < threads; i++) {
-        int rc = gc_uv_thread_create(&pool->workers[i].thread,
+        int rc = goc_thread_create(&pool->workers[i].thread,
                                    pool_worker_fn, &pool->workers[i]);
         if (rc != 0) {
             fprintf(stderr,
@@ -537,7 +537,7 @@ void goc_pool_destroy(goc_pool* pool) {
 
     /* 4. Reap worker threads. */
     for (size_t i = 0; i < pool->thread_count; i++) {
-        gc_uv_thread_join(&pool->workers[i].thread);
+        goc_thread_join(&pool->workers[i].thread);
     }
 
     /* 5. Destroy per-worker resources. */
@@ -599,7 +599,7 @@ goc_drain_result_t goc_pool_destroy_timeout(goc_pool* pool, uint64_t ms) {
     }
 
     for (size_t i = 0; i < pool->thread_count; i++) {
-        gc_uv_thread_join(&pool->workers[i].thread);
+        goc_thread_join(&pool->workers[i].thread);
     }
 
     for (size_t i = 0; i < pool->thread_count; i++) {
