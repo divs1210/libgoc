@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <string.h>
 #include <stdatomic.h>
 #include <uv.h>
 #include <gc.h>
@@ -370,8 +371,13 @@ void* goc_realloc(void* ptr, size_t n) {
 
 void live_channels_init(void) {
     live_channels_cap = 64;
-    live_channels     = malloc(live_channels_cap * sizeof(goc_chan*));
+    /* Must be GC-traced: this registry may be the only remaining strong
+     * reference to some channels at shutdown time. If allocated with plain
+     * malloc, BDW-GC cannot scan the pointer array and may collect channels
+     * early, leaving stale pointers here. */
+    live_channels     = GC_malloc(live_channels_cap * sizeof(goc_chan*));
     assert(live_channels != NULL);
+    memset(live_channels, 0, live_channels_cap * sizeof(goc_chan*));
     live_channels_len = 0;
     uv_mutex_init(&g_live_mutex);
 }
@@ -387,11 +393,14 @@ void chan_register(goc_chan* ch) {
     uv_mutex_lock(&g_live_mutex);
 
     if (live_channels_len == live_channels_cap) {
+        size_t old_cap  = live_channels_cap;
         size_t new_cap  = live_channels_cap * 2;
-        goc_chan** grown = realloc(live_channels, new_cap * sizeof(goc_chan*));
+        goc_chan** grown = GC_realloc(live_channels, new_cap * sizeof(goc_chan*));
         assert(grown != NULL);
         live_channels     = grown;
         live_channels_cap = new_cap;
+        memset(live_channels + old_cap, 0,
+               (new_cap - old_cap) * sizeof(goc_chan*));
     }
 
     live_channels[live_channels_len++] = ch;
@@ -412,6 +421,9 @@ void chan_unregister(goc_chan* ch) {
     for (size_t i = 0; i < live_channels_len; i++) {
         if (live_channels[i] == ch) {
             live_channels[i] = live_channels[--live_channels_len];
+            /* Clear vacated slot so the GC-traced registry doesn't keep
+             * dead channels reachable via stale pointers. */
+            live_channels[live_channels_len] = NULL;
             break;
         }
     }
@@ -585,7 +597,7 @@ void goc_shutdown(void) {
         uv_mutex_destroy(ch->lock);
         free(ch->lock);
     }
-    free(live_channels);
+    GC_free(live_channels);
     live_channels     = NULL;
     live_channels_len = 0;
     live_channels_cap = 0;

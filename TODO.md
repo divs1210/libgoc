@@ -4,7 +4,7 @@
 
 - [x] **F1** libuv I/O function wrappers that use channels rather than callbacks
 
-- [ ] **F2** dynamic fiber stacks, like Go
+- **F2** dynamic fiber stacks, like Go
 
 - [ ] **F3** Telemetry — expose runtime metrics for all pools, worker threads, fibers, channels, mutexes, and their metadata
 
@@ -16,6 +16,6 @@
 
 ### Chores
 
-- [ ] **F4** Publish to package managers for each platform (Homebrew, apt/deb, vcpkg, etc.)
+- **F4** Publish to package managers for each platform (Homebrew, apt/deb, vcpkg, etc.)
 
-- [ ] **F5** Idiomatic C++ wrapper `libgocxx`
+- **F5** Idiomatic C++ wrapper `libgocxx`

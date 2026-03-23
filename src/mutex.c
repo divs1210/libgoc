@@ -13,7 +13,9 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <stddef.h>
+#include <string.h>
 #include <stdatomic.h>
+#include <gc.h>
 #include "../include/goc.h"
 #include "channel_internal.h"
 
@@ -55,8 +57,11 @@ static uv_mutex_t  g_live_mutexes_lock;
 void mutex_registry_init(void)
 {
     g_live_mutexes_cap = 32;
-    g_live_mutexes = malloc(g_live_mutexes_cap * sizeof(goc_mutex*));
+    /* Must be GC-traced for the same reason as live_channels in gc.c:
+     * registry ownership can outlive all other references to a mutex. */
+    g_live_mutexes = GC_malloc(g_live_mutexes_cap * sizeof(goc_mutex*));
     assert(g_live_mutexes != NULL);
+    memset(g_live_mutexes, 0, g_live_mutexes_cap * sizeof(goc_mutex*));
     g_live_mutexes_len = 0;
     uv_mutex_init(&g_live_mutexes_lock);
 }
@@ -66,11 +71,14 @@ static void mutex_register(goc_mutex* mx)
     uv_mutex_lock(&g_live_mutexes_lock);
 
     if (g_live_mutexes_len == g_live_mutexes_cap) {
+        size_t old_cap = g_live_mutexes_cap;
         size_t new_cap = g_live_mutexes_cap * 2;
-        goc_mutex** grown = realloc(g_live_mutexes, new_cap * sizeof(goc_mutex*));
+        goc_mutex** grown = GC_realloc(g_live_mutexes, new_cap * sizeof(goc_mutex*));
         assert(grown != NULL);
         g_live_mutexes = grown;
         g_live_mutexes_cap = new_cap;
+        memset(g_live_mutexes + old_cap, 0,
+               (new_cap - old_cap) * sizeof(goc_mutex*));
     }
 
     g_live_mutexes[g_live_mutexes_len++] = mx;
@@ -86,7 +94,7 @@ void mutex_registry_destroy_all(void)
         free(mx->lock);
     }
 
-    free(g_live_mutexes);
+    GC_free(g_live_mutexes);
     g_live_mutexes = NULL;
     g_live_mutexes_len = 0;
     g_live_mutexes_cap = 0;
