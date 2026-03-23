@@ -28,6 +28,14 @@
  *         (the predicate is true only inside a fiber body)
  *   P1.5  goc_realloc() grows a GC allocation preserving existing data,
  *         and shrinks it without corrupting surviving bytes
+ *
+ * Notes:
+ *   - goc_init() is called once in main() before any test runs.
+ *   - goc_shutdown() is called once in main() after all tests complete;
+ *     no goc_* function may be called after it returns.
+ *   - The test harness uses a goto-based cleanup pattern: each test function
+ *     has a single `done:` label that is the target of TEST_PASS / TEST_FAIL /
+ *     ASSERT.  This keeps cleanup deterministic even when assertions fire.
  */
 
 #include <stddef.h>
