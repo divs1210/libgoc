@@ -27,11 +27,11 @@ The library provides stackful coroutines ("fibers"), channels, a select primitiv
 - Windows (x86-64)
 
 **Helper libraries:**
+- [Async I/O API](./IO.md)
 - [Dynamic Array](./ARRAY.md)
 
 **Also see:**
 - [Design Doc](./DESIGN.md)
-- [Async I/O API](./IO.md)
 - [Benchmarks](/bench)
 
 
