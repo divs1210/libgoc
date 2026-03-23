@@ -74,17 +74,6 @@ libgoc/
 │   ├── goc.h              # Public API header
 │   └── goc_io.h           # Async I/O wrappers public API (separate include)
 ├── tests/
-│   ├── test_harness.h              # Shared harness macros + SIGSEGV/SIGABRT crash handler
-│   ├── test_p1_foundation.c        # Phase 1 — Foundation
-│   ├── test_goc_array.c            # Component — goc_array dynamic array
-│   ├── test_p2_channels_fibers.c   # Phase 2 — Channels and fiber launch
-│   ├── test_p3_channel_io.c        # Phase 3 — Channel I/O
-│   ├── test_p4_callbacks.c         # Phase 4 — Callbacks
-│   ├── test_p5_select_timeout.c    # Phase 5 — Select and timeout
-│   ├── test_p6_thread_pool.c       # Phase 6 — Thread pool
-│   ├── test_p7_integration.c       # Phase 7 — Integration
-│   ├── test_p8_safety.c            # Phase 8 — Safety and crash behaviour
-│   └── test_p9_mutexes.c           # Phase 9 — RW mutexes
 │   ├── test_harness.h               # Shared harness macros + SIGSEGV/SIGABRT crash handler
 │   ├── test_p01_foundation.c        # Phase 1  — Foundation
 │   ├── test_goc_array.c             # Component — goc_array dynamic array
@@ -135,7 +124,7 @@ The project uses CMake (≥ 3.20). `CMakeLists.txt` defines the following primar
 
 A CMake function `goc_configure_target(<target>)` centralises the options shared by every library variant: `PUBLIC` include path `include/`, `PRIVATE` paths `src/` and `vendor/minicoro/`, compile definition `GC_THREADS`, and link libraries `PkgConfig::LIBUV` and `PkgConfig::BDWGC`. All library targets (`goc`, `goc_shared`, `goc_asan`, `goc_tsan`) are configured through this function.
 
-When `-DLIBGOC_VMEM=ON` is passed, `LIBGOC_VMEM_ENABLED` is added as a `PRIVATE` compile definition on the `goc` library target **and** on every per-phase test executable. This ensures that `src/internal.h`'s canary macros are disabled and that `test_p8_safety.c` detects the vmem build at compile time (P8.1 uses `#ifdef LIBGOC_VMEM_ENABLED` to skip the canary-abort test in vmem builds, where the canary is a no-op). By default (canary mode), `LIBGOC_VMEM_ENABLED` is **not** defined and canary protection is active.
+When `-DLIBGOC_VMEM=ON` is passed, `LIBGOC_VMEM_ENABLED` is added as a `PRIVATE` compile definition on the `goc` library target **and** on every per-phase test executable. This ensures that `src/internal.h`'s canary macros are disabled and that `test_p08_safety.c` detects the vmem build at compile time (P8.1 uses `#ifdef LIBGOC_VMEM_ENABLED` to skip the canary-abort test in vmem builds, where the canary is a no-op). By default (canary mode), `LIBGOC_VMEM_ENABLED` is **not** defined and canary protection is active.
 
 Dependencies are resolved via `pkg-config` (libuv as `libuv`, Boehm GC as `bdw-gc-threaded` — **no fallback**; configure fails loudly if the threaded variant is absent). minicoro is instantiated via `src/minicoro.c` (which defines `MINICORO_IMPL`) and its header is available to all targets via `target_include_directories` pointing at `vendor/minicoro/`.
 
@@ -1460,7 +1449,7 @@ The test suite is split across phase files in `tests/`, each a self-contained C 
 | P8.10 | `goc_put_sync` called from within a fiber → `abort()`; verified via `fork` + `waitpid` asserting `SIGABRT` |
 | P8.11 | `goc_alts_sync` called from within a fiber → `abort()`; verified via `fork` + `waitpid` asserting `SIGABRT` |
 
-> **Windows:** All P8 tests self-skip on Windows. `fork()`/`waitpid()` are not available in MinGW; `test_p8_safety.c` detects `_WIN32` at compile time and emits a `TEST_SKIP` stub for each of the 11 tests. The binary builds and runs cleanly; tests report `skip` rather than failing.
+> **Windows:** All P8 tests self-skip on Windows. `fork()`/`waitpid()` are not available in MinGW; `test_p08_safety.c` detects `_WIN32` at compile time and emits a `TEST_SKIP` stub for each of the 11 tests. The binary builds and runs cleanly; tests report `skip` rather than failing.
 
 **Phase 9 — RW mutexes**
 
@@ -1553,7 +1542,7 @@ All four configurations run `RelWithDebInfo` builds. Dependencies per OS:
 - **macOS**: Homebrew: `libuv`, `bdw-gc`, `pkg-config`. Homebrew's `bdw-gc` formula does not ship a `bdw-gc-threaded.pc` pkg-config alias; the workflow creates it in `$(brew --prefix)/lib/pkgconfig`.
 - **Windows**: MSYS2/MinGW-w64 (UCRT64 environment) is used instead of MSVC+vcpkg. This is required because libgoc uses `pthread.h` and C11 `_Atomic` directly. MSYS2's MinGW packages provide a POSIX-compatible toolchain with full GCC C11 support and a bdwgc build compiled with pthreads. A `bdw-gc-threaded.pc` alias is created in `/ucrt64/lib/pkgconfig` before CMake runs.
 
-The test suite itself is portable to Windows with one exception: **Phase 8 (safety tests)** relies on `fork()`/`waitpid()` to isolate processes that call `abort()`. These POSIX APIs are not available in MinGW. `test_p8_safety.c` detects `_WIN32` at compile time and replaces each of the 11 P8 tests with a `TEST_SKIP` stub, so the binary still builds and runs cleanly — it just reports skipped tests rather than failing.
+The test suite itself is portable to Windows with one exception: **Phase 8 (safety tests)** relies on `fork()`/`waitpid()` to isolate processes that call `abort()`. These POSIX APIs are not available in MinGW. `test_p08_safety.c` detects `_WIN32` at compile time and replaces each of the 11 P8 tests with a `TEST_SKIP` stub, so the binary still builds and runs cleanly — it just reports skipped tests rather than failing.
 
 ### CD Workflow (`.github/workflows/cd.yml`)
 

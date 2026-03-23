@@ -39,6 +39,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <assert.h>
 #include <uv.h>
 #include <gc.h>
@@ -53,6 +54,25 @@
 static void free_io_handle(uv_handle_t* h)
 {
     free(h);
+}
+
+static void dispatch_async_or_abort(uv_async_t* async,
+                                    uv_async_cb cb,
+                                    const char* op_name)
+{
+    int rc = uv_async_init(g_loop, async, cb);
+    if (rc < 0) {
+        fprintf(stderr, "libgoc: uv_async_init failed in %s: %s\n",
+                op_name, uv_strerror(rc));
+        abort();
+    }
+
+    rc = uv_async_send(async);
+    if (rc < 0) {
+        fprintf(stderr, "libgoc: uv_async_send failed in %s: %s\n",
+                op_name, uv_strerror(rc));
+        abort();
+    }
 }
 
 /* =========================================================================
@@ -575,8 +595,7 @@ goc_chan* goc_io_read_start(uv_stream_t* stream)
     d->stream = stream;
     d->ch     = ch;
     uv_handle_chan_register(ch);
-    uv_async_init(g_loop, &d->async, on_read_start_dispatch);
-    uv_async_send(&d->async);
+    dispatch_async_or_abort(&d->async, on_read_start_dispatch, "goc_io_read_start");
     return ch;
 }
 
@@ -612,8 +631,7 @@ int goc_io_read_stop(uv_stream_t* stream)
                                       sizeof(goc_read_stop_dispatch_t));
     assert(d);
     d->stream = stream;
-    uv_async_init(g_loop, &d->async, on_read_stop_dispatch);
-    uv_async_send(&d->async);
+    dispatch_async_or_abort(&d->async, on_read_stop_dispatch, "goc_io_read_stop");
     return 0;
 }
 
@@ -671,8 +689,7 @@ goc_chan* goc_io_write(uv_stream_t* handle,
     d->nbufs  = nbufs;
     d->ch     = ch;
     uv_handle_chan_register(ch);
-    uv_async_init(g_loop, &d->async, on_write_dispatch);
-    uv_async_send(&d->async);
+    dispatch_async_or_abort(&d->async, on_write_dispatch, "goc_io_write");
     return ch;
 }
 
@@ -737,8 +754,7 @@ goc_chan* goc_io_write2(uv_stream_t* handle,
     d->send_handle = send_handle;
     d->ch          = ch;
     uv_handle_chan_register(ch);
-    uv_async_init(g_loop, &d->async, on_write2_dispatch);
-    uv_async_send(&d->async);
+    dispatch_async_or_abort(&d->async, on_write2_dispatch, "goc_io_write2");
     return ch;
 }
 
@@ -793,8 +809,7 @@ goc_chan* goc_io_shutdown_stream(uv_stream_t* handle)
     d->handle = handle;
     d->ch     = ch;
     uv_handle_chan_register(ch);
-    uv_async_init(g_loop, &d->async, on_shutdown_dispatch);
-    uv_async_send(&d->async);
+    dispatch_async_or_abort(&d->async, on_shutdown_dispatch, "goc_io_shutdown_stream");
     return ch;
 }
 
@@ -859,8 +874,7 @@ goc_chan* goc_io_tcp_connect(uv_tcp_t* handle, const struct sockaddr* addr)
                : sizeof(struct sockaddr_in));
     d->ch = ch;
     uv_handle_chan_register(ch);
-    uv_async_init(g_loop, &d->async, on_tcp_connect_dispatch);
-    uv_async_send(&d->async);
+    dispatch_async_or_abort(&d->async, on_tcp_connect_dispatch, "goc_io_tcp_connect");
     return ch;
 }
 
@@ -901,8 +915,7 @@ goc_chan* goc_io_pipe_connect(uv_pipe_t* handle, const char* name)
     assert(d->name);
     d->ch = ch;
     uv_handle_chan_register(ch);
-    uv_async_init(g_loop, &d->async, on_pipe_connect_dispatch);
-    uv_async_send(&d->async);
+    dispatch_async_or_abort(&d->async, on_pipe_connect_dispatch, "goc_io_pipe_connect");
     return ch;
 }
 
@@ -973,8 +986,7 @@ goc_chan* goc_io_udp_send(uv_udp_t* handle,
                : sizeof(struct sockaddr_in));
     d->ch = ch;
     uv_handle_chan_register(ch);
-    uv_async_init(g_loop, &d->async, on_udp_send_dispatch);
-    uv_async_send(&d->async);
+    dispatch_async_or_abort(&d->async, on_udp_send_dispatch, "goc_io_udp_send");
     return ch;
 }
 
@@ -1080,8 +1092,7 @@ goc_chan* goc_io_udp_recv_start(uv_udp_t* handle)
     d->handle = handle;
     d->ch     = ch;
     uv_handle_chan_register(ch);
-    uv_async_init(g_loop, &d->async, on_udp_recv_start_dispatch);
-    uv_async_send(&d->async);
+    dispatch_async_or_abort(&d->async, on_udp_recv_start_dispatch, "goc_io_udp_recv_start");
     return ch;
 }
 
@@ -1113,7 +1124,6 @@ int goc_io_udp_recv_stop(uv_udp_t* handle)
                                           sizeof(goc_udp_recv_stop_dispatch_t));
     assert(d);
     d->handle = handle;
-    uv_async_init(g_loop, &d->async, on_udp_recv_stop_dispatch);
-    uv_async_send(&d->async);
+    dispatch_async_or_abort(&d->async, on_udp_recv_stop_dispatch, "goc_io_udp_recv_stop");
     return 0;
 }

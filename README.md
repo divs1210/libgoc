@@ -795,7 +795,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 
 # Or run a single phase directly for full output
-./build/test_p1_foundation
+./build/test_p01_foundation
 ```
 
 ---
@@ -837,7 +837,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 
 # Or run a single phase directly
-./build/test_p1_foundation
+./build/test_p01_foundation
 ```
 
 ---
