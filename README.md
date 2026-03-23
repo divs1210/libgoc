@@ -111,7 +111,7 @@ static void player_fiber(void* arg) {
     }
 }
 
-void main_fiber(void* _) {
+static void main_fiber(void* _) {
     goc_chan* a_to_b = goc_chan_make(0);
     goc_chan* b_to_a = goc_chan_make(0);
 
