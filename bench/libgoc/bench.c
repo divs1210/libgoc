@@ -53,6 +53,7 @@
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <uv.h>
 
 static goc_stats_t stats_diff(goc_stats_t after, goc_stats_t before) {
@@ -247,12 +248,21 @@ static void bench_ring(size_t ring_nodes, size_t ring_hops) {
 
     /* Create one channel per node; node i reads from channels[i] and
      * writes to channels[(i+1) % ring_nodes]. */
-    goc_chan** channels = goc_malloc(sizeof(goc_chan*) * ring_nodes);
+    goc_chan** channels = malloc(sizeof(goc_chan*) * ring_nodes);
+    if (channels == NULL) {
+        fprintf(stderr, "bench_ring: failed to allocate channels array\n");
+        return;
+    }
     for (size_t i = 0; i < ring_nodes; i++) {
         channels[i] = goc_chan_make(0);
     }
 
-    goc_chan** joins = goc_malloc(sizeof(goc_chan*) * ring_nodes);
+    goc_chan** joins = malloc(sizeof(goc_chan*) * ring_nodes);
+    if (joins == NULL) {
+        fprintf(stderr, "bench_ring: failed to allocate joins array\n");
+        free(channels);
+        return;
+    }
     for (size_t i = 0; i < ring_nodes; i++) {
         ring_node_args_t* args = goc_malloc(sizeof(ring_node_args_t));
         args->recv = channels[i];
@@ -264,6 +274,9 @@ static void bench_ring(size_t ring_nodes, size_t ring_hops) {
     goc_put(channels[0], goc_box_uint(ring_hops));
     goc_take_all(joins, ring_nodes);
     uint64_t t1 = uv_hrtime();
+
+    free(joins);
+    free(channels);
 
     double s    = (double)(t1 - t0) / 1e9;
     int    ms   = (int)(s * 1000);
@@ -337,7 +350,12 @@ typedef struct {
 static void fan_in_fn(void* arg) {
     fan_in_args_t* a = (fan_in_args_t*)arg;
 
-    goc_alt_op* ops     = goc_malloc(sizeof(goc_alt_op) * a->workers);
+    goc_alt_op* ops     = malloc(sizeof(goc_alt_op) * a->workers);
+    if (ops == NULL) {
+        fprintf(stderr, "fan_in_fn: failed to allocate ops array\n");
+        goc_close(a->done);
+        return;
+    }
     size_t      n_active = a->workers;
     for (size_t i = 0; i < a->workers; i++) {
         ops[i].ch      = a->outs[i];
@@ -361,6 +379,7 @@ static void fan_in_fn(void* arg) {
         }
     }
 
+    free(ops);
     goc_close(a->done);
 }
 
@@ -377,8 +396,14 @@ static void bench_fan_in(size_t workers, size_t tasks) {
     if (goc_stats_enabled()) goc_stats_snapshot(&s0);
 
     goc_chan*  in   = goc_chan_make(0);
-    goc_chan** outs = goc_malloc(sizeof(goc_chan*) * workers);
-    goc_chan** worker_joins = goc_malloc(sizeof(goc_chan*) * workers);
+    goc_chan** outs = malloc(sizeof(goc_chan*) * workers);
+    goc_chan** worker_joins = malloc(sizeof(goc_chan*) * workers);
+    if (outs == NULL || worker_joins == NULL) {
+        fprintf(stderr, "bench_fan_in: failed to allocate channel arrays\n");
+        free(outs);
+        free(worker_joins);
+        return;
+    }
 
     for (size_t i = 0; i < workers; i++) {
         outs[i] = goc_chan_make(0);
@@ -404,6 +429,9 @@ static void bench_fan_in(size_t workers, size_t tasks) {
     goc_take(done);
     goc_take_all(worker_joins, workers);
     uint64_t t1 = uv_hrtime();
+
+    free(worker_joins);
+    free(outs);
 
     double s    = (double)(t1 - t0) / 1e9;
     int    ms   = (int)(s * 1000);
@@ -452,7 +480,11 @@ static void bench_spawn_idle(size_t count) {
     if (goc_stats_enabled()) goc_stats_snapshot(&s0);
 
     goc_chan*  park  = goc_chan_make(0);
-    goc_chan** joins = goc_malloc(sizeof(goc_chan*) * count);
+    goc_chan** joins = malloc(sizeof(goc_chan*) * count);
+    if (joins == NULL) {
+        fprintf(stderr, "bench_spawn_idle: failed to allocate joins array\n");
+        return;
+    }
 
     uint64_t t0 = uv_hrtime();
     for (size_t i = 0; i < count; i++)
@@ -462,6 +494,8 @@ static void bench_spawn_idle(size_t count) {
 
     goc_take_all(joins, count);
     uint64_t t1 = uv_hrtime();
+
+    free(joins);
 
     double s    = (double)(t1 - t0) / 1e9;
     int    ms   = (int)(s * 1000);
