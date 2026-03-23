@@ -100,13 +100,13 @@ static void player(void* arg) {
 
     goc_val_t* v;
     while ((v = goc_take(a->recv))->ok == GOC_OK) {
-        int count = (int)(intptr_t)v->val;
+        int count = (int)goc_unbox_int(v->val);
         printf("%s %d\n", a->name, count);
         if (count >= N_ROUNDS) {
             goc_close(a->send);
             return;
         }
-        goc_put(a->send, (void*)(intptr_t)(count + 1));
+        goc_put(a->send, goc_box_int(count + 1));
     }
 }
 
@@ -123,7 +123,7 @@ int main(void) {
     goc_chan* done_pong = goc_go(player, &pong_args);
 
     /* Kick off the exchange with the first message. */
-    goc_put_sync(a_to_b, (void*)(intptr_t)1);
+    goc_put_sync(a_to_b, goc_box_int(1));
 
     /* Wait for both fibers to finish. */
     goc_take_sync(done_ping);
@@ -177,7 +177,7 @@ static void sum_range(void* arg) {
     long acc = 0;
     for (long i = a->lo; i < a->hi; i++)
         acc += i;
-    goc_put(a->result_ch, (void*)(intptr_t)acc);
+    goc_put(a->result_ch, goc_box_int(acc));
 }
 
 /* =========================================================================
@@ -211,7 +211,7 @@ int main(void) {
     long total = 0;
     for (int i = 0; i < N_WORKERS; i++) {
         goc_val_t* v = goc_take_sync(result_ch);
-        if (v->ok == GOC_OK) total += (long)(intptr_t)v->val;
+        if (v->ok == GOC_OK) total += (long)goc_unbox_int(v->val);
     }
 
     printf("sum [0, %ld) = %ld\n", RANGE, total);
@@ -321,6 +321,29 @@ my_obj_t* obj = goc_malloc(sizeof(my_obj_t));
 
 ---
 
+### Scalar boxing helpers
+
+libgoc channels and arrays carry `void*` values. These macros eliminate the repetitive double-cast needed to pass integers through a `void*` slot and to recover them.
+
+| Macro | Expands to | Description |
+|---|---|---|
+| `goc_box_int(x)` | `(void*)(intptr_t)(x)` | Encode a signed integer as `void*` |
+| `goc_unbox_int(p)` | `(intptr_t)(p)` | Decode a `void*` back to `intptr_t` |
+| `goc_box_uint(x)` | `(void*)(uintptr_t)(x)` | Encode an unsigned integer as `void*` |
+| `goc_unbox_uint(p)` | `(uintptr_t)(p)` | Decode a `void*` back to `uintptr_t` |
+
+```c
+// Channel
+goc_put(ch, goc_box_int(42));
+intptr_t n = goc_unbox_int(goc_take(ch)->val);
+
+// Array
+goc_array_push(arr, goc_box_int(42));
+intptr_t n = goc_unbox_int(goc_array_get(arr, 0));
+```
+
+---
+
 ### Value type
 
 Channel take operations and select arms return a `goc_val_t` instead of a bare pointer. This distinguishes a genuine `NULL` value sent on a channel from a channel-closed notification, and (for non-blocking takes) from a channel that is open but momentarily empty.
@@ -380,7 +403,7 @@ typedef struct { goc_chan* ch; int n; } args_t;
 static void producer(void* arg) {
     args_t* a = arg;
     for (int i = 0; i < a->n; i++)
-        goc_put(a->ch, (void*)(intptr_t)i);
+        goc_put(a->ch, goc_box_int(i));
     goc_close(a->ch);
 }
 
@@ -456,7 +479,7 @@ static void consumer(void* arg) {
     goc_chan* ch = arg;
     goc_val_t* v;
     while ((v = goc_take(ch))->ok == GOC_OK)
-        printf("got %ld\n", (intptr_t)v->val);
+        printf("got %ld\n", (long)goc_unbox_int(v->val));
     // channel closed
 }
 ```

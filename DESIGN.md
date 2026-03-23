@@ -1105,6 +1105,12 @@ void          goc_shutdown(void);
 void*         goc_malloc(size_t n);
 void*         goc_realloc(void* ptr, size_t n);
 
+/* Scalar boxing helpers (macros) */
+/* goc_box_int(x)    — (void*)(intptr_t)(x)  */
+/* goc_unbox_int(p)  — (intptr_t)(p)          */
+/* goc_box_uint(x)   — (void*)(uintptr_t)(x) */
+/* goc_unbox_uint(p) — (uintptr_t)(p)         */
+
 /* Channels */
 goc_chan*     goc_chan_make(size_t buf_size);
 void          goc_close(goc_chan* ch);

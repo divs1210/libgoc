@@ -173,12 +173,12 @@ goc_array* goc_array_from(void** items, size_t n);   /* see Construction */
 
 goc_array* arr = goc_array_make(0);
 
-goc_array_push(arr, (void*)(intptr_t)10);
-goc_array_push(arr, (void*)(intptr_t)20);
-goc_array_push(arr, (void*)(intptr_t)30);
+goc_array_push(arr, goc_box_int(10));
+goc_array_push(arr, goc_box_int(20));
+goc_array_push(arr, goc_box_int(30));
 
 for (size_t i = 0; i < goc_array_len(arr); i++) {
-    printf("%ld\n", (intptr_t)goc_array_get(arr, i));
+    printf("%ld\n", (long)goc_unbox_int(goc_array_get(arr, i)));
 }
 // 10
 // 20
@@ -211,7 +211,8 @@ void* top = goc_array_pop(stack);  /* pop */
 
 ```c
 goc_array* arr = goc_array_from((void*[]){
-    (void*)1, (void*)2, (void*)3, (void*)4, (void*)5
+    goc_box_int(1), goc_box_int(2), goc_box_int(3),
+    goc_box_int(4), goc_box_int(5)
 }, 5);
 
 goc_array* middle = goc_array_slice(arr, 1, 4);
@@ -222,13 +223,13 @@ goc_array* middle = goc_array_slice(arr, 1, 4);
 
 ```c
 goc_array* arr = goc_array_make(0);
-goc_array_push(arr, (void*)(intptr_t)1);
-goc_array_push(arr, (void*)(intptr_t)2);
+goc_array_push(arr, goc_box_int(1));
+goc_array_push(arr, goc_box_int(2));
 
 void** c = goc_array_to_c(arr);
-/* c[0] == (void*)1, c[1] == (void*)2 */
+/* goc_unbox_int(c[0]) == 1, goc_unbox_int(c[1]) == 2 */
 
 /* Going the other way: */
-void* items[] = { (void*)10, (void*)20, (void*)30 };
+void* items[] = { goc_box_int(10), goc_box_int(20), goc_box_int(30) };
 goc_array* from_c = goc_array_from(items, 3);
 ```
