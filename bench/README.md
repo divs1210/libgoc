@@ -283,11 +283,13 @@ This report evaluates the performance of **libgoc (post-optimization)**, **libgo
 
 Geometric mean of the ×Go multipliers across pool sizes 1, 2, 4, 8.
 
-| System | Ping-pong | Ring | Fan-out/Fan-in | Spawn idle | Prime sieve |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **libgoc (canary)** | 0.81× | 0.33× | 0.58× | 0.05× | 0.38× |
-| **libgoc (vmem)**   | 0.34× | 0.02× | 0.24× | 0.04× | 0.06× |
-| **Clojure**         | 0.36× | 0.88× | 0.48× | 1.97× | 0.32× |
+| Benchmark | libgoc (canary) | libgoc (vmem) | Clojure |
+| :--- | :---: | :---: | :---: |
+| Ping-pong | 0.81× | 0.34× | 0.36× |
+| Ring | 0.33× | 0.02× | 0.88× |
+| Fan-out/Fan-in | 0.58× | 0.24× | 0.48× |
+| Spawn idle | 0.05× | 0.04× | 1.97× |
+| Prime sieve | 0.38× | 0.06× | 0.32× |
 
 **Takeaways:**
 - libgoc canary is within ~20% of Go on ping-pong and competitive on prime sieve at pool=1.
