@@ -7,6 +7,8 @@
  */
 
 #include <stdlib.h>
+#include <stdio.h>
+#include <assert.h>
 #include <uv.h>
 #include "../include/goc.h"
 #include "internal.h"
@@ -17,11 +19,15 @@
 
 typedef struct {
     uv_async_t  async;        /* MUST be first member — cast from uv_handle_t* is safe */
-    goc_chan*   ch;
-    uv_timer_t* t;
+    struct goc_timeout_timer_ctx* timer_ctx;
     uint64_t    ms;
     uint64_t    deadline_ns;  /* uv_hrtime() snapshot taken at goc_timeout() call time */
 } goc_timeout_req;
+
+typedef struct goc_timeout_timer_ctx {
+    uv_timer_t timer;         /* MUST be first member — freed from uv_close callback */
+    goc_chan*  ch;
+} goc_timeout_timer_ctx;
 
 /* -------------------------------------------------------------------------
  * Static callbacks (loop thread)
@@ -31,7 +37,8 @@ static void free_handle_cb(uv_handle_t* h) { free(h); }
 
 static void on_timeout(uv_timer_t* t)
 {
-    goc_chan* ch = (goc_chan*)t->data;
+    goc_timeout_timer_ctx* tctx = (goc_timeout_timer_ctx*)t;
+    goc_chan* ch = tctx->ch;
     uv_handle_chan_unregister(ch);
     goc_close(ch);
     uv_close((uv_handle_t*)t, free_handle_cb);
@@ -52,8 +59,23 @@ static void on_start_timer(uv_async_t* h)
     uint64_t elapsed_ms = elapsed_ns / 1000000ULL;
     uint64_t remaining  = (elapsed_ms < req->ms) ? (req->ms - elapsed_ms) : 0;
 
-    uv_timer_init(g_loop, req->t);
-    uv_timer_start(req->t, on_timeout, remaining, 0);  /* one-shot */
+    int rc = uv_timer_init(g_loop, &req->timer_ctx->timer);
+    if (rc < 0) {
+        uv_handle_chan_unregister(req->timer_ctx->ch);
+        goc_close(req->timer_ctx->ch);
+        free(req->timer_ctx);
+        uv_close((uv_handle_t*)h, free_handle_cb);
+        return;
+    }
+
+    rc = uv_timer_start(&req->timer_ctx->timer, on_timeout, remaining, 0);  /* one-shot */
+    if (rc < 0) {
+        uv_handle_chan_unregister(req->timer_ctx->ch);
+        goc_close(req->timer_ctx->ch);
+        uv_close((uv_handle_t*)&req->timer_ctx->timer, free_handle_cb);
+        uv_close((uv_handle_t*)h, free_handle_cb);
+        return;
+    }
 
     /* Close the async handle; it is one-shot and no longer needed. */
     uv_close((uv_handle_t*)h, free_handle_cb);
@@ -65,22 +87,41 @@ static void on_start_timer(uv_async_t* h)
 
 goc_chan* goc_timeout(uint64_t ms)
 {
-    goc_chan*         ch  = goc_chan_make(0);   /* rendezvous channel */
-    uv_handle_chan_register(ch);               /* keep ch alive while timer is pending */
-    goc_timeout_req*  req = malloc(sizeof(goc_timeout_req));
-    uv_timer_t*       t   = malloc(sizeof(uv_timer_t));
+    goc_chan*               ch   = goc_chan_make(0);   /* rendezvous channel */
+    goc_timeout_req*        req  = (goc_timeout_req*)malloc(sizeof(goc_timeout_req));
+    goc_timeout_timer_ctx*  tctx = (goc_timeout_timer_ctx*)malloc(sizeof(goc_timeout_timer_ctx));
+    assert(req);
+    assert(tctx);
 
-    t->data          = ch;
-    req->ch          = ch;
-    req->t           = t;
+    tctx->ch = ch;
+
+    req->timer_ctx   = tctx;
     req->ms          = ms;
     req->deadline_ns = uv_hrtime();  /* snapshot call time for dispatch-latency correction */
 
+    uv_handle_chan_register(ch);      /* keep ch alive while timer is pending */
+
     /* uv_async_init is safe to call from any thread. */
-    uv_async_init(g_loop, &req->async, on_start_timer);
+    int rc = uv_async_init(g_loop, &req->async, on_start_timer);
+    if (rc < 0) {
+        uv_handle_chan_unregister(ch);
+        goc_close(ch);
+        free(tctx);
+        free(req);
+        return ch;
+    }
 
     /* Signal the event loop thread to start the timer. */
-    uv_async_send(&req->async);
+    rc = uv_async_send(&req->async);
+    if (rc < 0) {
+        /* At this point req owns an initialized uv_async_t handle that must
+         * be closed on the loop thread. If uv_async_send fails, we have no
+         * thread-safe way to schedule that close reliably from here, so fail
+         * fast instead of silently leaking a live handle and leaving timeout
+         * semantics inconsistent. */
+        fprintf(stderr, "libgoc: uv_async_send failed in goc_timeout: %s\n", uv_strerror(rc));
+        abort();
+    }
 
     return ch;
 }
