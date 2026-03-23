@@ -96,7 +96,7 @@ typedef struct {
     const char* name;
 } player_args_t;
 
-static void player(void* arg) {
+static void player_fiber(void* arg) {
     player_args_t* a = arg;
 
     goc_val_t* v;
@@ -111,25 +111,27 @@ static void player(void* arg) {
     }
 }
 
-int main(void) {
-    goc_init();
-
+void main_fiber(void* _) {
     goc_chan* a_to_b = goc_chan_make(0);
     goc_chan* b_to_a = goc_chan_make(0);
 
     player_args_t ping_args = { .recv = b_to_a, .send = a_to_b, .name = "ping" };
     player_args_t pong_args = { .recv = a_to_b, .send = b_to_a, .name = "pong" };
 
-    goc_chan* done_ping = goc_go(player, &ping_args);
-    goc_chan* done_pong = goc_go(player, &pong_args);
+    goc_chan* done_ping = goc_go(player_fiber, &ping_args);
+    goc_chan* done_pong = goc_go(player_fiber, &pong_args);
 
     /* Kick off the exchange with the first message. */
-    goc_put_sync(a_to_b, goc_box_int(1));
+    goc_put(a_to_b, goc_box_int(1));
 
     /* Wait for both fibers to finish. */
-    goc_take_sync(done_ping);
-    goc_take_sync(done_pong);
+    goc_take(done_ping);
+    goc_take(done_pong);
+}
 
+int main(void) {
+    goc_init();
+    goc_go(main_fiber, NULL);
     goc_shutdown();
     return 0;
 }
@@ -141,13 +143,9 @@ int main(void) {
   each `goc_put` blocks until the other fiber calls `goc_take`, and vice versa.
 - `goc_go` — spawns both player fibers on the default pool and returns a join
   channel that is closed automatically when the fiber returns.
-- `goc_put_sync` — sends the opening message from the main OS thread (outside
-  any fiber) without blocking a pool worker.
 - `goc_close` — when the round limit is reached the active fiber closes the
   forward channel, causing the partner's next `goc_take` to return
   `GOC_CLOSED` and exit its loop cleanly.
-- `goc_take_sync` — blocks the main thread until each join channel is closed,
-  providing a simple, channel-based join without extra synchronisation.
 
 ---
 
@@ -256,7 +254,7 @@ typedef struct node_t {
     struct node_t* next;
 } node_t;
 
-static void build_list(void* arg) {
+static void build_list() {
     goc_chan* result_ch = arg;
 
     /* Build a linked list entirely on the GC heap — no free() required. */
@@ -268,20 +266,17 @@ static void build_list(void* arg) {
         head     = n;
     }
 
-    goc_put(result_ch, head);
+    return head;
 }
 
 int main(void) {
     goc_init();
 
-    goc_chan* result_ch = goc_chan_make(0);
-    goc_go(build_list, result_ch);
-
-    goc_val_t* v = goc_take_sync(result_ch);
-    if (v->ok == GOC_OK) {
-        for (node_t* n = v->val; n; n = n->next)
-            printf("%d ", n->value);
+    node_t* node = build_list(result_ch);
+    while (node != NULL) {
+        printf("%d ", node->value);
         printf("\n");
+        node = node->next;
     }
 
     goc_shutdown();
