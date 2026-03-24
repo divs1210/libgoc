@@ -717,6 +717,13 @@ Used the right way, **libgoc** provides a runtime environment very similar to Go
 A typical program's main function should be like this:
 
 ```c
+static void main_fiber(void* _) {
+    // User code comes here.
+    // Since this is a fiber context,
+    // async channel ops work here
+    // and in all code reachable from here
+}
+
 int main(void) {
     goc_init();
 
@@ -725,13 +732,6 @@ int main(void) {
 
     goc_shutdown();
     return 0;
-}
-
-static void main_fiber(void* _ub) {
-    // User code comes here.
-    // Since this is a fiber context,
-    // async channel ops work here
-    // and in all code reachable from here
 }
 ```
 
