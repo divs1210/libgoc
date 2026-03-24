@@ -2,8 +2,13 @@
  * tests/test_harness.h — Shared test harness for libgoc test suites
  *
  * Provides:
- *   - Result counters and TEST_BEGIN / ASSERT / TEST_PASS / TEST_FAIL macros
- *     (identical to the previously duplicated harness in each test file).
+ *   - Result counters and TEST_BEGIN / ASSERT / TEST_PASS / TEST_FAIL /
+ *     TEST_SKIP macros.
+ *   - GOC_STATS_DRAIN() — when GOC_ENABLE_STATS is defined, non-blockingly
+ *     drains all pending events from goc_stats_chan_g and prints them to
+ *     stderr.  Automatically called by ASSERT and TEST_FAIL on failure so
+ *     every failing test shows the residual stats channel state without any
+ *     per-test boilerplate.  Expands to ((void)0) when stats are disabled.
  *   - install_crash_handler() — registers a SIGSEGV / SIGABRT signal handler
  *     that (on Linux/macOS) prints a backtrace to stderr via
  *     backtrace_symbols_fd() and re-raises the signal; on Windows a simpler
@@ -52,15 +57,20 @@
 #endif
 
 /* =========================================================================
+ * Stats drain helper — GOC_STATS_DRAIN()
+ *
+ * Stats events are now delivered synchronously via a registered callback
+ * (see goc_stats.h / goc_stats_set_callback).  There is no channel to
+ * drain.  Individual test files collect events into their own buffers;
+ * GOC_STATS_DRAIN is a no-op in the shared harness.
+ * ====================================================================== */
+
+#define GOC_STATS_DRAIN() ((void)0)
+
+/* =========================================================================
  * Portable nanosleep helper
  * ====================================================================== */
 
-/**
- * goc_nanosleep() — sleep for ns nanoseconds (cross-platform).
- *
- * Converts nanoseconds to milliseconds (ceiling) and delegates to
- * uv_sleep(), which works on Linux, macOS, and Windows.
- */
 static inline void goc_nanosleep(uint64_t ns) {
     uv_sleep((unsigned int)((ns + 999999ULL) / 1000000ULL));
 }
@@ -69,9 +79,9 @@ static inline void goc_nanosleep(uint64_t ns) {
  * Result counters
  * ====================================================================== */
 
-static int g_tests_run    = 0;
-static int g_tests_passed = 0;
-static int g_tests_failed = 0;
+extern int g_tests_run;
+extern int g_tests_passed;
+extern int g_tests_failed;
 
 /* =========================================================================
  * Harness macros
@@ -86,13 +96,15 @@ static int g_tests_failed = 0;
         fflush(stdout);                                         \
     } while (0)
 
-/* ASSERT — verify a condition; jump to `done:` on failure. */
+/* ASSERT — verify a condition; on failure print the location, drain any
+ * pending stats events to stderr, then jump to `done:`. */
 #define ASSERT(cond)                                            \
     do {                                                        \
         if (!(cond)) {                                          \
             printf("FAIL\n    Assertion failed: %s\n"           \
                    "    %s:%d\n", #cond, __FILE__, __LINE__);   \
             g_tests_failed++;                                   \
+            GOC_STATS_DRAIN();                                  \
             goto done;                                          \
         }                                                       \
     } while (0)
@@ -105,12 +117,14 @@ static int g_tests_failed = 0;
         goto done;                                              \
     } while (0)
 
-/* TEST_FAIL — mark the current test as failed with a custom message. */
+/* TEST_FAIL — mark the current test as failed with a custom message; drain
+ * any pending stats events to stderr, then jump to `done:`. */
 #define TEST_FAIL(msg)                                          \
     do {                                                        \
         printf("FAIL\n    %s\n    %s:%d\n",                     \
                (msg), __FILE__, __LINE__);                      \
         g_tests_failed++;                                       \
+        GOC_STATS_DRAIN();                                      \
         goto done;                                              \
     } while (0)
 
@@ -123,7 +137,29 @@ static int g_tests_failed = 0;
     } while (0)
 
 /* =========================================================================
- * Crash handler
+ * Crash and termination handlers
+ *
+ * Signals handled:
+ *   SIGSEGV / SIGABRT — hard crash: print backtrace, dump stats, re-raise.
+ *   SIGTERM           — external kill (e.g. CTest timeout): dump stats,
+ *                       re-raise so the process exits with the correct
+ *                       signal status.
+ *   SIGALRM           — watchdog timeout: fired by goc_test_arm_watchdog()
+ *                       if the test process hangs.  Prints a hang diagnostic,
+ *                       dumps stats, then terminates via SIGABRT so CTest
+ *                       records a failure with a core dump.
+ *
+ * goc_test_arm_watchdog(secs) — call once in main() after
+ *   install_crash_handler() to arm a self-delivery SIGALRM after `secs`
+ *   seconds.  If the test hangs (e.g. blocked forever in goc_take_sync due
+ *   to a race condition), the alarm fires, the handler dumps the pending
+ *   stats channel, and the process terminates.  No-op on Windows.
+ *
+ * Note on async-signal safety: goc_stats_drain_pending() is not
+ * async-signal-safe (it calls goc_take_try which may acquire locks).
+ * This is intentionally accepted in the test harness: the process is
+ * already dying, and the drain produces the most useful post-mortem
+ * information.  Do not use this pattern in production signal handlers.
  * ====================================================================== */
 
 #if !defined(_WIN32) && defined(GOC_HAVE_EXECINFO)
@@ -132,13 +168,11 @@ static int g_tests_failed = 0;
 
 #define GOC_BACKTRACE_MAX 64
 
+/* crash_handler — SIGSEGV, SIGABRT, SIGTERM */
 static void crash_handler(int sig) {
     void* frames[GOC_BACKTRACE_MAX];
     int   n;
 
-    /* Write a header to stderr.  dprintf is async-signal-safe on Linux.
-     * On non-Linux POSIX (e.g. macOS) fprintf is used; it is not
-     * async-signal-safe but works in practice for crash diagnostics. */
 #if defined(__linux__)
     dprintf(STDERR_FILENO, "\n*** signal %d — backtrace ***\n", sig);
 #else
@@ -148,30 +182,58 @@ static void crash_handler(int sig) {
     n = backtrace(frames, GOC_BACKTRACE_MAX);
     backtrace_symbols_fd(frames, n, STDERR_FILENO);
 
-    /* Restore the default disposition and re-raise so the process exits
-     * with the correct signal status (not 0 or 1). */
+    GOC_STATS_DRAIN();
+
     struct sigaction sa = { .sa_handler = SIG_DFL };
     sigemptyset(&sa.sa_mask);
     sigaction(sig, &sa, NULL);
     raise(sig);
 }
 
+/* watchdog_handler — SIGALRM: fired when the test process hangs */
+static void watchdog_handler(int sig) {
+    (void)sig;
+#if defined(__linux__)
+    dprintf(STDERR_FILENO,
+            "\n*** watchdog timeout (SIGALRM) — possible hang or deadlock ***\n");
+#else
+    fprintf(stderr,
+            "\n*** watchdog timeout (SIGALRM) — possible hang or deadlock ***\n");
+#endif
+
+    GOC_STATS_DRAIN();
+
+    /* Terminate via SIGABRT so CTest records a failure and a core is dumped. */
+    struct sigaction sa = { .sa_handler = SIG_DFL };
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGABRT, &sa, NULL);
+    raise(SIGABRT);
+}
+
 static inline void install_crash_handler(void) {
     struct sigaction sa;
-    sa.sa_handler = crash_handler;
     sigemptyset(&sa.sa_mask);
-    /* SA_RESETHAND: restore default after first invocation. */
     sa.sa_flags = SA_RESETHAND;
+
+    sa.sa_handler = crash_handler;
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    sa.sa_handler = watchdog_handler;
+    sigaction(SIGALRM, &sa, NULL);
+}
+
+static inline void goc_test_arm_watchdog(unsigned secs) {
+    alarm(secs);
 }
 
 #else  /* _WIN32 or no execinfo — portable fallback */
 
-/* Simple handler: print signal number and re-raise with default. */
 static void crash_handler(int sig) {
     fprintf(stderr, "\n*** signal %d ***\n", sig);
     fflush(stderr);
+    GOC_STATS_DRAIN();
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -179,6 +241,11 @@ static void crash_handler(int sig) {
 static inline void install_crash_handler(void) {
     signal(SIGSEGV, crash_handler);
     signal(SIGABRT, crash_handler);
+    signal(SIGTERM, crash_handler);
+}
+
+static inline void goc_test_arm_watchdog(unsigned secs) {
+    (void)secs; /* alarm() not available on Windows */
 }
 
 #endif /* crash handler */

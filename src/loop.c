@@ -13,6 +13,7 @@
 #include <gc.h>
 #include "../include/goc.h"
 #include "internal.h"
+#include "channel_internal.h"
 
 /* --------------------------------------------------------------------------
  * MPSC queue (Vyukov-style intrusive lock-free queue)
@@ -122,17 +123,124 @@ static void on_wakeup_closed(uv_handle_t *h)
     free(h);
 }
 
+/* --------------------------------------------------------------------------
+ * loop_process_pending_put / loop_process_pending_take
+ *
+ * Called on the loop thread to perform the channel operation for a
+ * goc_put_cb / goc_take_cb entry that was posted without holding ch->lock.
+ * Acquires ch->lock, attempts fast delivery, and parks the entry if no
+ * match is available yet.  Fires the optional callback immediately when
+ * the operation resolves; otherwise the entry stays parked and wake() will
+ * call post_callback() later to fire it.
+ * -------------------------------------------------------------------------- */
+
+static void loop_process_pending_put(goc_entry *e)
+{
+    goc_chan *ch = e->ch;
+    e->ch = NULL;   /* clear so a future drain_cb_queue pass skips this entry */
+
+    uv_mutex_lock(ch->lock);
+
+    if (ch->dead_count >= GOC_DEAD_COUNT_THRESHOLD)
+        compact_dead_entries(ch);
+
+    /* Closed: always fail (matches goc_put ordering). */
+    if (ch->closed) {
+        e->ok = GOC_CLOSED;
+        uv_mutex_unlock(ch->lock);
+        if (e->put_cb) e->put_cb(GOC_CLOSED, e->ud);
+        return;
+    }
+
+    /* Parked taker available: deliver directly. */
+    if (chan_put_to_taker(ch, e->put_val)) {
+        e->ok = GOC_OK;
+        uv_mutex_unlock(ch->lock);
+        if (e->put_cb) e->put_cb(GOC_OK, e->ud);
+        return;
+    }
+
+    /* Buffer space available. */
+    if (chan_put_to_buffer(ch, e->put_val)) {
+        e->ok = GOC_OK;
+        uv_mutex_unlock(ch->lock);
+        if (e->put_cb) e->put_cb(GOC_OK, e->ud);
+        return;
+    }
+
+    /* No match yet: park.  wake() → post_callback() will fire put_cb later. */
+    chan_list_append(&ch->putters, &ch->putters_tail, e);
+    uv_mutex_unlock(ch->lock);
+}
+
+static void loop_process_pending_take(goc_entry *e)
+{
+    goc_chan *ch = e->ch;
+    e->ch = NULL;   /* clear so a future drain_cb_queue pass skips this entry */
+
+    void *val = NULL;
+
+    uv_mutex_lock(ch->lock);
+
+    if (ch->dead_count >= GOC_DEAD_COUNT_THRESHOLD)
+        compact_dead_entries(ch);
+
+    /* Value available from buffer. */
+    if (chan_take_from_buffer(ch, &val)) {
+        e->cb_result = val;
+        e->ok = GOC_OK;
+        uv_mutex_unlock(ch->lock);
+        if (e->cb) e->cb(val, GOC_OK, e->ud);
+        return;
+    }
+
+    /* Value available from parked putter. */
+    if (chan_take_from_putter(ch, &val)) {
+        e->cb_result = val;
+        e->ok = GOC_OK;
+        uv_mutex_unlock(ch->lock);
+        if (e->cb) e->cb(val, GOC_OK, e->ud);
+        return;
+    }
+
+    /* Closed and empty. */
+    if (ch->closed) {
+        e->ok = GOC_CLOSED;
+        uv_mutex_unlock(ch->lock);
+        if (e->cb) e->cb(NULL, GOC_CLOSED, e->ud);
+        return;
+    }
+
+    /* No match yet: park.  wake() → post_callback() will fire cb later. */
+    chan_list_append(&ch->takers, &ch->takers_tail, e);
+    uv_mutex_unlock(ch->lock);
+}
+
 /* Drain the callback queue and fire pending callbacks (loop thread). */
 static void drain_cb_queue(void)
 {
     goc_entry *e;
     while ((e = cb_queue_pop()) != NULL) {
-        if (e->kind == GOC_CALLBACK) {
-            if (e->cb)
-                e->cb(e->cb_result, e->ok, e->ud);
-            else if (e->put_cb)
-                e->put_cb(e->ok, e->ud);
+        if (e->kind != GOC_CALLBACK)
+            continue;
+
+        /* Pending channel op posted by goc_put_cb / goc_take_cb:
+         * e->ch is non-NULL and the entry has not yet been claimed by wake().
+         * Process the channel operation here on the loop thread. */
+        if (e->ch != NULL &&
+            !atomic_load_explicit(&e->woken, memory_order_acquire)) {
+            if (e->is_put)
+                loop_process_pending_put(e);
+            else
+                loop_process_pending_take(e);
+            continue;
         }
+
+        /* Already claimed by wake(): fire the callback. */
+        if (e->cb)
+            e->cb(e->cb_result, e->ok, e->ud);
+        else if (e->put_cb)
+            e->put_cb(e->ok, e->ud);
     }
 }
 

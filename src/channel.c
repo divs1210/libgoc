@@ -23,6 +23,7 @@
 #include <gc.h>
 #include "minicoro.h"
 #include "../include/goc.h"
+#include "../include/goc_stats.h"
 #include "channel_internal.h"
 
 /* --------------------------------------------------------------------------
@@ -142,11 +143,14 @@ goc_chan* goc_chan_make(size_t buf_size)
         ch->buf = goc_malloc(buf_size * sizeof(void*));
 
     ch->buf_size = buf_size;
+    ch->item_count = 0;
 
     ch->lock = malloc(sizeof(uv_mutex_t));        /* plain malloc — libuv constraint */
     uv_mutex_init(ch->lock);
 
     chan_register(ch);
+    /* Telemetry: channel opened */
+    GOC_STATS_CHANNEL_STATUS((int)(intptr_t)ch, /*status=*/1, (int)ch->buf_size, (int)ch->item_count);
     return ch;
 }
 
@@ -230,6 +234,11 @@ void goc_close(goc_chan* ch)
 
     uv_mutex_lock(ch->lock);
     ch->closed = 1;
+
+    /* Telemetry: channel closed */
+    GOC_STATS_CHANNEL_STATUS((int)(intptr_t)ch, /*status=*/0, (int)ch->buf_size, (int)ch->item_count);
+// Update item_count in goc_put and goc_take
+// These helpers are in channel_internal.h, but we can patch the main goc_put/goc_take logic here
 
     /* Wake all parked takers with GOC_CLOSED */
     wake_all_parked_entries(ch->takers);
@@ -561,6 +570,9 @@ goc_val_t** goc_take_all_sync(goc_chan** chs, size_t n)
 
 /* --------------------------------------------------------------------------
  * goc_take_cb
+ *
+ * Non-blocking: posts the pending take to the loop thread, which will
+ * perform the channel operation under ch->lock and fire cb on delivery.
  * -------------------------------------------------------------------------- */
 void goc_take_cb(goc_chan* ch,
                  void (*cb)(void* val, goc_status_t ok, void* ud),
@@ -570,48 +582,20 @@ void goc_take_cb(goc_chan* ch,
 
     goc_entry* e = goc_malloc(sizeof(goc_entry));
     e->kind        = GOC_CALLBACK;
+    e->ch          = ch;
+    e->is_put      = false;
     e->cb          = cb;
     e->ud          = ud;
     e->result_slot = &e->cb_result;
 
-    uv_mutex_lock(ch->lock);
-
-    void* val = NULL;
-
-    /* Value available from buffer */
-    if (chan_take_from_buffer(ch, &val)) {
-        e->cb_result = val;
-        e->ok        = GOC_OK;
-        uv_mutex_unlock(ch->lock);
-        post_callback(e, val);
-        return;
-    }
-
-    /* Value available from parked putter */
-    if (chan_take_from_putter(ch, &val)) {
-        e->cb_result = val;
-        e->ok        = GOC_OK;
-        uv_mutex_unlock(ch->lock);
-        post_callback(e, val);
-        return;
-    }
-
-    /* Closed and empty */
-    if (ch->closed) {
-        e->ok = GOC_CLOSED;
-        uv_mutex_unlock(ch->lock);
-        post_callback(e, NULL);
-        return;
-    }
-
-    /* Slow path: park */
-    chan_list_append(&ch->takers, &ch->takers_tail, e);
-
-    uv_mutex_unlock(ch->lock);
+    post_callback(e, NULL);
 }
 
 /* --------------------------------------------------------------------------
  * goc_put_cb
+ *
+ * Non-blocking: posts the pending put to the loop thread, which will
+ * perform the channel operation under ch->lock and fire cb on delivery.
  * -------------------------------------------------------------------------- */
 void goc_put_cb(goc_chan* ch, void* val,
                 void (*cb)(goc_status_t ok, void* ud),
@@ -619,41 +603,11 @@ void goc_put_cb(goc_chan* ch, void* val,
 {
     goc_entry* e = goc_malloc(sizeof(goc_entry));
     e->kind    = GOC_CALLBACK;
+    e->ch      = ch;
+    e->is_put  = true;
     e->put_val = val;
     e->put_cb  = cb;
     e->ud      = ud;
 
-    uv_mutex_lock(ch->lock);
-
-    /* Parked taker: deliver directly */
-    if (chan_put_to_taker(ch, val)) {
-        e->ok = GOC_OK;
-        uv_mutex_unlock(ch->lock);
-        if (cb != NULL)
-            post_callback(e, NULL);
-        return;
-    }
-
-    /* Buffer space available */
-    if (chan_put_to_buffer(ch, val)) {
-        e->ok = GOC_OK;
-        uv_mutex_unlock(ch->lock);
-        if (cb != NULL)
-            post_callback(e, NULL);
-        return;
-    }
-
-    /* Channel closed */
-    if (ch->closed) {
-        e->ok = GOC_CLOSED;
-        uv_mutex_unlock(ch->lock);
-        if (cb != NULL)
-            post_callback(e, NULL);
-        return;
-    }
-
-    /* Slow path: park */
-    chan_list_append(&ch->putters, &ch->putters_tail, e);
-
-    uv_mutex_unlock(ch->lock);
+    post_callback(e, NULL);
 }

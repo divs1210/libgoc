@@ -11,11 +11,12 @@ endif()
 # ---------------------------------------------------------------------------
 # Build options
 # ---------------------------------------------------------------------------
-option(LIBGOC_SHARED   "Build a shared library (libgoc.so / .dylib / .dll)" OFF)
-option(LIBGOC_VMEM     "Use minicoro virtual memory allocator (off by default; canary-protected stacks are the default)" OFF)
-option(LIBGOC_ASAN     "Build an instrumented copy of goc with AddressSanitizer" OFF)
-option(LIBGOC_TSAN     "Build an instrumented copy of goc with ThreadSanitizer" OFF)
-option(LIBGOC_COVERAGE "Instrument goc and tests for code coverage" OFF)
+option(LIBGOC_SHARED      "Build a shared library (libgoc.so / .dylib / .dll)" OFF)
+option(LIBGOC_VMEM        "Use minicoro virtual memory allocator (off by default; canary-protected stacks are the default)" OFF)
+option(LIBGOC_ASAN        "Build an instrumented copy of goc with AddressSanitizer" OFF)
+option(LIBGOC_TSAN        "Build an instrumented copy of goc with ThreadSanitizer" OFF)
+option(LIBGOC_COVERAGE    "Instrument goc and tests for code coverage" OFF)
+option(GOC_ENABLE_STATS   "Enable telemetry / statistics collection (goc_stats)" OFF)
 set(LIBGOC_STACK_SIZE "0" CACHE STRING "Default fiber stack size in bytes (0 = let minicoro decide)")
 
 # ---------------------------------------------------------------------------
@@ -57,6 +58,10 @@ set(GOC_SOURCES
     src/goc_array.c
     src/goc_io.c
 )
+
+if(GOC_ENABLE_STATS)
+    set(GOC_SOURCES ${GOC_SOURCES} src/goc_stats.c)
+endif()
 
 # ---------------------------------------------------------------------------
 # Helper: apply common compile options to a goc library target
@@ -105,9 +110,12 @@ endif()
 add_library(goc STATIC ${GOC_SOURCES})
 goc_configure_target(goc)
 
-# Pass virtual memory flag and stack size to source code
+# Pass virtual memory flag, stats flag, and stack size to source code
 if(LIBGOC_VMEM)
     target_compile_definitions(goc PRIVATE LIBGOC_VMEM_ENABLED)
+endif()
+if(GOC_ENABLE_STATS)
+    target_compile_definitions(goc PRIVATE GOC_ENABLE_STATS)
 endif()
 target_compile_definitions(goc PRIVATE LIBGOC_STACK_SIZE=${LIBGOC_STACK_SIZE})
 
@@ -120,6 +128,9 @@ if(LIBGOC_SHARED)
     set_target_properties(goc_shared PROPERTIES OUTPUT_NAME goc)
     if(LIBGOC_VMEM)
         target_compile_definitions(goc_shared PRIVATE LIBGOC_VMEM_ENABLED)
+    endif()
+    if(GOC_ENABLE_STATS)
+        target_compile_definitions(goc_shared PRIVATE GOC_ENABLE_STATS)
     endif()
     target_compile_definitions(goc_shared PRIVATE LIBGOC_STACK_SIZE=${LIBGOC_STACK_SIZE})
 endif()
@@ -135,6 +146,9 @@ if(LIBGOC_ASAN)
     if(LIBGOC_VMEM)
         target_compile_definitions(goc_asan PRIVATE LIBGOC_VMEM_ENABLED)
     endif()
+    if(GOC_ENABLE_STATS)
+        target_compile_definitions(goc_asan PRIVATE GOC_ENABLE_STATS)
+    endif()
     target_compile_definitions(goc_asan PRIVATE LIBGOC_STACK_SIZE=${LIBGOC_STACK_SIZE})
 endif()
 
@@ -148,6 +162,9 @@ if(LIBGOC_TSAN)
     target_link_options(goc_tsan INTERFACE -fsanitize=thread)
     if(LIBGOC_VMEM)
         target_compile_definitions(goc_tsan PRIVATE LIBGOC_VMEM_ENABLED)
+    endif()
+    if(GOC_ENABLE_STATS)
+        target_compile_definitions(goc_tsan PRIVATE GOC_ENABLE_STATS)
     endif()
     target_compile_definitions(goc_tsan PRIVATE LIBGOC_STACK_SIZE=${LIBGOC_STACK_SIZE})
 endif()
@@ -180,7 +197,7 @@ foreach(test_src IN LISTS TEST_SOURCES)
         set(GOC_LINK_TARGET goc)
     endif()
 
-    add_executable(${test_name} ${test_src})
+    add_executable(${test_name} ${test_src} tests/test_harness.c)
 
     target_include_directories(${test_name} PRIVATE include src tests vendor/minicoro)
 
@@ -195,7 +212,19 @@ foreach(test_src IN LISTS TEST_SOURCES)
     if(LIBGOC_VMEM)
         target_compile_definitions(${test_name} PRIVATE LIBGOC_VMEM_ENABLED)
     endif()
+    if(GOC_ENABLE_STATS)
+        target_compile_definitions(${test_name} PRIVATE GOC_ENABLE_STATS)
+    endif()
     target_compile_definitions(${test_name} PRIVATE LIBGOC_STACK_SIZE=${LIBGOC_STACK_SIZE})
+
+    # test_goc_stats always runs with telemetry enabled, independent of the
+    # GOC_ENABLE_STATS option.  When the option is OFF, src/goc_stats.c is not
+    # part of the library, so it is added directly to the test executable so
+    # that the stats symbols and the GOC_ENABLE_STATS define are always present.
+    if(test_name STREQUAL "test_goc_stats" AND NOT GOC_ENABLE_STATS)
+        target_sources(${test_name} PRIVATE src/goc_stats.c)
+        target_compile_definitions(${test_name} PRIVATE GOC_ENABLE_STATS)
+    endif()
 
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
@@ -235,7 +264,7 @@ include(GNUInstallDirs)
 install(TARGETS goc
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
-install(FILES include/goc.h include/goc_io.h include/goc_array.h
+install(FILES include/goc.h include/goc_io.h include/goc_array.h include/goc_stats.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 if(LIBGOC_SHARED)

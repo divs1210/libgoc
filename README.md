@@ -29,6 +29,7 @@ The library provides stackful coroutines ("fibers"), channels, a select primitiv
 **Helper libraries:**
 - [Async I/O API](./IO.md)
 - [Dynamic Array](./ARRAY.md)
+- [Telemetry](./TELEMETRY.md)
 
 **Also see:**
 - [Design Doc](./DESIGN.md)

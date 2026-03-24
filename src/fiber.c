@@ -12,6 +12,7 @@
 #include <gc.h>
 #include "minicoro.h"
 #include "../include/goc.h"
+#include "../include/goc_stats.h"
 #include "internal.h"
 
 /* ---------------------------------------------------------------------------
@@ -19,6 +20,8 @@
  * --------------------------------------------------------------------------- */
 
 goc_pool* g_default_pool = NULL;   /* set by goc_init; exported via extern in internal.h */
+
+static _Atomic uint64_t g_fiber_id_counter = 0;
 
 /* ---------------------------------------------------------------------------
  * goc_in_fiber
@@ -39,6 +42,8 @@ bool goc_in_fiber(void) {
 static void fiber_trampoline(mco_coro* co) {
     goc_entry* entry = (goc_entry*)mco_get_user_data(co);
     entry->fn(entry->fn_arg);
+    /* Telemetry: fiber finished */
+    GOC_STATS_FIBER_STATUS(entry->id, 0, GOC_FIBER_COMPLETED);
     goc_close(entry->join_ch);
 }
 
@@ -55,6 +60,7 @@ goc_entry* goc_fiber_entry_create(goc_pool* pool,
 
     /* 2. Populate fiber launch fields. */
     entry->kind     = GOC_FIBER;
+    entry->id       = atomic_fetch_add_explicit(&g_fiber_id_counter, 1, memory_order_relaxed);
     entry->fn       = fn;
     entry->fn_arg   = arg;
     entry->join_ch  = join_ch;
@@ -85,6 +91,9 @@ goc_entry* goc_fiber_entry_create(goc_pool* pool,
 
     /* 7. Write the canary value so pool_worker_fn can detect stack overflow. */
     goc_stack_canary_set(entry->stack_canary_ptr);
+
+    /* Telemetry: fiber created */
+    GOC_STATS_FIBER_STATUS(entry->id, 0, GOC_FIBER_CREATED);
 
     return entry;
 }

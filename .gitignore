@@ -71,6 +71,7 @@ build_orig/
 
 # Go module cache (accidentally committed)
 root/
+fix.md
 pr.md
 bench/libgoc/gc_fix.md
 .clj-kondo/.cache/v1/lock

@@ -1,0 +1,560 @@
+/*
+ * tests/test_goc_stats.c — Telemetry: goc_stats event emission and callback
+ *
+ * Verifies that the stats subsystem initialises correctly, that each event
+ * type (worker, fiber, channel) is emitted with the correct field values, and
+ * that the stats system is disabled cleanly on shutdown.
+ *
+ * Stats events are delivered via a registered callback (goc_stats_set_callback).
+ * The test installs a callback that copies each event into a mutex-protected
+ * ring buffer.  A condvar lets drain helpers block until the expected event
+ * arrives, with a per-event timeout to catch missing emissions.
+ *
+ * Build:  cmake -B build -DGOC_ENABLE_STATS=ON && cmake --build build
+ * Run:    ctest --test-dir build --output-on-failure
+ *         ./build/test_goc_stats
+ *
+ * Test coverage:
+ *
+ *   S1.1  goc_stats_init() / goc_stats_shutdown() complete without error
+ *   S1.2  goc_stats_is_enabled() is true after goc_stats_init()
+ *   S1.3  Worker event round-trips with correct type and fields
+ *   S1.4  Fiber event round-trips with correct type and fields
+ *   S1.5  Channel event round-trips with correct type and fields
+ *   S2.1  goc_go() emits GOC_FIBER_CREATED; fiber exit emits GOC_FIBER_COMPLETED
+ *   S2.2  After fiber completes, owning worker transitions to GOC_WORKER_IDLE
+ *   S2.3  goc_pool_make() emits GOC_WORKER_CREATED per thread
+ *   S2.4  Pool creation and destruction events
+ *   S3.1  Channel open/close events via API
+ *   S3.2  Buffered channel: buf_size and item_count after put/take
+ *   S3.3  Multiple fibers and channels: all events unique and present
+ *   S4.1  goc_stats_shutdown() disables stats delivery
+ *
+ *   (See test source for details on each scenario.)
+ */
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+#include <uv.h>
+
+#include "test_harness.h"
+#include "goc.h"
+#include "goc_stats.h"
+
+/* =========================================================================
+ * Event collection buffer
+ *
+ * The callback copies each event into g_events[].  A read cursor
+ * (g_read_pos) tracks which events tests have already consumed.
+ * A condvar lets blocking drain helpers sleep until new events arrive.
+ * ====================================================================== */
+
+#define EVENT_BUF_CAP 512
+
+static struct goc_stats_event g_events[EVENT_BUF_CAP];
+static size_t                 g_event_count = 0;   /* total events received */
+static size_t                 g_read_pos    = 0;   /* next event to consume */
+static uv_mutex_t             g_event_mutex;
+static uv_cond_t              g_event_cond;
+
+/* Callback installed by main(); runs on whichever thread emits the event. */
+static void collect_event(const struct goc_stats_event* ev, void* ud) {
+    (void)ud;
+    uv_mutex_lock(&g_event_mutex);
+    if (g_event_count < EVENT_BUF_CAP) {
+        g_events[g_event_count++] = *ev;
+        uv_cond_signal(&g_event_cond);
+    }
+    uv_mutex_unlock(&g_event_mutex);
+}
+
+/* -------------------------------------------------------------------------
+ * Drain helpers
+ *
+ * next_event() blocks (up to EVENT_TIMEOUT_MS) until the next unread event
+ * is available.  Returns NULL on timeout.
+ *
+ * find_* helpers scan forward from g_read_pos looking for a matching event,
+ * calling next_event() for each hop.  MAX_DRAIN caps the scan to prevent
+ * infinite waits if the expected event is never emitted.
+ * ------------------------------------------------------------------------- */
+
+#define EVENT_TIMEOUT_MS 5000
+#define MAX_DRAIN        64
+
+static const struct goc_stats_event* next_event(void) {
+    uv_mutex_lock(&g_event_mutex);
+    uint64_t deadline = uv_hrtime() + (uint64_t)EVENT_TIMEOUT_MS * 1000000ULL;
+    while (g_read_pos >= g_event_count) {
+        uint64_t now = uv_hrtime();
+        if (now >= deadline) {
+            uv_mutex_unlock(&g_event_mutex);
+            return NULL;
+        }
+        uv_cond_timedwait(&g_event_cond, &g_event_mutex, deadline - now);
+    }
+    const struct goc_stats_event* ev = &g_events[g_read_pos++];
+    uv_mutex_unlock(&g_event_mutex);
+    return ev;
+}
+
+/* Non-blocking: discard all currently buffered events; return the count. */
+static int drain_pending_events(void) {
+    uv_mutex_lock(&g_event_mutex);
+    int n = (int)(g_event_count - g_read_pos);
+    g_read_pos = g_event_count;
+    uv_mutex_unlock(&g_event_mutex);
+    return n;
+}
+
+/* Non-blocking peek: returns the next unread event if one is already in the
+ * buffer, or NULL if the buffer is empty.  Does not block or wait. */
+static const struct goc_stats_event* peek_event(void) {
+    uv_mutex_lock(&g_event_mutex);
+    const struct goc_stats_event* ev = NULL;
+    if (g_read_pos < g_event_count)
+        ev = &g_events[g_read_pos++];
+    uv_mutex_unlock(&g_event_mutex);
+    return ev;
+}
+
+static const struct goc_stats_event* find_worker_event(int id) {
+    for (int i = 0; i < MAX_DRAIN; i++) {
+        const struct goc_stats_event* ev = next_event();
+        if (!ev) return NULL;
+        if (ev->type == GOC_STATS_EVENT_WORKER_STATUS && ev->data.worker.id == id)
+            return ev;
+    }
+    return NULL;
+}
+
+static const struct goc_stats_event* find_fiber_event(
+        int id, enum goc_stats_fiber_status status) {
+    for (int i = 0; i < MAX_DRAIN; i++) {
+        const struct goc_stats_event* ev = next_event();
+        if (!ev) return NULL;
+        if (ev->type == GOC_STATS_EVENT_FIBER_STATUS &&
+            ev->data.fiber.id == id &&
+            ev->data.fiber.status == (int)status)
+            return ev;
+    }
+    return NULL;
+}
+
+static const struct goc_stats_event* find_channel_event(int id) {
+    for (int i = 0; i < MAX_DRAIN; i++) {
+        const struct goc_stats_event* ev = next_event();
+        if (!ev) return NULL;
+        if (ev->type == GOC_STATS_EVENT_CHANNEL_STATUS && ev->data.channel.id == id)
+            return ev;
+    }
+    return NULL;
+}
+
+static const struct goc_stats_event* find_any_fiber_created(void) {
+    for (int i = 0; i < MAX_DRAIN; i++) {
+        const struct goc_stats_event* ev = next_event();
+        if (!ev) return NULL;
+        if (ev->type == GOC_STATS_EVENT_FIBER_STATUS &&
+            ev->data.fiber.status == GOC_FIBER_CREATED)
+            return ev;
+    }
+    return NULL;
+}
+
+static const struct goc_stats_event* find_any_worker_status(
+        enum goc_stats_worker_status status) {
+    for (int i = 0; i < MAX_DRAIN; i++) {
+        const struct goc_stats_event* ev = next_event();
+        if (!ev) return NULL;
+        if (ev->type == GOC_STATS_EVENT_WORKER_STATUS &&
+            ev->data.worker.status == (int)status)
+            return ev;
+    }
+    return NULL;
+}
+
+/* -------------------------------------------------------------------------
+ * Fiber entry points for S1.3–S1.5
+ * ------------------------------------------------------------------------- */
+
+static void emit_worker_event(void* arg) {
+    (void)arg;
+    GOC_STATS_WORKER_STATUS(/*id=*/42, GOC_WORKER_RUNNING, /*pending_jobs=*/5);
+}
+
+static void emit_fiber_event(void* arg) {
+    (void)arg;
+    GOC_STATS_FIBER_STATUS(/*id=*/7, /*last_worker_id=*/3, GOC_FIBER_COMPLETED);
+}
+
+static void emit_channel_event(void* arg) {
+    (void)arg;
+    GOC_STATS_CHANNEL_STATUS(/*id=*/99, /*status=*/0, /*buf_size=*/16, /*item_count=*/4);
+}
+
+
+/* =========================================================================
+ * S1.1 — goc_stats_init() / goc_stats_shutdown() are safe no-ops without
+ *         GOC_ENABLE_STATS, and initialise / shut down correctly with it.
+ * ====================================================================== */
+
+static void test_s1_1(void) {
+    TEST_BEGIN("S1.1  goc_stats_init/shutdown complete without error");
+    goc_stats_init();
+    TEST_PASS();
+done:;
+}
+
+/*
+ * S1.2 — goc_stats_is_enabled() is true after goc_stats_init()
+ */
+static void test_s1_2(void) {
+    TEST_BEGIN("S1.2  goc_stats_is_enabled() true after goc_stats_init");
+    ASSERT(goc_stats_is_enabled());
+    TEST_PASS();
+done:;
+}
+
+/*
+ * S1.3 — Worker event round-trips with correct type and fields
+ */
+static void test_s1_3(void) {
+    TEST_BEGIN("S1.3  worker event round-trips with correct fields");
+    goc_go(emit_worker_event, NULL);
+    const struct goc_stats_event* ev = find_worker_event(42);
+    ASSERT(ev != NULL);
+    ASSERT(ev->type == GOC_STATS_EVENT_WORKER_STATUS);
+    ASSERT(ev->timestamp > 0);
+    ASSERT(ev->data.worker.id           == 42);
+    ASSERT(ev->data.worker.status       == GOC_WORKER_RUNNING);
+    ASSERT(ev->data.worker.pending_jobs == 5);
+    TEST_PASS();
+done:;
+}
+
+/*
+ * S1.4 — Fiber event round-trips with correct type and fields
+ */
+static void test_s1_4(void) {
+    TEST_BEGIN("S1.4  fiber event round-trips with correct fields");
+    goc_go(emit_fiber_event, NULL);
+    const struct goc_stats_event* ev = find_fiber_event(7, GOC_FIBER_COMPLETED);
+    ASSERT(ev != NULL);
+    ASSERT(ev->type == GOC_STATS_EVENT_FIBER_STATUS);
+    ASSERT(ev->timestamp > 0);
+    ASSERT(ev->data.fiber.id             == 7);
+    ASSERT(ev->data.fiber.last_worker_id == 3);
+    ASSERT(ev->data.fiber.status         == GOC_FIBER_COMPLETED);
+    TEST_PASS();
+done:;
+}
+
+/*
+ * S1.5 — Channel event round-trips with correct type and fields
+ */
+static void test_s1_5(void) {
+    TEST_BEGIN("S1.5  channel event round-trips with correct fields");
+    goc_go(emit_channel_event, NULL);
+    const struct goc_stats_event* ev = find_channel_event(99);
+    ASSERT(ev != NULL);
+    ASSERT(ev->type == GOC_STATS_EVENT_CHANNEL_STATUS);
+    ASSERT(ev->timestamp > 0);
+    ASSERT(ev->data.channel.id         == 99);
+    ASSERT(ev->data.channel.status     == 0);
+    ASSERT(ev->data.channel.buf_size   == 16);
+    ASSERT(ev->data.channel.item_count == 4);
+    TEST_PASS();
+done:;
+}
+
+/* =========================================================================
+ * S2.x tests — automatic pool.c instrumentation
+ * ====================================================================== */
+
+static void noop_fiber(void* arg) { (void)arg; }
+
+/*
+ * Stats subsystem is enabled and pool.c instrumentation is active.
+ * This is a prerequisite gate for S2.1–S2.3.  Spawning a fiber causes
+ * pool_submit_spawn to emit GOC_FIBER_CREATED synchronously on the calling
+ * thread, so the event is in the buffer before goc_go() returns.  A
+ * non-blocking peek distinguishes "pool compiled with stats" from "stats
+ * subsystem enabled but pool macros are no-ops".
+ *
+ * If this test fails, rebuild with: cmake -B build -DGOC_ENABLE_STATS=ON
+ */
+
+/*
+ * S2.1 — goc_go() emits GOC_FIBER_CREATED; fiber exit emits GOC_FIBER_COMPLETED
+ */
+static void test_s2_1(void) {
+    TEST_BEGIN("S2.1  goc_go emits FIBER_CREATED; completion emits FIBER_COMPLETED");
+    goc_go(noop_fiber, NULL);
+
+    const struct goc_stats_event* created = find_any_fiber_created();
+    ASSERT(created != NULL);
+    ASSERT(created->data.fiber.last_worker_id == 0);
+    ASSERT(created->timestamp > 0);
+    int fiber_id = created->data.fiber.id;
+
+    const struct goc_stats_event* completed = find_fiber_event(fiber_id, GOC_FIBER_COMPLETED);
+    ASSERT(completed != NULL);
+    ASSERT(completed->data.fiber.last_worker_id >= 0);
+    ASSERT(completed->timestamp >= created->timestamp);
+
+    TEST_PASS();
+done:;
+}
+
+/*
+ * S2.2 — After a fiber completes, the owning worker transitions to GOC_WORKER_IDLE
+ */
+static void test_s2_2(void) {
+    TEST_BEGIN("S2.2  worker transitions to GOC_WORKER_IDLE after fiber completes");
+    goc_go(noop_fiber, NULL);
+
+    const struct goc_stats_event* created = find_any_fiber_created();
+    ASSERT(created != NULL);
+    int fiber_id = created->data.fiber.id;
+
+    const struct goc_stats_event* completed = find_fiber_event(fiber_id, GOC_FIBER_COMPLETED);
+    ASSERT(completed != NULL);
+
+    const struct goc_stats_event* idle = find_any_worker_status(GOC_WORKER_IDLE);
+    ASSERT(idle != NULL);
+    ASSERT(idle->data.worker.id >= 0);
+
+    TEST_PASS();
+done:;
+}
+
+/*
+ * S2.3 — goc_pool_make() emits GOC_WORKER_CREATED per thread
+ */
+static void test_s2_3(void) {
+    TEST_BEGIN("S2.3  goc_pool_make emits GOC_WORKER_CREATED per thread");
+    goc_pool* pool = NULL;
+    pool = goc_pool_make(2);
+
+    bool saw[2] = {false, false};
+    int n_found = 0;
+    for (int i = 0; i < MAX_DRAIN && n_found < 2; i++) {
+        const struct goc_stats_event* ev = next_event();
+        ASSERT(ev != NULL);
+        if (ev->type != GOC_STATS_EVENT_WORKER_STATUS) continue;
+        if (ev->data.worker.status != GOC_WORKER_CREATED) continue;
+        int id = ev->data.worker.id;
+        if (id == 0 || id == 1) {
+            saw[id] = true;
+            n_found++;
+        }
+    }
+    ASSERT(saw[0]);
+    ASSERT(saw[1]);
+
+    goc_pool_destroy(pool);
+    pool = NULL;
+    TEST_PASS();
+done:
+    if (pool) goc_pool_destroy(pool);
+}
+
+/*
+ * S2.4 — Pool creation and destruction events
+ */
+static void test_s2_4(void) {
+    TEST_BEGIN("S2.4  pool creation and destruction events");
+    goc_pool* pool = goc_pool_make(3);
+    void* pool_id = pool;
+    const struct goc_stats_event* create_ev = NULL;
+    const struct goc_stats_event* destroy_ev = NULL;
+    // Find pool created event
+    for (int i = 0; i < MAX_DRAIN; i++) {
+        const struct goc_stats_event* ev = next_event();
+        if (ev && ev->type == GOC_STATS_EVENT_POOL_STATUS &&
+            ev->data.pool.id == pool_id && ev->data.pool.status == GOC_POOL_CREATED) {
+            create_ev = ev;
+            break;
+        }
+    }
+    ASSERT(create_ev != NULL);
+    ASSERT(create_ev->data.pool.thread_count == 3);
+    goc_pool_destroy(pool);
+    // Find pool destroyed event
+    for (int i = 0; i < MAX_DRAIN; i++) {
+        const struct goc_stats_event* ev = next_event();
+        if (ev && ev->type == GOC_STATS_EVENT_POOL_STATUS &&
+            ev->data.pool.id == pool_id && ev->data.pool.status == GOC_POOL_DESTROYED) {
+            destroy_ev = ev;
+            break;
+        }
+    }
+    ASSERT(destroy_ev != NULL);
+    ASSERT(destroy_ev->data.pool.thread_count == 3);
+    TEST_PASS();
+done:;
+}
+
+/*
+ * S3.1 — Channel open/close events via API
+ */
+static void test_s3_1(void) {
+    TEST_BEGIN("S3.1  channel open/close events via API");
+    goc_chan* ch = goc_chan_make(0);
+    int ch_id = (int)(intptr_t)ch;
+    const struct goc_stats_event* open_ev = find_channel_event(ch_id);
+    ASSERT(open_ev != NULL);
+    ASSERT(open_ev->data.channel.status == 1); // open
+    ASSERT(open_ev->data.channel.buf_size == 0);
+    ASSERT(open_ev->data.channel.item_count == 0);
+    goc_close(ch);
+    const struct goc_stats_event* close_ev = find_channel_event(ch_id);
+    ASSERT(close_ev != NULL);
+    ASSERT(close_ev->data.channel.status == 0); // closed
+    ASSERT(close_ev->data.channel.buf_size == 0);
+    ASSERT(close_ev->data.channel.item_count == 0);
+    TEST_PASS();
+done:;
+}
+
+/*
+ * S3.2 — Buffered channel: buf_size and item_count after put/take
+ */
+// S3.2 fiber args and function
+static struct {
+    goc_chan* ch;
+    goc_val_t* taken;
+} s3_2_fiber_args;
+
+static void s3_2_fiber(void* arg) {
+    typeof(s3_2_fiber_args)* args = arg;
+    goc_put(args->ch, (void*)1);
+    goc_put(args->ch, (void*)2);
+    args->taken = goc_take(args->ch);
+}
+
+static void test_s3_2(void) {
+    TEST_BEGIN("S3.2  buffered channel buf_size and item_count");
+    goc_chan* ch = goc_chan_make(2);
+    int ch_id = (int)(intptr_t)ch;
+    // Open event
+    const struct goc_stats_event* open_ev = find_channel_event(ch_id);
+    ASSERT(open_ev != NULL);
+    ASSERT(open_ev->data.channel.status == 1);
+    ASSERT(open_ev->data.channel.buf_size == 2);
+    ASSERT(open_ev->data.channel.item_count == 0);
+
+    s3_2_fiber_args.ch = ch;
+    s3_2_fiber_args.taken = NULL;
+    goc_chan* join = goc_go(s3_2_fiber, &s3_2_fiber_args);
+    goc_take_sync(join); // wait for fiber to finish
+
+    ASSERT(s3_2_fiber_args.taken->val == (void*)1);
+    goc_close(ch);
+
+    const struct goc_stats_event* close_ev = find_channel_event(ch_id);
+    ASSERT(close_ev != NULL);
+    ASSERT(close_ev->data.channel.status == 0);
+    ASSERT(close_ev->data.channel.buf_size == 2);
+    ASSERT(close_ev->data.channel.item_count == 1);
+    TEST_PASS();
+done:;
+}
+
+/*
+ * S3.3 — Multiple fibers and channels: all events unique and present
+ */
+static void test_s3_3(void) {
+    TEST_BEGIN("S3.3  multiple fibers and channels events");
+    goc_chan* ch1 = goc_chan_make(0);
+    goc_chan* ch2 = goc_chan_make(1);
+    int ch1_id = (int)(intptr_t)ch1;
+    int ch2_id = (int)(intptr_t)ch2;
+    goc_go(noop_fiber, NULL);
+    goc_go(noop_fiber, NULL);
+    // Find both channel open events
+    const struct goc_stats_event* open1 = find_channel_event(ch1_id);
+    const struct goc_stats_event* open2 = find_channel_event(ch2_id);
+    ASSERT(open1 != NULL && open2 != NULL);
+    // Find two fiber created events
+    int found = 0;
+    for (int i = 0; i < MAX_DRAIN && found < 2; i++) {
+        const struct goc_stats_event* ev = next_event();
+        if (ev && ev->type == GOC_STATS_EVENT_FIBER_STATUS && ev->data.fiber.status == GOC_FIBER_CREATED)
+            found++;
+    }
+    ASSERT(found == 2);
+    goc_close(ch1);
+    goc_close(ch2);
+    // Find both channel close events
+    const struct goc_stats_event* close1 = find_channel_event(ch1_id);
+    const struct goc_stats_event* close2 = find_channel_event(ch2_id);
+    ASSERT(close1 != NULL && close2 != NULL);
+    TEST_PASS();
+done:;
+}
+
+/*
+ * S4_1 — goc_stats_shutdown() disables stats delivery
+ */
+static void test_s4_1(void) {
+    TEST_BEGIN("S4_1  goc_stats_shutdown disables stats");
+    ASSERT(goc_stats_is_enabled());
+    goc_stats_shutdown();
+    ASSERT(!goc_stats_is_enabled());
+    TEST_PASS();
+done:;
+}
+
+
+/* =========================================================================
+ * main
+ * ====================================================================== */
+
+int main(void) {
+    install_crash_handler();
+    goc_test_arm_watchdog(30);
+
+    printf("libgoc test suite — Stats / Telemetry\n");
+    printf("=======================================\n\n");
+
+    goc_init();
+    goc_stats_init();
+
+    /* Set up event collection before any test runs. */
+    uv_mutex_init(&g_event_mutex);
+    uv_cond_init(&g_event_cond);
+    goc_stats_set_callback(collect_event, NULL);
+
+    printf("Stats — Telemetry\n");
+    test_s1_1();
+    test_s1_2();
+    test_s1_3();
+    test_s1_4();
+    test_s1_5();
+    test_s2_1();
+    test_s2_2();
+    test_s2_3();
+    test_s2_4();
+    test_s3_1();
+    test_s3_2();
+    test_s3_3();
+    test_s4_1();
+    printf("\n");
+
+    uv_cond_destroy(&g_event_cond);
+    uv_mutex_destroy(&g_event_mutex);
+    goc_shutdown();
+
+    printf("=======================================\n");
+    printf("Results: %d/%d passed", g_tests_passed, g_tests_run);
+    if (g_tests_failed > 0)
+        printf(", %d FAILED", g_tests_failed);
+    printf("\n");
+
+    return (g_tests_failed == 0) ? 0 : 1;
+}
