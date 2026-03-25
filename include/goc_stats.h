@@ -58,7 +58,7 @@ struct goc_stats_event {
     uint64_t timestamp;
     union {
         struct { void* id; int status; int thread_count; } pool;
-        struct { int id; int status; int pending_jobs; } worker;
+        struct { int id; void* pool_id; int status; int pending_jobs; } worker;
         struct { int id; int last_worker_id; int status; } fiber;
         struct { int id; int status; int buf_size; int item_count; } channel;
     } data;
@@ -93,7 +93,7 @@ bool goc_stats_is_enabled(void);
 
 #ifdef GOC_ENABLE_STATS
 void goc_stats_submit_event_pool(void* id, int status, int thread_count);
-void goc_stats_submit_event_worker(int id, int status, int pending_jobs);
+void goc_stats_submit_event_worker(int id, void* pool_id, int status, int pending_jobs);
 void goc_stats_submit_event_fiber(int id, int last_worker_id, int status);
 void goc_stats_submit_event_channel(int id, int status, int buf_size, int item_count);
 #endif
@@ -105,15 +105,15 @@ void goc_stats_submit_event_channel(int id, int status, int buf_size, int item_c
 #ifdef GOC_ENABLE_STATS
 #  define GOC_STATS_POOL_STATUS(id, status, thread_count) \
     goc_stats_submit_event_pool((id), (status), (thread_count))
-#  define GOC_STATS_WORKER_STATUS(id, status, pending_jobs) \
-    goc_stats_submit_event_worker((id), (status), (pending_jobs))
+#  define GOC_STATS_WORKER_STATUS(id, pool_id, status, pending_jobs) \
+    goc_stats_submit_event_worker((id), (pool_id), (status), (pending_jobs))
 #  define GOC_STATS_FIBER_STATUS(id, last_worker_id, status) \
     goc_stats_submit_event_fiber((id), (last_worker_id), (status))
 #  define GOC_STATS_CHANNEL_STATUS(id, status, buf_size, item_count) \
     goc_stats_submit_event_channel((id), (status), (buf_size), (item_count))
 #else
 #  define GOC_STATS_POOL_STATUS(id, status, thread_count)            ((void)0)
-#  define GOC_STATS_WORKER_STATUS(id, status, pending_jobs)          ((void)0)
+#  define GOC_STATS_WORKER_STATUS(id, pool_id, status, pending_jobs) ((void)0)
 #  define GOC_STATS_FIBER_STATUS(id, last_worker_id, status)         ((void)0)
 #  define GOC_STATS_CHANNEL_STATUS(id, status, buf_size, item_count) ((void)0)
 #endif

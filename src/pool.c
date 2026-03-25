@@ -264,7 +264,7 @@ void pool_submit_spawn(goc_pool* pool,
         GOC_STATS_WORKER_STATUS(
             (int)atomic_load_explicit(&pool->next_push_idx, memory_order_relaxed)
                  % (int)pool->thread_count,
-            GOC_WORKER_RUNNING, (int)live);
+            pool, GOC_WORKER_RUNNING, (int)live);
         post_to_run_queue(pool, entry);
         return;
     }
@@ -343,10 +343,10 @@ static void pool_worker_fn(void* arg) {
             goto run;
         }
 
-        GOC_STATS_WORKER_STATUS((int)tl_worker->index, GOC_WORKER_IDLE, (int)pool->live_count);
+        GOC_STATS_WORKER_STATUS((int)tl_worker->index, pool, GOC_WORKER_IDLE, (int)pool->live_count);
         uv_sem_wait(&tl_worker->idle_sem);
         atomic_fetch_sub_explicit(&pool->idle_count, 1, memory_order_relaxed);
-        GOC_STATS_WORKER_STATUS((int)tl_worker->index, GOC_WORKER_RUNNING, (int)pool->live_count);
+        GOC_STATS_WORKER_STATUS((int)tl_worker->index, pool, GOC_WORKER_RUNNING, (int)pool->live_count);
         continue;   /* re-check shutdown and try again */
 
 run:
@@ -400,12 +400,12 @@ run:
             uv_cond_broadcast(&pool->drain_cond);
             uv_mutex_unlock(&pool->drain_mutex);
 
-            GOC_STATS_WORKER_STATUS((int)tl_worker->index, GOC_WORKER_RUNNING, (int)pool->live_count);
+            GOC_STATS_WORKER_STATUS((int)tl_worker->index, pool, GOC_WORKER_RUNNING, (int)pool->live_count);
             pool_dispatch_spawn_list(pool, admitted);
         }
     }
 
-    GOC_STATS_WORKER_STATUS((int)tl_worker->index, GOC_WORKER_STOPPED, 0);
+    GOC_STATS_WORKER_STATUS((int)tl_worker->index, pool, GOC_WORKER_STOPPED, 0);
     tl_worker = NULL;
 }
 
@@ -517,7 +517,7 @@ goc_pool* goc_pool_make(size_t threads) {
                     i + 1, threads, rc);
             abort();
         }
-        GOC_STATS_WORKER_STATUS((int)i, GOC_WORKER_CREATED, 0);
+        GOC_STATS_WORKER_STATUS((int)i, pool, GOC_WORKER_CREATED, 0);
     }
 
     GOC_STATS_POOL_STATUS(goc_box_int(pool), GOC_POOL_CREATED, (int)threads);

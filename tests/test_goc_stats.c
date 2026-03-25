@@ -183,7 +183,7 @@ static const struct goc_stats_event* find_any_worker_status(
 
 static void emit_worker_event(void* arg) {
     (void)arg;
-    GOC_STATS_WORKER_STATUS(/*id=*/42, GOC_WORKER_RUNNING, /*pending_jobs=*/5);
+    GOC_STATS_WORKER_STATUS(/*id=*/42, /*pool_id=*/NULL, GOC_WORKER_RUNNING, /*pending_jobs=*/5);
 }
 
 static void emit_fiber_event(void* arg) {
@@ -230,6 +230,7 @@ static void test_s1_3(void) {
     ASSERT(ev->type == GOC_STATS_EVENT_WORKER_STATUS);
     ASSERT(ev->timestamp > 0);
     ASSERT(ev->data.worker.id           == 42);
+    ASSERT(ev->data.worker.pool_id      == NULL);
     ASSERT(ev->data.worker.status       == GOC_WORKER_RUNNING);
     ASSERT(ev->data.worker.pending_jobs == 5);
     TEST_PASS();
