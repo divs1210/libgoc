@@ -1,6 +1,6 @@
 # libgoc - Telemetry (`goc_stats`)
 
-> Synchronous, event-based telemetry for fibers, workers, and channels in libgoc.
+> Asynchronous, event-based telemetry for fibers, workers, and channels in libgoc.
 
 ---
 
@@ -23,14 +23,14 @@
 
 ## Overview
 
-`goc_stats` provides a synchronous, callback-based telemetry system for libgoc. It emits events for key runtime objects (fibers, workers, channels) at lifecycle and status transitions. Events are delivered immediately on the emitting thread, allowing for low-latency monitoring, debugging, and integration with external systems.
+`goc_stats` provides an asynchronous telemetry system for libgoc. It emits events for key runtime objects (fibers, workers, channels) at lifecycle and status transitions. Events are delivered immediately on the emitting thread, allowing for low-latency monitoring, debugging, and integration with external systems.
 
 ---
 
 ## Design
 
-- **Synchronous delivery:** Events are emitted synchronously on the thread that triggers them (pool worker, main thread, etc.). Callbacks must be fast and non-blocking.
-- **Event types:** Fiber, worker, and channel events are supported. Each event includes a timestamp and relevant fields.
+- **Asynchronous delivery:** Events are emitted immediately on the thread that triggers them (pool worker, main thread, etc.). Callbacks must be fast and non-blocking.
+- **Event types:** pool, fiber, worker, and channel events are supported. Each event includes a timestamp and relevant fields.
 - **Build-time enable/disable:** Telemetry is enabled by defining `GOC_ENABLE_STATS` at build time. When disabled, all macros become no-ops and have zero runtime cost.
 - **Thread safety:** The callback may be invoked from any thread. Use a mutex or buffer to hand off events for heavy processing.
 
