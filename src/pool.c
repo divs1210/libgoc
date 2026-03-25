@@ -228,7 +228,6 @@ static void pool_dispatch_spawn_list(goc_pool* pool, goc_spawn_req* reqs) {
                                                   reqs->fn,
                                                   reqs->fn_arg,
                                                   reqs->join_ch);
-        GOC_STATS_FIBER_STATUS((int)entry->id, -1, GOC_FIBER_CREATED);
         post_to_run_queue(pool, entry);
         GC_free(reqs);
         reqs = next;
@@ -262,7 +261,6 @@ void pool_submit_spawn(goc_pool* pool,
         uv_mutex_unlock(&pool->drain_mutex);
 
         goc_entry* entry = goc_fiber_entry_create(pool, fn, arg, join_ch);
-        GOC_STATS_FIBER_STATUS((int)entry->id, -1, GOC_FIBER_CREATED);
         GOC_STATS_WORKER_STATUS(
             (int)atomic_load_explicit(&pool->next_push_idx, memory_order_relaxed)
                  % (int)pool->thread_count,
@@ -390,7 +388,6 @@ run:
 
         if (st == MCO_DEAD) {
             if (fe != NULL) {
-                GOC_STATS_FIBER_STATUS((int)fe->id, (int)tl_worker->index, GOC_FIBER_COMPLETED);
                 goc_fiber_root_unregister(fe->fiber_root_handle);
             }
             mco_destroy(coro);
