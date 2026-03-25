@@ -26,12 +26,14 @@
 15. [`goc_alts`](#goc_alts)
 16. [Public API](#public-api)
 17. [Async I/O Wrappers (`goc_io`)](#async-io-wrappers-goc_io)
-18. [Initialization Sequence](#initialization-sequence)
-19. [Shutdown Sequence](#shutdown-sequence)
-20. [Testing](#testing)
-21. [CI/CD](#cicd)
+18. [Telemetry (`goc_stats`)](#telemetry-goc_stats)
+19. [Initialization Sequence](#initialization-sequence)
+20. [Shutdown Sequence](#shutdown-sequence)
+21. [Testing](#testing)
+22. [CI/CD](#cicd)
 
 > **Dynamic Array:** For `goc_array` design rationale and full API see [ARRAY.md](./ARRAY.md).
+> **Telemetry:** For full `goc_stats` API and event reference see [TELEMETRY.md](./TELEMETRY.md).
 
 ---
 
@@ -53,30 +55,32 @@
 libgoc/
 ├── include/
 │   ├── goc.h              # Public API header
-│   └── goc_array.h        # Dynamic array public API
+│   ├── goc_io.h           # Async I/O wrappers public API (separate include)
+│   ├── goc_array.h        # Dynamic array public API
+│   └── goc_stats.h        # Telemetry public API (opt-in; requires GOC_ENABLE_STATS)
 ├── src/
 │   ├── alts.c             # goc_alts, goc_alts_sync
 │   ├── timeout.c          # goc_timeout
 │   ├── gc.c               # Boehm GC initialization, goc_malloc, goc_realloc
-│   ├── loop.c             # libuv event loop thread
+│   ├── loop.c             # libuv event loop thread; MPSC callback queue
 │   ├── pool.c             # Thread pool workers
 │   ├── fiber.c            # minicoro fiber mechanics
 │   ├── channel.c          # Channel operations
 │   ├── mutex.c            # RW mutexes (channel-backed lock handles)
 │   ├── goc_array.c        # Dynamic array (goc_array)
 │   ├── goc_io.c           # Async I/O wrappers (libuv; see goc_io.h)
+│   ├── goc_stats.c        # Telemetry implementation (compiled only when GOC_ENABLE_STATS is set)
 │   ├── minicoro.c         # Instantiates minicoro (defines MINICORO_IMPL)
 │   ├── internal.h         # Internal types, helpers, and cross-module declarations
 │   ├── chan_type.h         # Authoritative struct goc_chan definition (included where concrete channel fields are accessed)
 │   ├── channel_internal.h  # Channel-only internals and inline channel helpers
 │   └── config.h           # Build configuration constants (thresholds, etc.)
-├── include/
-│   ├── goc.h              # Public API header
-│   └── goc_io.h           # Async I/O wrappers public API (separate include)
 ├── tests/
 │   ├── test_harness.h               # Shared harness macros + SIGSEGV/SIGABRT crash handler
+│   ├── test_harness.c               # Shared harness implementation (compiled into every test binary)
 │   ├── test_p01_foundation.c        # Phase 1  — Foundation
 │   ├── test_goc_array.c             # Component — goc_array dynamic array
+│   ├── test_goc_stats.c             # Component — goc_stats telemetry
 │   ├── test_p02_channels_fibers.c   # Phase 2  — Channels and fiber launch
 │   ├── test_p03_channel_io.c        # Phase 3  — Channel I/O
 │   ├── test_p04_callbacks.c         # Phase 4  — Callbacks
@@ -126,6 +130,7 @@ The project uses CMake (≥ 3.20). `CMakeLists.txt` defines the following primar
 | `goc_shared` | shared library | Same sources as `goc`; built only with `-DLIBGOC_SHARED=ON`; output name `libgoc.so` / `.dylib` / `.dll` |
 | `test_p01_foundation` … `test_p10_io` | executables | One per phase, discovered via `file(GLOB tests/test_p*.c)`; each linked against the active `goc` variant + libuv + Boehm GC |
 | `test_goc_array` | executable | Component test for `goc_array`; discovered via `file(GLOB tests/test_goc_*.c)` |
+| `test_goc_stats` | executable | Component test for `goc_stats`; always compiled with `GOC_ENABLE_STATS` and `src/goc_stats.c` added directly, regardless of the `GOC_ENABLE_STATS` CMake option |
 
 A CMake function `goc_configure_target(<target>)` centralises the options shared by every library variant: `PUBLIC` include path `include/`, `PRIVATE` paths `src/` and `vendor/minicoro/`, compile definition `GC_THREADS`, and link libraries `PkgConfig::LIBUV` and `PkgConfig::BDWGC`. All library targets (`goc`, `goc_shared`, `goc_asan`, `goc_tsan`) are configured through this function.
 
@@ -147,6 +152,7 @@ Optional opt-in flags, each requiring a **separate build directory**:
 | `-DLIBGOC_ASAN=ON` | `goc_asan` | AddressSanitizer; per-phase test executables link against `goc_asan`; mutually exclusive with TSAN and COVERAGE |
 | `-DLIBGOC_TSAN=ON` | `goc_tsan` | ThreadSanitizer; per-phase test executables link against `goc_tsan`; mutually exclusive with ASAN and COVERAGE |
 | `-DLIBGOC_COVERAGE=ON` | `coverage` target (if lcov/genhtml found) | Instruments `goc` with `--coverage`; runs ctest then produces `coverage_html/index.html`; mutually exclusive with ASAN and TSAN |
+| `-DGOC_ENABLE_STATS=ON` | *(none)* | Compiles `src/goc_stats.c` into the library and defines `GOC_ENABLE_STATS` on all targets; without this flag the telemetry macros are no-ops and `goc_stats.c` is excluded from `libgoc.a`. `test_goc_stats` always compiles `goc_stats.c` directly regardless of this flag. |
 
 ASAN and TSAN each compile a separate instrumented copy of the `goc` static library (`goc_asan` / `goc_tsan`) so that sanitizer flags propagate through all object files. When either sanitizer flag is active the per-phase test executables link against the instrumented variant instead of `goc`. Configuring ASAN and TSAN together, or either sanitizer with COVERAGE, in the same directory is a CMake fatal error.
 
@@ -1249,6 +1255,16 @@ libgoc provides channel-based wrappers for libuv I/O operations in a separate he
 
 ---
 
+## Telemetry (`goc_stats`)
+
+libgoc provides an optional, synchronous telemetry system via `include/goc_stats.h` and `src/goc_stats.c`. When enabled (`-DGOC_ENABLE_STATS=ON`), the runtime emits structured events at key lifecycle points: pool creation/destruction, worker state transitions (created → running → idle → stopped), fiber creation/completion, and channel open/close. Events are delivered synchronously on the emitting thread via a user-supplied callback registered with `goc_stats_set_callback`. A default callback that prints all events to stdout is installed by `goc_stats_init`.
+
+When `GOC_ENABLE_STATS` is not defined, all emission macros (`GOC_STATS_POOL_STATUS`, `GOC_STATS_WORKER_STATUS`, `GOC_STATS_FIBER_STATUS`, `GOC_STATS_CHANNEL_STATUS`) expand to `((void)0)` and have zero runtime cost.
+
+> **Full API reference, event schema, and examples:** [TELEMETRY.md](./TELEMETRY.md)
+
+---
+
 ## Initialization Sequence
 
 `goc_init` must be called exactly once, as the first call in `main()`. Calling it more than once is undefined behaviour. It performs the following steps:
@@ -1504,6 +1520,22 @@ The test suite is split across phase files in `tests/`, each a self-contained C 
 
 > **Windows portability:** Temporary file paths are constructed via `GetTempPathA` on Windows and `/tmp` on POSIX. All file-system operations use `UV_FS_O_*` flags (e.g. `UV_FS_O_RDONLY`, `UV_FS_O_WRONLY | UV_FS_O_CREAT`) which are portable across all libuv platforms. Phase 10 builds and runs on Windows.
 
+**goc_stats component** (`test_goc_stats`)
+
+`test_goc_stats` always compiles with `GOC_ENABLE_STATS` defined and links `src/goc_stats.c` directly, independent of the `GOC_ENABLE_STATS` CMake option. This lets the telemetry tests run in any build configuration.
+
+| Test | Description |
+|---|---|
+| S1.1 | `goc_stats_init` / `goc_stats_shutdown` complete without error |
+| S1.2 | `goc_stats_is_enabled()` returns `true` after `goc_stats_init` |
+| S1.3 | Worker event round-trips with correct `id`, `status`, and `pending_jobs` fields |
+| S1.4 | Fiber event round-trips with correct `id`, `last_worker_id`, and `status` fields |
+| S1.5 | Channel event round-trips with correct `id`, `status`, `buf_size`, and `item_count` fields |
+| S2.1 | `goc_go` emits `GOC_FIBER_CREATED`; completion emits `GOC_FIBER_COMPLETED` |
+| S2.2 | Worker transitions to `GOC_WORKER_IDLE` after fiber completes |
+| S2.3 | `goc_pool_make` emits `GOC_WORKER_CREATED` per thread |
+| S2.4 | Pool creation and destruction events |
+
 ### Running
 
 ```sh
@@ -1538,10 +1570,10 @@ Runs a build matrix across four configurations:
 
 | Runner | `cmake_flags` | Tests |
 |---|---|---|
-| `ubuntu-latest` | *(none — canary build)* | All phases (P1–P9) via `ctest --timeout 60`; P8.1 exercises canary abort |
-| `macos-latest` | *(none — canary build)* | All phases (P1–P9) via `ctest --timeout 60`; P8.1 exercises canary abort |
-| `windows-latest` | *(none — canary build)* | P1–P7, P9 via `ctest --timeout 60`; P8 self-skips (no `fork`) |
-| `ubuntu-latest` | `-DLIBGOC_VMEM=ON` (vmem build) | All phases (P1–P9) via `ctest --timeout 60`; P8.1 skipped (vmem build) |
+| `ubuntu-latest` | *(none — canary build)* | All phases (P1–P10), `test_goc_array`, `test_goc_stats` via `ctest --timeout 60`; P8.1 exercises canary abort |
+| `macos-latest` | *(none — canary build)* | All phases (P1–P10), `test_goc_array`, `test_goc_stats` via `ctest --timeout 60`; P8.1 exercises canary abort |
+| `windows-latest` | *(none — canary build)* | P1–P7, P9–P10, `test_goc_array`, `test_goc_stats` via `ctest --timeout 60`; P8 self-skips (no `fork`) |
+| `ubuntu-latest` | `-DLIBGOC_VMEM=ON` (vmem build) | All phases (P1–P10), `test_goc_array`, `test_goc_stats` via `ctest --timeout 60`; P8.1 skipped (vmem build) |
 
 All four configurations run `RelWithDebInfo` builds. Dependencies per OS:
 
@@ -1559,9 +1591,9 @@ Triggered on every push to `main` that touches `src/`, `include/`, `CMakeLists.t
 
 1. **`tag`** — Creates a UTC timestamp tag in the format `yyyy.MM.dd.HH.mm` (e.g. `2026.03.18.12.05`) and pushes it to the repository.
 
-2. **`build-linux`**, **`build-macos`**, **`build-windows`** — Run in parallel after `tag`. Each job builds the `goc` static library in `Release` mode (canary stacks, the default — no `-DLIBGOC_VMEM` flag) and packages it alongside the full public header set: `include/goc.h`, `include/goc_io.h`, and `include/goc_array.h`:
-    - Linux: `libgoc-<tag>-canary-linux-x86_64.tar.gz` (`libgoc.a` + `goc.h` + `goc_io.h` + `goc_array.h`); Boehm GC is built from source with `--enable-threads=posix` and cached; a `bdw-gc-threaded.pc` alias is baked into the cache.
-    - macOS: `libgoc-<tag>-canary-macos-arm64.tar.gz` (`libgoc.a` + `goc.h` + `goc_io.h` + `goc_array.h`); Homebrew dependencies are installed and a `bdw-gc-threaded.pc` alias is created in `$(brew --prefix)/lib/pkgconfig` if absent.
-    - Windows: `libgoc-<tag>-canary-windows-x86_64.tar.gz` (`libgoc.a` + `goc.h` + `goc_io.h` + `goc_array.h`, built via MSYS2/MinGW-w64 UCRT64); a `bdw-gc-threaded.pc` alias is created in `/ucrt64/lib/pkgconfig` if absent before CMake runs.
+2. **`build-linux`**, **`build-macos`**, **`build-windows`** — Run in parallel after `tag`. Each job builds the `goc` static library in `Release` mode (canary stacks, the default — no `-DLIBGOC_VMEM` flag) and packages it alongside the full public header set: `include/goc.h`, `include/goc_io.h`, `include/goc_array.h`, and `include/goc_stats.h`:
+    - Linux: `libgoc-<tag>-canary-linux-x86_64.tar.gz` (`libgoc.a` + `goc.h` + `goc_io.h` + `goc_array.h` + `goc_stats.h`); Boehm GC is built from source with `--enable-threads=posix` and cached; a `bdw-gc-threaded.pc` alias is baked into the cache.
+    - macOS: `libgoc-<tag>-canary-macos-arm64.tar.gz` (`libgoc.a` + `goc.h` + `goc_io.h` + `goc_array.h` + `goc_stats.h`); Homebrew dependencies are installed and a `bdw-gc-threaded.pc` alias is created in `$(brew --prefix)/lib/pkgconfig` if absent.
+    - Windows: `libgoc-<tag>-canary-windows-x86_64.tar.gz` (`libgoc.a` + `goc.h` + `goc_io.h` + `goc_array.h` + `goc_stats.h`, built via MSYS2/MinGW-w64 UCRT64); a `bdw-gc-threaded.pc` alias is created in `/ucrt64/lib/pkgconfig` if absent before CMake runs.
 
 3. **`release`** — Downloads all three artifacts and publishes a GitHub Release tagged with the timestamp tag created in step 1.

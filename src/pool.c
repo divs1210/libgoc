@@ -22,6 +22,7 @@
 #include <uv.h>
 #include <gc.h>
 #include "../include/goc.h"
+#include "../include/goc_stats.h"
 #include "minicoro.h"
 #include "internal.h"
 #include "wsdq.h"
@@ -256,9 +257,14 @@ void pool_submit_spawn(goc_pool* pool,
     if (bypass_throttle ||
         (pool->pending_spawn_head == NULL && !pool_spawn_cap_reached_locked(pool))) {
         pool->resident_count++;
+        size_t live = pool->live_count;
         uv_mutex_unlock(&pool->drain_mutex);
 
         goc_entry* entry = goc_fiber_entry_create(pool, fn, arg, join_ch);
+        GOC_STATS_WORKER_STATUS(
+            (int)atomic_load_explicit(&pool->next_push_idx, memory_order_relaxed)
+                 % (int)pool->thread_count,
+            GOC_WORKER_RUNNING, (int)live);
         post_to_run_queue(pool, entry);
         return;
     }
@@ -337,8 +343,10 @@ static void pool_worker_fn(void* arg) {
             goto run;
         }
 
+        GOC_STATS_WORKER_STATUS((int)tl_worker->index, GOC_WORKER_IDLE, (int)pool->live_count);
         uv_sem_wait(&tl_worker->idle_sem);
         atomic_fetch_sub_explicit(&pool->idle_count, 1, memory_order_relaxed);
+        GOC_STATS_WORKER_STATUS((int)tl_worker->index, GOC_WORKER_RUNNING, (int)pool->live_count);
         continue;   /* re-check shutdown and try again */
 
 run:
@@ -379,8 +387,9 @@ run:
             atomic_store_explicit(&fe->parked, 1, memory_order_release);
 
         if (st == MCO_DEAD) {
-            if (fe != NULL)
+            if (fe != NULL) {
                 goc_fiber_root_unregister(fe->fiber_root_handle);
+            }
             mco_destroy(coro);
 
             uv_mutex_lock(&pool->drain_mutex);
@@ -391,10 +400,12 @@ run:
             uv_cond_broadcast(&pool->drain_cond);
             uv_mutex_unlock(&pool->drain_mutex);
 
+            GOC_STATS_WORKER_STATUS((int)tl_worker->index, GOC_WORKER_RUNNING, (int)pool->live_count);
             pool_dispatch_spawn_list(pool, admitted);
         }
     }
 
+    GOC_STATS_WORKER_STATUS((int)tl_worker->index, GOC_WORKER_STOPPED, 0);
     tl_worker = NULL;
 }
 
@@ -506,10 +517,11 @@ goc_pool* goc_pool_make(size_t threads) {
                     i + 1, threads, rc);
             abort();
         }
+        GOC_STATS_WORKER_STATUS((int)i, GOC_WORKER_CREATED, 0);
     }
 
+    GOC_STATS_POOL_STATUS(goc_box_int(pool), GOC_POOL_CREATED, (int)threads);
     registry_add(pool);
-
     return pool;
 }
 
@@ -519,6 +531,7 @@ goc_pool* goc_pool_make(size_t threads) {
 
 void goc_pool_destroy(goc_pool* pool) {
     pool_abort_if_called_from_worker(pool, "goc_pool_destroy");
+    GOC_STATS_POOL_STATUS(goc_box_int(pool), GOC_POOL_DESTROYED, (int)pool->thread_count);
 
     /* 1. Wait for all live fibers to exit (live_count reaches zero). */
     uv_mutex_lock(&pool->drain_mutex);

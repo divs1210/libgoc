@@ -12,6 +12,7 @@ struct goc_chan {
     size_t       buf_size;
     size_t       buf_head;
     size_t       buf_count;
+    size_t       item_count; /* number of items in buffer */
     goc_entry*   takers;
     goc_entry*   takers_tail;  /* last node in takers list; NULL when empty */
     goc_entry*   putters;

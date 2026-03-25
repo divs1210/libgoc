@@ -93,6 +93,7 @@ typedef enum {
 
 struct goc_entry {
     goc_entry_kind     kind;
+    uint64_t           id;             /* monotonically increasing fiber ID; assigned at creation */
     _Atomic int        cancelled;       /* set to 1 to cancel this entry (alts loser path) */
     _Atomic int        woken;           /* CAS 0→1 to claim wake; only one winner */
     _Atomic int*       fired;           /* shared fired flag for goc_alts; NULL otherwise */
@@ -120,6 +121,18 @@ struct goc_entry {
     void*              ud;
     void*              cb_result;   /* value delivered to take callback; reused as result_slot target for SYNC */
     void*              put_val;     /* value the putter wants to send */
+
+    /* Pending _cb channel operation.
+     *
+     * goc_put_cb / goc_take_cb post the entry directly to the loop queue
+     * instead of acquiring ch->lock inline.  The loop thread processes the
+     * channel operation under the lock on behalf of the caller.
+     *
+     * ch       — target channel; NULL once the entry is parked or resolved.
+     * is_put   — true = pending put (put_val is the value to send);
+     *            false = pending take (cb receives the value). */
+    struct goc_chan*   ch;
+    bool               is_put;
 
     /* Sync fields (GOC_SYNC) */
     goc_sync_t         sync_obj;

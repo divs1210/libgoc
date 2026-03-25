@@ -51,6 +51,7 @@ static inline int chan_put_to_buffer(goc_chan* ch, void* val) {
     size_t tail = (ch->buf_head + ch->buf_count) % ch->buf_size;
     ch->buf[tail] = val;
     ch->buf_count++;
+    ch->item_count++;
     return 1;
 }
 
@@ -59,6 +60,7 @@ static inline int chan_take_from_buffer(goc_chan* ch, void** out) {
     *out = ch->buf[ch->buf_head];
     ch->buf_head = (ch->buf_head + 1) % ch->buf_size;
     ch->buf_count--;
+    if (ch->item_count > 0) ch->item_count--;
     return 1;
 }
 
