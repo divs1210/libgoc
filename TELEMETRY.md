@@ -52,11 +52,12 @@
 | `GOC_POOL_DESTROYED`    | `1`   | Pool torn down   |
 
 ### Worker Events (`GOC_STATS_EVENT_WORKER_STATUS`)
-| Field          | Type  | Description                    |
-|----------------|-------|--------------------------------|
-| `id`           | `int` | Worker index                   |
-| `status`       | `int` | See `goc_stats_worker_status`  |
-| `pending_jobs` | `int` | Live fiber count in the pool   |
+| Field          | Type    | Description                    |
+|----------------|---------|--------------------------------|
+| `id`           | `int`   | Worker index                   |
+| `pool_id`      | `void*` | Pool pointer                   |
+| `status`       | `int`   | See `goc_stats_worker_status`  |
+| `pending_jobs` | `int`   | Live fiber count in the pool   |
 
 | `goc_stats_worker_status` | Value | Meaning                       |
 |---------------------------|-------|-------------------------------|
@@ -118,7 +119,7 @@ struct goc_stats_event {
 	uint64_t timestamp;
 	union {
 		struct { int id; int status; int thread_count; } pool;
-		struct { int id; int status; int pending_jobs; } worker;
+		struct { int id; void* pool_id; int status; int pending_jobs; } worker;
 		struct { int id; int last_worker_id; int status; } fiber;
 		struct { int id; int status; int buf_size; int item_count; } channel;
 	} data;
@@ -133,15 +134,15 @@ Macros emit events if telemetry is enabled, or become no-ops otherwise:
 #ifdef GOC_ENABLE_STATS
 #  define GOC_STATS_POOL_STATUS(id, status, thread_count) \
 	goc_stats_submit_event_pool((id), (status), (thread_count))
-#  define GOC_STATS_WORKER_STATUS(id, status, pending_jobs) \
-	goc_stats_submit_event_worker((id), (status), (pending_jobs))
+#  define GOC_STATS_WORKER_STATUS(id, pool_id, status, pending_jobs) \
+	goc_stats_submit_event_worker((id), (pool_id), (status), (pending_jobs))
 #  define GOC_STATS_FIBER_STATUS(id, last_worker_id, status) \
 	goc_stats_submit_event_fiber((id), (last_worker_id), (status))
 #  define GOC_STATS_CHANNEL_STATUS(id, status, buf_size, item_count) \
 	goc_stats_submit_event_channel((id), (status), (buf_size), (item_count))
 #else
 #  define GOC_STATS_POOL_STATUS(id, status, thread_count)            ((void)0)
-#  define GOC_STATS_WORKER_STATUS(id, status, pending_jobs)          ((void)0)
+#  define GOC_STATS_WORKER_STATUS(id, pool_id, status, pending_jobs) ((void)0)
 #  define GOC_STATS_FIBER_STATUS(id, last_worker_id, status)         ((void)0)
 #  define GOC_STATS_CHANNEL_STATUS(id, status, buf_size, item_count) ((void)0)
 #endif
@@ -165,16 +166,16 @@ Macros emit events if telemetry is enabled, or become no-ops otherwise:
 After `goc_stats_init()`, all events are printed to stdout by the built-in default callback. For a program that creates a pool, spawns a fiber, and shuts down, the output looks like:
 
 ```
-[goc_stats] WORKER @ 1748000000000000000: id=0 status=0 pending=0
-[goc_stats] WORKER @ 1748000000001000000: id=1 status=0 pending=0
+[goc_stats] WORKER @ 1748000000000000000: id=0 pool=0x55a1b2c3d000 status=0 pending=0
+[goc_stats] WORKER @ 1748000000001000000: id=1 pool=0x55a1b2c3d000 status=0 pending=0
 [goc_stats] POOL @ 1748000000002000000: pool=0x55a1b2c3d000 status=0 threads=2
 [goc_stats] FIBER @ 1748000000003000000: id=0 last_worker=-1 status=0
-[goc_stats] WORKER @ 1748000000004000000: id=0 status=1 pending=1
+[goc_stats] WORKER @ 1748000000004000000: id=0 pool=0x55a1b2c3d000 status=1 pending=1
 [goc_stats] FIBER @ 1748000000005000000: id=0 last_worker=0 status=1
-[goc_stats] WORKER @ 1748000000006000000: id=0 status=2 pending=0
+[goc_stats] WORKER @ 1748000000006000000: id=0 pool=0x55a1b2c3d000 status=2 pending=0
 [goc_stats] POOL @ 1748000000007000000: pool=0x55a1b2c3d000 status=1 threads=2
-[goc_stats] WORKER @ 1748000000008000000: id=0 status=3 pending=0
-[goc_stats] WORKER @ 1748000000009000000: id=1 status=3 pending=0
+[goc_stats] WORKER @ 1748000000008000000: id=0 pool=0x55a1b2c3d000 status=3 pending=0
+[goc_stats] WORKER @ 1748000000009000000: id=1 pool=0x55a1b2c3d000 status=3 pending=0
 ```
 
 See the [Event Types](#event-types) tables for status enum values.
@@ -205,7 +206,7 @@ int main(void) {
 ```c
 GOC_STATS_POOL_STATUS(goc_box_int(pool), GOC_POOL_CREATED, thread_count); // pool created
 GOC_STATS_POOL_STATUS(goc_box_int(pool), GOC_POOL_DESTROYED, thread_count); // pool destroyed
-GOC_STATS_WORKER_STATUS(worker_id, GOC_WORKER_RUNNING, pending_jobs);
+GOC_STATS_WORKER_STATUS(worker_id, pool, GOC_WORKER_RUNNING, pending_jobs);
 GOC_STATS_FIBER_STATUS(fiber_id, last_worker_id, GOC_FIBER_CREATED);
 GOC_STATS_CHANNEL_STATUS(goc_box_int(ch), 1, ch->buf_size, 0); // channel open
 GOC_STATS_CHANNEL_STATUS(goc_box_int(ch), 0, ch->buf_size, 0); // channel close

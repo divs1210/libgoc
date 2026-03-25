@@ -139,8 +139,9 @@ static void goc_stats_default_callback(const struct goc_stats_event *ev, void *u
                    ev->data.pool.id, ev->data.pool.status, ev->data.pool.thread_count);
             break;
         case GOC_STATS_EVENT_WORKER_STATUS:
-            printf("id=%d status=%d pending=%d\n",
-                   ev->data.worker.id, ev->data.worker.status, ev->data.worker.pending_jobs);
+            printf("id=%d pool=%p status=%d pending=%d\n",
+                   ev->data.worker.id, ev->data.worker.pool_id,
+                   ev->data.worker.status, ev->data.worker.pending_jobs);
             break;
         case GOC_STATS_EVENT_FIBER_STATUS:
             printf("id=%d last_worker=%d status=%d\n",
@@ -246,11 +247,12 @@ void goc_stats_submit_event_pool(void *id, int status, int thread_count) {
     goc_stats_dispatch(&ev);
 }
 
-void goc_stats_submit_event_worker(int id, int status, int pending_jobs) {
+void goc_stats_submit_event_worker(int id, void *pool_id, int status, int pending_jobs) {
     struct goc_stats_event ev;
     ev.type                     = GOC_STATS_EVENT_WORKER_STATUS;
     ev.timestamp                = goc_stats_now();
     ev.data.worker.id           = id;
+    ev.data.worker.pool_id      = pool_id;
     ev.data.worker.status       = status;
     ev.data.worker.pending_jobs = pending_jobs;
     goc_stats_dispatch(&ev);
