@@ -7,11 +7,11 @@
 
 #ifdef GOC_ENABLE_STATS
 
-static _Atomic int        stats_enabled  = 0;
-static _Atomic int        mutex_inited   = 0;
-static uv_mutex_t         g_cb_mutex;
-static goc_stats_callback g_cb  = NULL;
-static void*              g_cb_ud = NULL;
+static _Atomic int                  stats_enabled = 0;
+static _Atomic int                  mutex_inited  = 0;
+static uv_mutex_t                   g_cb_mutex;
+static _Atomic(goc_stats_callback)  g_cb          = NULL;
+static _Atomic(void*)               g_cb_ud       = NULL;
 
 static uint64_t goc_stats_now(void) {
     struct timespec ts;
@@ -22,12 +22,8 @@ static uint64_t goc_stats_now(void) {
 static void goc_stats_dispatch(const struct goc_stats_event* ev) {
     if (!atomic_load_explicit(&stats_enabled, memory_order_acquire)) return;
 
-    /* Read callback under lock, then call without holding it. */
-    uv_mutex_lock(&g_cb_mutex);
-    goc_stats_callback cb = g_cb;
-    void* ud               = g_cb_ud;
-    uv_mutex_unlock(&g_cb_mutex);
-
+    goc_stats_callback cb = atomic_load_explicit(&g_cb, memory_order_acquire);
+    void* ud              = atomic_load_explicit(&g_cb_ud, memory_order_relaxed);
     if (cb) cb(ev, ud);
 }
 
@@ -103,13 +99,8 @@ static void goc_stats_default_callback(const struct goc_stats_event* ev, void* u
 
 void goc_stats_set_callback(goc_stats_callback cb, void* ud) {
     uv_mutex_lock(&g_cb_mutex);
-    if (cb) {
-        g_cb = cb;
-        g_cb_ud = ud;
-    } else {
-        g_cb = NULL;
-        g_cb_ud = NULL;
-    }
+    atomic_store_explicit(&g_cb_ud, ud, memory_order_relaxed);
+    atomic_store_explicit(&g_cb,    cb, memory_order_release);
     uv_mutex_unlock(&g_cb_mutex);
 }
 
@@ -123,8 +114,8 @@ void goc_stats_init(void) {
         uv_mutex_init(&g_cb_mutex);
     }
     uv_mutex_lock(&g_cb_mutex);
-    g_cb = goc_stats_default_callback;
-    g_cb_ud = NULL;
+    atomic_store_explicit(&g_cb_ud, (void*)NULL,               memory_order_relaxed);
+    atomic_store_explicit(&g_cb,    goc_stats_default_callback, memory_order_release);
     uv_mutex_unlock(&g_cb_mutex);
     atomic_store_explicit(&stats_enabled, 1, memory_order_release);
 }
@@ -135,14 +126,11 @@ void goc_stats_shutdown(void) {
     /* Clear the callback under the lock so any thread that slipped past the
      * stats_enabled check above and is waiting on the mutex will read NULL
      * and call nothing after acquiring it. */
+    /* Clear the callback under the lock to serialise with set_callback. */
     uv_mutex_lock(&g_cb_mutex);
-    g_cb    = NULL;
-    g_cb_ud = NULL;
+    atomic_store_explicit(&g_cb,    NULL, memory_order_release);
+    atomic_store_explicit(&g_cb_ud, NULL, memory_order_relaxed);
     uv_mutex_unlock(&g_cb_mutex);
-    /* Do NOT destroy the mutex here. A thread that passed the stats_enabled
-     * check before shutdown ran may still be waiting to acquire it.
-     * Destroying the mutex while another thread is about to lock it causes
-     * libuv to abort. The mutex is a process-global and is reclaimed on exit. */
 }
 
 bool goc_stats_is_enabled(void) {

@@ -197,6 +197,23 @@ foreach(test_src IN LISTS TEST_SOURCES)
         set(GOC_LINK_TARGET goc)
     endif()
 
+    # test_goc_stats needs the full library compiled with GOC_ENABLE_STATS so
+    # that the instrumentation macros in pool.c, fiber.c, and channel.c are
+    # active.  When GOC_ENABLE_STATS is OFF the regular 'goc' library has them
+    # as no-ops, so build a dedicated variant and link against it instead.
+    if(test_name STREQUAL "test_goc_stats" AND NOT GOC_ENABLE_STATS)
+        if(NOT TARGET goc_stats_instrumented)
+            add_library(goc_stats_instrumented STATIC ${GOC_SOURCES} src/goc_stats.c)
+            goc_configure_target(goc_stats_instrumented)
+            target_compile_definitions(goc_stats_instrumented PRIVATE
+                GOC_ENABLE_STATS LIBGOC_STACK_SIZE=${LIBGOC_STACK_SIZE})
+            if(LIBGOC_VMEM)
+                target_compile_definitions(goc_stats_instrumented PRIVATE LIBGOC_VMEM_ENABLED)
+            endif()
+        endif()
+        set(GOC_LINK_TARGET goc_stats_instrumented)
+    endif()
+
     add_executable(${test_name} ${test_src} tests/test_harness.c)
 
     target_include_directories(${test_name} PRIVATE include src tests vendor/minicoro)
@@ -218,11 +235,11 @@ foreach(test_src IN LISTS TEST_SOURCES)
     target_compile_definitions(${test_name} PRIVATE LIBGOC_STACK_SIZE=${LIBGOC_STACK_SIZE})
 
     # test_goc_stats always runs with telemetry enabled, independent of the
-    # GOC_ENABLE_STATS option.  When the option is OFF, src/goc_stats.c is not
-    # part of the library, so it is added directly to the test executable so
-    # that the stats symbols and the GOC_ENABLE_STATS define are always present.
+    # GOC_ENABLE_STATS option.  The define is added here so that the test's
+    # own source (test_goc_stats.c) sees the stats API.  The library sources
+    # (pool.c, fiber.c, channel.c, goc_stats.c) are covered by the
+    # goc_stats_instrumented library built above.
     if(test_name STREQUAL "test_goc_stats" AND NOT GOC_ENABLE_STATS)
-        target_sources(${test_name} PRIVATE src/goc_stats.c)
         target_compile_definitions(${test_name} PRIVATE GOC_ENABLE_STATS)
     endif()
 
