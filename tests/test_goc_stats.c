@@ -293,6 +293,7 @@ static void noop_fiber(void* arg) { (void)arg; }
  */
 static void test_s2_1(void) {
     TEST_BEGIN("S2.1  goc_go emits FIBER_CREATED; completion emits FIBER_COMPLETED");
+    drain_pending_events();
     goc_go(noop_fiber, NULL);
 
     const struct goc_stats_event* created = find_any_fiber_created();
@@ -315,6 +316,7 @@ done:;
  */
 static void test_s2_2(void) {
     TEST_BEGIN("S2.2  worker transitions to GOC_WORKER_IDLE after fiber completes");
+    drain_pending_events();
     goc_go(noop_fiber, NULL);
 
     const struct goc_stats_event* created = find_any_fiber_created();
@@ -337,6 +339,7 @@ done:;
  */
 static void test_s2_3(void) {
     TEST_BEGIN("S2.3  goc_pool_make emits GOC_WORKER_CREATED per thread");
+    drain_pending_events();
     goc_pool* pool = NULL;
     pool = goc_pool_make(2);
 
@@ -368,6 +371,7 @@ done:
  */
 static void test_s2_4(void) {
     TEST_BEGIN("S2.4  pool creation and destruction events");
+    drain_pending_events();
     goc_pool* pool = goc_pool_make(3);
     void* pool_id = pool;
     const struct goc_stats_event* create_ev = NULL;
