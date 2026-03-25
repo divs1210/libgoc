@@ -17,8 +17,13 @@
  *
  * Result delivery
  * ---------------
- * All callbacks (one-shot and streaming) use goc_put_cb() so the event loop
- * thread is never blocked waiting for a fiber to consume a result.
+ * All one-shot callbacks deliver their result via goc_put_cb() with a
+ * close_on_put completion callback.  goc_put_cb() is non-blocking: it posts
+ * the put to the MPSC queue for the loop thread to process.  The loop thread
+ * delivers the value to any parked fiber taker (or buffers it) and then
+ * fires close_on_put, which calls goc_close().  This ordering guarantees
+ * that the channel is never closed before the value is delivered, regardless
+ * of which thread runs the I/O callback.
  *
  * Scalar vs. struct results
  * -------------------------
@@ -32,9 +37,9 @@
  * goc_chan* pointers stored inside malloc-allocated libuv context structs
  * are invisible to Boehm GC.  Every channel-returning function calls
  * uv_handle_chan_register(ch) after submitting the request; every callback
- * calls uv_handle_chan_unregister(ch) before goc_close(ch).  This keeps the
- * channel in a GC-visible array (live_uv_handles in gc.c) for the duration
- * of the pending I/O.
+ * calls uv_handle_chan_unregister(ch) before goc_put_cb().  The channel
+ * remains in the GC-visible array (live_uv_handles in gc.c) until
+ * close_on_put fires goc_close(), at which point chan_unregister removes it.
  */
 
 #include <stdlib.h>

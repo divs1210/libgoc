@@ -6,7 +6,7 @@
 
 **libgoc** is a runtime library for C programs that want Go-style CSP concurrency backed by a managed memory environment. It is written in plain C for maximum reach and portability.
 
-The library provides stackful coroutines ("fibers"), channels, a select primitive (`goc_alts`), timeout channels, and a managed thread pool. Boehm GC is a required dependency and is linked automatically.
+The library provides stackful coroutines ("fibers"), channels, a select primitive (`goc_alts`), timeout channels, a managed thread pool, and optional runtime telemetry (`goc_stats`). Boehm GC is a required dependency and is linked automatically.
 
 **libgoc is built for:**
 
