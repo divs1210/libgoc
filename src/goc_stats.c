@@ -7,7 +7,8 @@
 
 #ifdef GOC_ENABLE_STATS
 
-static _Atomic int        stats_enabled = 0;
+static _Atomic int        stats_enabled  = 0;
+static _Atomic int        mutex_inited   = 0;
 static uv_mutex_t         g_cb_mutex;
 static goc_stats_callback g_cb  = NULL;
 static void*              g_cb_ud = NULL;
@@ -114,7 +115,13 @@ void goc_stats_set_callback(goc_stats_callback cb, void* ud) {
 
 void goc_stats_init(void) {
     if (atomic_load_explicit(&stats_enabled, memory_order_acquire)) return;
-    uv_mutex_init(&g_cb_mutex);
+    /* Initialize the mutex exactly once across init/shutdown cycles. */
+    int expected = 0;
+    if (atomic_compare_exchange_strong_explicit(
+            &mutex_inited, &expected, 1,
+            memory_order_acq_rel, memory_order_acquire)) {
+        uv_mutex_init(&g_cb_mutex);
+    }
     uv_mutex_lock(&g_cb_mutex);
     g_cb = goc_stats_default_callback;
     g_cb_ud = NULL;
@@ -123,12 +130,19 @@ void goc_stats_init(void) {
 }
 
 void goc_stats_shutdown(void) {
+    /* Disable delivery first so new callers short-circuit before locking. */
     atomic_store_explicit(&stats_enabled, 0, memory_order_release);
+    /* Clear the callback under the lock so any thread that slipped past the
+     * stats_enabled check above and is waiting on the mutex will read NULL
+     * and call nothing after acquiring it. */
     uv_mutex_lock(&g_cb_mutex);
     g_cb    = NULL;
     g_cb_ud = NULL;
     uv_mutex_unlock(&g_cb_mutex);
-    uv_mutex_destroy(&g_cb_mutex);
+    /* Do NOT destroy the mutex here. A thread that passed the stats_enabled
+     * check before shutdown ran may still be waiting to acquire it.
+     * Destroying the mutex while another thread is about to lock it causes
+     * libuv to abort. The mutex is a process-global and is reclaimed on exit. */
 }
 
 bool goc_stats_is_enabled(void) {

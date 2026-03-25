@@ -546,9 +546,12 @@ int main(void) {
     test_s4_1();
     printf("\n");
 
+    /* Shut down the runtime before destroying the event buffer mutex/cond.
+     * goc_shutdown() waits for all worker threads to stop, guaranteeing no
+     * in-flight collect_event callback can race with the uv_mutex_destroy. */
+    goc_shutdown();
     uv_cond_destroy(&g_event_cond);
     uv_mutex_destroy(&g_event_mutex);
-    goc_shutdown();
 
     printf("=======================================\n");
     printf("Results: %d/%d passed", g_tests_passed, g_tests_run);
