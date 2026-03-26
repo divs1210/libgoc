@@ -32,11 +32,12 @@ A prioritized roadmap for improving throughput, tail latency, memory efficiency,
 
 Based on `bench/libgoc/README.md` results (canary mode, pool=1–8):
 
-- **Spawn idle** gap has closed significantly: canary now reaches 84k–166k tasks/s (up from ~18k previously), reflecting recent scheduler improvements. Still below Go parity but no longer the dominant deficit.
+- **Spawn idle** canary: 120k–157k tasks/s across pool sizes (pool=8 is 120k, slightly below pool=1–4 range). Still below Go parity but no longer the dominant deficit.
 - **Ring** now exceeds 1M hops/s at pool=8 (~0.44× Go). Scheduler/handoff costs are reduced but non-trivial; further gains remain possible.
-- **Fan-out/fan-in** peaks at pool=4 (258k msg/s) and dips slightly at pool=8 (238k msg/s). Contention exists but the scaling pattern is non-monotonic, not a straight degradation.
-- **Prime sieve** peaks at pool=4 (2821 primes/s) and dips slightly at pool=8 (2577 primes/s) — it is not competitive only at pool=1; throughput improves up to pool=4.
-- **vmem mode** behaves as a bounded-correctness/stress configuration: ring in particular is 20–40× slower than canary due to TLB/page-fault pressure. vmem is not a target for performance parity work.
+- **Fan-out/fan-in** canary: 188k–214k msg/s, with pool=4 dipping to the lowest (189k). The scaling pattern is non-monotonic, indicating cross-worker contention.
+- **Prime sieve** canary: ~2.5k–2.8k primes/s, competitive with Clojure (0.49× Go geomean). Beats Go at pool=1 (1.54×).
+- **vmem spawn idle** was previously broken at pool=8 (18k tasks/s stall caused by a wakeup-drop bug in `goc_close`). Now fixed and consistent at ~64–65k tasks/s across all pool sizes.
+- **vmem mode** otherwise behaves as a bounded-correctness/stress configuration: ring in particular is 20–40× slower than canary due to TLB/page-fault pressure. vmem is not a target for performance parity work.
 - **Timeout/callback-heavy workloads are not yet explicitly benchmarked**, so those optimizations remain important but lower-confidence until coverage is added.
 
 ### Phase 0 telemetry baseline (canary, `GOC_ENABLE_STATS=1`, 2026-03-26)
@@ -126,6 +127,16 @@ All Phase 0 instrumentation gaps have been filled:
 - **Benchmark stats output**: `bench_print_stats()` helper in `bench/libgoc/bench.c` prints a one-line summary of all three accessor values at the end of each benchmark.
 
 See `TELEMETRY.md` for the updated API reference.
+
+### Phase 0.1 — Channel hot-path lock-release optimization (Completed)
+
+Motivated by a flakiness fix (P6.22), the `goc_take` / `goc_put` hot paths and `goc_close` were refactored to release `ch->lock` **before** spinning on `fe->parked`:
+
+- **`wake_claim`** (`channel.c`): new helper that does everything `wake()` does for `GOC_FIBER` entries except the spin and post. Returns the fiber's `fe` pointer so the caller can unlock before spinning. Non-fiber entries (`GOC_CALLBACK`, `GOC_SYNC`) are dispatched inline as before.
+- **`goc_take` / `goc_put` fast paths** (`channel.c`): switched from `chan_take_from_putter` / `chan_put_to_taker` to `chan_take_from_putter_claim` / `chan_put_to_taker_claim` (defined in `channel_internal.h`), which use `wake_claim` and return the `fe` to spin+post after the unlock.
+- **`goc_close` collect-then-dispatch** (`channel.c`): replaced the previous lock-held spin loop with a two-phase approach. Under the lock, all non-cancelled entries are claimed and `GOC_FIBER` entries are collected into a heap-allocated `to_post` array (sized exactly to the waiter count — a fixed-size stack array was rejected because a cap silently drops wakeups for large closes). After the lock is released, each collected entry is spun on and posted. `GOC_CALLBACK` and `GOC_SYNC` entries are still dispatched inline under the lock.
+
+**Benchmark impact** (canary vs. prior baseline, geomean across pool sizes): ≈flat (−2% overall). vmem spawn idle improved 3.5× at pool=8, resolving a stall caused by a wakeup-drop bug introduced alongside the Phase B changes (fixed-size `to_post[512]` silently dropped wakeups for 200k-fiber closes).
 
 ---
 
