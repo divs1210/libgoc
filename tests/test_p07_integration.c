@@ -537,6 +537,22 @@ static void test_p7_5_worker_fn(void* arg) {
     goc_put(a->result_ch, goc_box_uint(a->value));
 }
 
+typedef struct {
+    p7_5_worker_args_t* args;
+    goc_chan* blocked_ch;
+} fast_fiber_args_t;
+
+static void fast_fiber_wrapper(void* arg) {
+    fast_fiber_args_t* ffa = (fast_fiber_args_t*)arg;
+    if (ffa->args->ready_ch) {
+        goc_put(ffa->args->ready_ch, NULL);
+    }
+    // Signal after the fast fiber is about to block on result_ch
+    goc_put(ffa->blocked_ch, NULL);
+    goc_take(goc_timeout(ffa->args->delay_ms));
+    goc_put(ffa->args->result_ch, goc_box_uint(ffa->args->value));
+}
+
 /*
  * P7.5 — Timeout + cancellation: slower fiber's result discarded cleanly
  *
@@ -572,22 +588,6 @@ static void test_p7_5(void) {
         .delay_ms  = P7_5_SLOW_DELAY_MS,
         .value     = 0xDEAD,
     };
-
-    typedef struct {
-        p7_5_worker_args_t* args;
-        goc_chan* blocked_ch;
-    } fast_fiber_args_t;
-
-    void fast_fiber_wrapper(void* arg) {
-        fast_fiber_args_t* ffa = (fast_fiber_args_t*)arg;
-        if (ffa->args->ready_ch) {
-            goc_put(ffa->args->ready_ch, NULL);
-        }
-        // Signal after the fast fiber is about to block on result_ch
-        goc_put(ffa->blocked_ch, NULL);
-        goc_take(goc_timeout(ffa->args->delay_ms));
-        goc_put(ffa->args->result_ch, goc_box_uint(ffa->args->value));
-    }
 
     fast_fiber_args_t fast_fiber_args = { .args = &fast_args, .blocked_ch = fast_blocked_ch };
     goc_chan* fast_join = goc_go(fast_fiber_wrapper, &fast_fiber_args);
