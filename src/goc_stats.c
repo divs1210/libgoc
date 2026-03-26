@@ -25,6 +25,7 @@
 typedef struct stats_node {
     _Atomic(struct stats_node *) next;
     struct goc_stats_event       ev;
+    bool                         is_barrier;
 } stats_node;
 
 static _Atomic(stats_node *) g_sq_head;   /* producers exchange here */
@@ -48,13 +49,14 @@ static void sq_push(stats_node *node) {
 /* Pop on the loop thread only.
  * Copies the event into *out, frees the old sentinel, returns true.
  * Returns false when the queue is empty (g_sq_tail->next == NULL). */
-static bool sq_pop(struct goc_stats_event *out) {
+static bool sq_pop(struct goc_stats_event *out, bool *is_barrier) {
     stats_node *tail = g_sq_tail;
     stats_node *next = atomic_load_explicit(&tail->next, memory_order_acquire);
     if (!next) return false;
-    *out      = next->ev;  /* copy before advancing */
-    g_sq_tail = next;      /* next is now the new sentinel */
-    free(tail);            /* old sentinel is no longer referenced */
+    *out        = next->ev;  /* copy before advancing */
+    *is_barrier = next->is_barrier;
+    g_sq_tail   = next;      /* next is now the new sentinel */
+    free(tail);              /* old sentinel is no longer referenced */
     return true;
 }
 
@@ -80,7 +82,6 @@ static uv_mutex_t                   g_close_mutex;
 static uv_cond_t                    g_close_cond;
 static int                          g_close_done     = 0;
 
-static _Atomic int                  g_flush_pending  = 0;
 static uv_mutex_t                   g_flush_mutex;
 static uv_cond_t                    g_flush_cond;
 static int                          g_flush_done     = 0;
@@ -95,14 +96,19 @@ static uint64_t goc_stats_now(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-/* Drain the queue and fire the callback for each event. Loop thread only. */
-static void stats_drain(void) {
+/* Drain the queue and fire the callback for each event. Loop thread only.
+ * Returns true if a flush barrier was consumed. */
+static bool stats_drain(void) {
     goc_stats_callback cb = atomic_load_explicit(&g_cb, memory_order_acquire);
     void *ud              = atomic_load_explicit(&g_cb_ud, memory_order_relaxed);
     struct goc_stats_event ev;
-    while (sq_pop(&ev)) {
+    bool saw_barrier = false;
+    bool is_barrier;
+    while (sq_pop(&ev, &is_barrier)) {
+        if (is_barrier) { saw_barrier = true; continue; }
         if (cb) cb(&ev, ud);
     }
+    return saw_barrier;
 }
 
 static void stats_on_close(uv_handle_t *h) {
@@ -117,9 +123,9 @@ static void stats_on_close(uv_handle_t *h) {
 
 /* Loop-thread callback: drain events; signal flush waiters; handle close. */
 static void stats_on_async(uv_async_t *h) {
-    stats_drain();
+    bool flushed = stats_drain();
 
-    if (atomic_exchange_explicit(&g_flush_pending, 0, memory_order_acq_rel)) {
+    if (flushed) {
         uv_mutex_lock(&g_flush_mutex);
         g_flush_done = 1;
         uv_cond_signal(&g_flush_cond);
@@ -263,7 +269,8 @@ static void goc_stats_dispatch(const struct goc_stats_event *ev) {
 
     stats_node *node = (stats_node *)malloc(sizeof(stats_node));
     if (!node) return;
-    node->ev = *ev;
+    node->ev         = *ev;
+    node->is_barrier = false;
 
     sq_push(node);
     uv_async_send(g_stats_async);
@@ -327,7 +334,11 @@ void goc_stats_flush(void) {
     g_flush_done = 0;
     uv_mutex_unlock(&g_flush_mutex);
 
-    atomic_store_explicit(&g_flush_pending, 1, memory_order_release);
+    /* Push a barrier sentinel; flush-done fires only when it is dequeued. */
+    stats_node *barrier = (stats_node *)malloc(sizeof(stats_node));
+    atomic_store_explicit(&barrier->next, NULL, memory_order_relaxed);
+    barrier->is_barrier = true;
+    sq_push(barrier);
     uv_async_send(g_stats_async);
 
     uv_mutex_lock(&g_flush_mutex);
