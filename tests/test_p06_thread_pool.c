@@ -1622,7 +1622,7 @@ done:;
 
 /* Minimal local event buffer for P6.24 / P6.25.
  * We install a temporary callback, run the pool, then restore the old one. */
-#define P6_STEAL_EV_CAP 512
+#define P6_STEAL_EV_CAP 1024
 
 typedef struct {
     struct goc_stats_event buf[P6_STEAL_EV_CAP];
