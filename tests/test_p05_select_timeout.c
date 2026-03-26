@@ -961,6 +961,10 @@ static void test_p5_14_fiber_fn(void* arg) {
  */
 static void test_p5_14(void) {
     TEST_BEGIN("P5.14  goc_alts: single wake when multiple channels close");
+    /* P5.10 and P5.13 each allocate a goc_timeout channel, leaving the event
+     * loop backlogged with stats events.  Flush before the fiber parks so the
+     * loop is uncontested when goc_alts needs to schedule the fiber. */
+    goc_stats_flush();
     done_t ready, done;
     done_init(&ready);
     done_init(&done);
@@ -1060,7 +1064,10 @@ static void test_p5_16_fiber_fn(void* arg) {
  */
 static void test_p5_16(void) {
     TEST_BEGIN("P5.16  alts close event: taker_scans >= 1 after parked take arm");
-
+    /* Preceding tests (P5.10, P5.13, P5.14) saturate the event loop with stats
+     * events.  Flush before the fiber parks so the 5 ms sleep is sufficient for
+     * goc_alts to reach mco_yield on an uncontested loop. */
+    goc_stats_flush();
     goc_chan* ch = goc_chan_make(0);
     ASSERT(ch != NULL);
 
