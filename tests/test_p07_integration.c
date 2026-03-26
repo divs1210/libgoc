@@ -517,8 +517,8 @@ done:;
  */
 
 #define P7_5_FAST_DELAY_MS    0
-#define P7_5_SLOW_DELAY_MS  150
-#define P7_5_TIMEOUT_MS      80
+#define P7_5_SLOW_DELAY_MS  1000
+#define P7_5_TIMEOUT_MS      500
 
 typedef struct {
     goc_chan*  result_ch;
