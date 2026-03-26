@@ -13,6 +13,10 @@
 
 /* channel.c -> used by alts.c, mutex.c */
 bool wake(goc_chan* ch, goc_entry* e, void* value);
+/* Claims e for wake.  Returns true on success.  For GOC_FIBER, sets *fe_out
+ * to the fiber entry the caller must spin+post after releasing ch->lock;
+ * for all other kinds dispatches immediately and sets *fe_out = NULL. */
+bool wake_claim(goc_chan* ch, goc_entry* e, void* value, goc_entry** fe_out);
 void compact_dead_entries(goc_chan* ch);
 void chan_set_on_close(goc_chan* ch, void (*on_close)(void*), void* ud);
 
@@ -113,6 +117,72 @@ static inline int chan_take_from_putter(goc_chan* ch, void** out) {
             *out = val;
             *pp = next;
             if (next == NULL) ch->putters_tail = NULL;
+            return 1;
+        }
+        *pp = next;
+        if (next == NULL) ch->putters_tail = NULL;
+    }
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * chan_put_to_taker_claim — like chan_put_to_taker but uses wake_claim().
+ *
+ * On success returns 1 and sets *fe_out to the fiber entry that the caller
+ * must spin+post after releasing ch->lock (NULL for non-fiber takers).
+ * Caller must unlock ch->lock before spinning.
+ * -------------------------------------------------------------------------- */
+static inline int chan_put_to_taker_claim(goc_chan* ch, void* val,
+                                          goc_entry** fe_out)
+{
+    goc_entry** pp = &ch->takers;
+    while (*pp) {
+        goc_entry* e = *pp;
+        if (atomic_load_explicit(&e->cancelled, memory_order_acquire)) {
+            *pp = e->next;
+            if (*pp == NULL) ch->takers_tail = NULL;
+            continue;
+        }
+        goc_entry* next = e->next;
+        goc_entry* fe = NULL;
+        if (wake_claim(ch, e, val, &fe)) {
+            *pp = next;
+            if (next == NULL) ch->takers_tail = NULL;
+            *fe_out = fe;
+            return 1;
+        }
+        *pp = next;
+        if (next == NULL) ch->takers_tail = NULL;
+    }
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * chan_take_from_putter_claim — like chan_take_from_putter but uses wake_claim().
+ *
+ * On success returns 1, writes the putter's value to *out, and sets *fe_out
+ * to the fiber entry that the caller must spin+post after releasing ch->lock
+ * (NULL for non-fiber putters).
+ * -------------------------------------------------------------------------- */
+static inline int chan_take_from_putter_claim(goc_chan* ch, void** out,
+                                              goc_entry** fe_out)
+{
+    goc_entry** pp = &ch->putters;
+    while (*pp) {
+        goc_entry* e = *pp;
+        if (atomic_load_explicit(&e->cancelled, memory_order_acquire)) {
+            *pp = e->next;
+            if (*pp == NULL) ch->putters_tail = NULL;
+            continue;
+        }
+        void* val = e->put_val;
+        goc_entry* next = e->next;
+        goc_entry* fe = NULL;
+        if (wake_claim(ch, e, NULL, &fe)) {
+            *out = val;
+            *pp = next;
+            if (next == NULL) ch->putters_tail = NULL;
+            *fe_out = fe;
             return 1;
         }
         *pp = next;

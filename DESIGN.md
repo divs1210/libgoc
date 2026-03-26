@@ -344,7 +344,11 @@ struct goc_chan {
 
 1. **CAS:** attempt to flip `close_guard` from `0` to `1` with `acq_rel` ordering.
 2. **Loser path:** if the CAS fails, another caller already owns teardown — return immediately. No pointer is read, no lock is attempted.
-3. **Winner path:** acquire `ch->lock`, set `ch->closed = 1`, wake all parked takers and putters with `ok==GOC_CLOSED`, release the lock, call `chan_unregister`. **The mutex is left valid and intact** — ownership of `ch->lock` passes to the shutdown sweep in Step 2b.
+3. **Winner path:** acquire `ch->lock`, set `ch->closed = 1`, collect all fiber entries to wake, release the lock, spin+post each collected entry, call `chan_unregister`. **The mutex is left valid and intact** — ownership of `ch->lock` passes to the shutdown sweep in Step 2b.
+
+   `goc_close` uses a **collect-then-dispatch** protocol to avoid holding `ch->lock` during the spin on `fe->parked`. Under the lock it walks both `takers` and `putters`, calling `try_claim_wake` on each non-cancelled entry and collecting the `goc_entry*` (obtained via `mco_get_user_data(e->coro)`) for every `GOC_FIBER` entry into a heap-allocated `to_post` array. Non-fiber entries (`GOC_CALLBACK`, `GOC_SYNC`) are dispatched inline while the lock is still held, as their dispatch paths do not spin. After all entries are claimed, the lock is released, and the collected fiber entries are spun on and posted to the run queue one by one.
+
+   The `to_post` array is heap-allocated (via `goc_malloc`) sized exactly to the number of non-cancelled waiters counted in a pre-pass. A fixed-size stack array must not be used — for large closes (e.g. 200k parked fibers in `bench_spawn_idle`) a cap silently drops wakeups, leaving fibers permanently suspended.
 
    When iterating takers and putters, `goc_close` must skip any entry where `e->cancelled == 1` **before** calling `try_claim_wake`. Cancelled entries belong to `goc_alts` losers whose coroutine is already `MCO_DEAD`; winning the CAS on such an entry and calling `post_to_run_queue` would call `mco_resume` on a dead coroutine, producing a SIGSEGV. This is the same guard applied by `wake()` and must be kept consistent with it.
 
@@ -423,10 +427,12 @@ typedef struct goc_entry {
      *   pool_worker_fn (after mco_resume returns):
      *     Sets fiber_entry->parked = 1.
      *
-     *   wake() and goc_close() (GOC_FIBER case):
+     *   wake(), wake_claim() callers, and goc_close() (GOC_FIBER case):
      *     Spin with sched_yield() while fiber_entry->parked == 0 before
      *     calling post_to_run_queue.  Guarantees the coroutine is truly
-     *     MCO_SUSPENDED before any worker calls mco_resume. */
+     *     MCO_SUSPENDED before any worker calls mco_resume.
+     *     wake() spins while still holding ch->lock; wake_claim() callers
+     *     and goc_close() release the lock first, then spin. */
     _Atomic int       parked;       /* per-fiber yield-gate; see protocol above */
 } goc_entry;
 ```
@@ -641,6 +647,8 @@ Non-blocking attempt to receive from a channel. Returns immediately under lock w
 
 ### Unified Wakeup
 
+#### `wake` — claim and dispatch under lock
+
 ```c
 bool wake(goc_chan* ch, goc_entry* e, void* value) {
     /* acquire ordering: see the full write that set `cancelled` before deciding to skip */
@@ -676,11 +684,26 @@ bool wake(goc_chan* ch, goc_entry* e, void* value) {
 }
 ```
 
+#### `wake_claim` — claim under lock, defer spin+post to caller
+
+For call sites that must release `ch->lock` **before** spinning on `fe->parked` (to avoid holding the lock during a potentially long spin), `wake_claim` performs everything `wake` does except the spin and post for `GOC_FIBER` entries. Instead it returns the fiber's `goc_entry*` (`fe`) via an out-parameter, and the caller is responsible for the spin+post after unlocking:
+
+```c
+bool wake_claim(goc_chan* ch, goc_entry* e, void* value, goc_entry** fe_out);
+
+// Caller contract for a non-NULL *fe_out:
+//   1. Release ch->lock.
+//   2. Spin: while (atomic_load(&fe->parked, acquire) == 0) sched_yield();
+//   3. post_to_run_queue(fe->pool, fe);
+```
+
+`GOC_CALLBACK` and `GOC_SYNC` entries are dispatched inline inside `wake_claim` (those paths do not spin), and `*fe_out` is set to `NULL` for them. `wake_claim` is used by `goc_take`, `goc_put`, and `goc_close` so that the channel lock is never held during the yield-gate spin.
+
 At the **top of `goc_take` and `goc_put`**, immediately after acquiring the lock, if `dead_count >= GOC_DEAD_COUNT_THRESHOLD`, walk both `takers` and `putters` and unlink every entry where `cancelled == 1`, then reset `dead_count` to 0. This amortises list cleanup without requiring inline removal at cancellation time. `compact_dead_entries` also repairs both tail pointers, so that append is O(1) again after a compaction sweep.
 
 > **O(1) tail append via `chan_list_append`.** All slow-path append sites (`goc_take`, `goc_put`, `goc_alts`, `goc_take_cb`, `goc_put_cb`) use the `chan_list_append` helper (declared in `channel_internal.h`) instead of walking to the tail. The helper appends in O(1) when `takers_tail` / `putters_tail` is valid; it falls back to an O(N) repair walk only when the tail pointer has been invalidated by a prior removal. Removal operations in `chan_put_to_taker` and `chan_take_from_putter` invalidate the tail pointer when they remove the last remaining entry (detected by `next == NULL` after removal). Without this optimisation, `bench_spawn_idle` with N fibers all parking on a single channel performed O(N²) work during the spawn phase (N entries each requiring a full traversal), making 200k fibers take hundreds of seconds instead of tens.
 
-> **`e->next` must be saved before calling `wake()` in the splice helpers, and before any dispatch call in `goc_close`.** `chan_put_to_taker` and `chan_take_from_putter` both splice the woken entry out of its list with `*pp = e->next`. For `GOC_FIBER` entries, `wake()` can resume the waiter immediately on another worker. After that dispatch, the transient parked entry may become unreachable and collectable, so reading `e->next` is unsafe. The fix is to snapshot `next = e->next` *before* calling `wake()`, while `ch->lock` is still held (the lock prevents concurrent modification of the list), then use `next` for the splice after `wake()` returns. The same hazard applies to `goc_close`, whose loops are therefore written as `while (e != NULL) { goc_entry* next = e->next; ..dispatch..; e = next; }`. This pattern must be preserved in any future modification of these helpers and of `goc_close`.
+> **`e->next` must be saved before calling `wake()` or `wake_claim()` in the splice helpers, and before any claim call in `goc_close`.** `chan_put_to_taker_claim` and `chan_take_from_putter_claim` both splice the woken entry out of its list with `*pp = e->next`. For `GOC_FIBER` entries, `wake()` (which spins+posts while holding the lock) can allow another worker to resume the fiber immediately. After dispatch, the transient parked entry may become unreachable and collectable, so reading `e->next` is unsafe. The fix is to snapshot `next = e->next` *before* calling `wake()` or `wake_claim()`, while `ch->lock` is still held (the lock prevents concurrent modification of the list), then use `next` for the splice. `goc_close` iterates with `while (e != NULL) { goc_entry* next = e->next; ..claim..; e = next; }`. This pattern must be preserved in any future modification of these helpers and of `goc_close`.
 
 > **Why not `dead_count > buf_count + GOC_DEAD_COUNT_THRESHOLD`?** Scaling the threshold by `buf_count` would delay compaction dramatically on heavily-buffered channels — a channel with 1 024 buffered slots would accumulate 1 032 dead entries before a sweep. Comparing against a fixed threshold bounds the maximum number of stale entries regardless of buffer capacity.
 

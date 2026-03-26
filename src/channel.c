@@ -91,6 +91,52 @@ bool wake(goc_chan* ch, goc_entry* e, void* value)
 }
 
 /* --------------------------------------------------------------------------
+ * wake_claim
+ *
+ * Like wake(), but for GOC_FIBER entries does NOT spin or post. Instead it
+ * returns the fiber's goc_entry (fe) so the caller can release ch->lock
+ * before spinning.  For GOC_CALLBACK and GOC_SYNC it dispatches immediately
+ * (those paths have no spin) and returns NULL.
+ *
+ * Caller contract for a non-NULL return value:
+ *   1. Release ch->lock.
+ *   2. Spin: while (atomic_load(&fe->parked, acquire) == 0) sched_yield();
+ *   3. post_to_run_queue(fe->pool, fe);
+ * -------------------------------------------------------------------------- */
+bool wake_claim(goc_chan* ch, goc_entry* e, void* value, goc_entry** fe_out)
+{
+    *fe_out = NULL;
+
+    if (atomic_load_explicit(&e->cancelled, memory_order_acquire)) {
+        ch->dead_count++;
+        return false;
+    }
+
+    if (!try_claim_wake(e)) {
+        ch->dead_count++;
+        return false;
+    }
+
+    if (e->result_slot != NULL)
+        *e->result_slot = value;
+
+    e->ok = GOC_OK;
+
+    switch (e->kind) {
+    case GOC_FIBER:
+        *fe_out = (goc_entry*)mco_get_user_data(e->coro);
+        return true;
+    case GOC_CALLBACK:
+        post_callback(e, value);
+        return true;
+    case GOC_SYNC:
+        goc_sync_post(e->sync_sem_ptr);
+        return true;
+    }
+    return true; /* unreachable */
+}
+
+/* --------------------------------------------------------------------------
  * compact_dead_entries
  *
  * Must be called with ch->lock held. Walks both takers and putters lists
@@ -192,42 +238,6 @@ void chan_set_on_close(goc_chan* ch, void (*on_close)(void*), void* ud)
 }
 
 /* -------------------------------------------------------------------------
- * wake_all_parked_entries — Wake all entries in a waiter list with GOC_CLOSED
- *
- * Called by goc_close() to wake all parked entries. Skips cancelled entries
- * (goc_alts losers whose coroutines are already MCO_DEAD).
- * ---------------------------------------------------------------------- */
-static void wake_all_parked_entries(goc_entry* head) {
-    goc_entry* e = head;
-    while (e != NULL) {
-        /* Snapshot next before any dispatch: for GOC_FIBER entries,
-         * post_to_run_queue may allow a pool thread to resume the fiber
-         * immediately, and the parked entry can become unreachable/collected
-         * before we iterate again. Reading e->next after dispatch is unsafe. */
-        goc_entry* next = e->next;
-        /* Skip cancelled entries (goc_alts losers): their coroutine is
-         * already dead; calling post_to_run_queue on it would resume a
-         * MCO_DEAD coro and crash.  This mirrors the same guard in wake(). */
-        if (!atomic_load_explicit(&e->cancelled, memory_order_acquire)) {
-            if (try_claim_wake(e)) {
-                e->ok = GOC_CLOSED;
-                switch (e->kind) {
-                case GOC_FIBER: {
-                    goc_entry* fe = (goc_entry*)mco_get_user_data(e->coro);
-                    while (atomic_load_explicit(&fe->parked, memory_order_acquire) == 0)
-                        sched_yield();
-                    post_to_run_queue(fe->pool, fe);
-                    break;
-                }
-                case GOC_CALLBACK: post_callback(e, NULL);        break;
-                case GOC_SYNC:     goc_sync_post(e->sync_sem_ptr);     break;
-                }
-            }
-        }
-        e = next;
-    }
-}
-
 /* --------------------------------------------------------------------------
  * goc_close
  *
@@ -249,33 +259,67 @@ void goc_close(goc_chan* ch)
     uv_mutex_lock(ch->lock);
     ch->closed = 1;
 
-    /* Count non-cancelled waiters before waking — entries may be stack-allocated
-     * (GOC_SYNC) and freed by their owner thread the moment we post the semaphore,
-     * so we must not read them after wake_all_parked_entries. */
-#ifdef GOC_ENABLE_STATS
-    uint64_t close_removed = 0;
+    /* Count non-cancelled waiters: used for the to_post heap allocation and
+     * (when GOC_ENABLE_STATS) for the close telemetry counter.  Entries may
+     * be stack-allocated (GOC_SYNC) and freed the moment we post them, so we
+     * must not read them after the wake loop. */
+    size_t waiter_count = 0;
     for (goc_entry* e = ch->takers; e != NULL; e = e->next)
         if (!atomic_load_explicit(&e->cancelled, memory_order_acquire))
-            close_removed++;
+            waiter_count++;
     for (goc_entry* e = ch->putters; e != NULL; e = e->next)
         if (!atomic_load_explicit(&e->cancelled, memory_order_acquire))
-            close_removed++;
+            waiter_count++;
+#ifdef GOC_ENABLE_STATS
+    uint64_t close_removed = (uint64_t)waiter_count;
 #endif
 
-    /* Wake all parked takers with GOC_CLOSED */
-    wake_all_parked_entries(ch->takers);
+    /* Collect GOC_FIBER entries to post after lock release.
+     * Heap-allocate sized to the exact waiter count so no entry is dropped. */
+    goc_entry** to_post = waiter_count ? goc_malloc(sizeof(goc_entry*) * waiter_count) : NULL;
+    size_t to_post_count = 0;
+    int cancelled_found = 0;
+    for (int _pass = 0; _pass < 2; _pass++) {
+        goc_entry* e = (_pass == 0) ? ch->takers : ch->putters;
+        while (e != NULL) {
+            goc_entry* next = e->next;
+            if (atomic_load_explicit(&e->cancelled, memory_order_acquire)) {
+                cancelled_found = 1;
+            } else if (try_claim_wake(e)) {
+                e->ok = GOC_CLOSED;
+                if (e->kind == GOC_FIBER)
+                    to_post[to_post_count++] = (goc_entry*)mco_get_user_data(e->coro);
+                else if (e->kind == GOC_CALLBACK)
+                    post_callback(e, NULL);
+                else if (e->kind == GOC_SYNC)
+                    goc_sync_post(e->sync_sem_ptr);
+            }
+            e = next;
+        }
+    }
 
-    /* Wake all parked putters with GOC_CLOSED */
-    wake_all_parked_entries(ch->putters);
+    /* If any cancelled entries remain, compact them before releasing the lock */
+    if (cancelled_found)
+        compact_dead_entries(ch);
 
+    /* Release lock before posting */
+    uv_mutex_unlock(ch->lock);
+
+    /* Spin and post for all collected GOC_FIBER entries */
+    for (size_t i = 0; i < to_post_count; i++) {
+        goc_entry* fe = to_post[i];
+        while (atomic_load_explicit(&fe->parked, memory_order_acquire) == 0)
+            sched_yield();
+        post_to_run_queue(fe->pool, fe);
+    }
+
+    /* Telemetry: update counters for entries woken by close, then emit event */
 #ifdef GOC_ENABLE_STATS
     if (close_removed > 0) {
         atomic_fetch_add_explicit(&ch->entries_removed, close_removed, memory_order_relaxed);
         atomic_fetch_add_explicit(&ch->compaction_runs, 1,             memory_order_relaxed);
     }
 #endif
-
-    /* Telemetry: channel closed — piggyback lifetime scan/compaction counters */
     GOC_STATS_CHANNEL_STATUS((int)(intptr_t)ch, /*status=*/0, (int)ch->buf_size, (int)ch->item_count,
                              atomic_load_explicit(&ch->taker_scans,     memory_order_relaxed),
                              atomic_load_explicit(&ch->putter_scans,    memory_order_relaxed),
@@ -285,7 +329,6 @@ void goc_close(goc_chan* ch)
     on_close = ch->on_close;
     on_close_ud = ch->on_close_ud;
 
-    uv_mutex_unlock(ch->lock);
     chan_unregister(ch);
 
     if (on_close != NULL)
@@ -320,9 +363,15 @@ goc_val_t* goc_take(goc_chan* ch)
         return r;
     }
 
-    /* Fast path: parked putter */
-    if (chan_take_from_putter(ch, &val)) {
+    /* Fast path: parked putter — claim under lock, spin+post outside */
+    goc_entry* fe_putter = NULL;
+    if (chan_take_from_putter_claim(ch, &val, &fe_putter)) {
         uv_mutex_unlock(ch->lock);
+        if (fe_putter != NULL) {
+            while (atomic_load_explicit(&fe_putter->parked, memory_order_acquire) == 0)
+                sched_yield();
+            post_to_run_queue(fe_putter->pool, fe_putter);
+        }
         goc_val_t* r = goc_malloc(sizeof(goc_val_t));
         r->val = val; r->ok = GOC_OK;
         return r;
@@ -398,9 +447,15 @@ goc_status_t goc_put(goc_chan* ch, void* val)
         return GOC_CLOSED;
     }
 
-    /* Fast path: parked taker */
-    if (chan_put_to_taker(ch, val)) {
+    /* Fast path: parked taker — claim under lock, spin+post outside */
+    goc_entry* fe_taker = NULL;
+    if (chan_put_to_taker_claim(ch, val, &fe_taker)) {
         uv_mutex_unlock(ch->lock);
+        if (fe_taker != NULL) {
+            while (atomic_load_explicit(&fe_taker->parked, memory_order_acquire) == 0)
+                sched_yield();
+            post_to_run_queue(fe_taker->pool, fe_taker);
+        }
         return GOC_OK;
     }
 
