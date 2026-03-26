@@ -240,7 +240,7 @@ endforeach()
 # The stats test suite is significantly heavier than the others and regularly
 # exceeds the default ctest --timeout on slow CI runners (e.g. Windows).
 # Override the per-test timeout to give it enough headroom.
-set_tests_properties(test_goc_stats PROPERTIES TIMEOUT 120)
+set_tests_properties(test_goc_stats PROPERTIES TIMEOUT 180)
 
 # ---------------------------------------------------------------------------
 # Coverage target (requires lcov + genhtml)
