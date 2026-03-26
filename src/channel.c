@@ -91,6 +91,52 @@ bool wake(goc_chan* ch, goc_entry* e, void* value)
 }
 
 /* --------------------------------------------------------------------------
+ * wake_claim
+ *
+ * Like wake(), but for GOC_FIBER entries does NOT spin or post. Instead it
+ * returns the fiber's goc_entry (fe) so the caller can release ch->lock
+ * before spinning.  For GOC_CALLBACK and GOC_SYNC it dispatches immediately
+ * (those paths have no spin) and returns NULL.
+ *
+ * Caller contract for a non-NULL return value:
+ *   1. Release ch->lock.
+ *   2. Spin: while (atomic_load(&fe->parked, acquire) == 0) sched_yield();
+ *   3. post_to_run_queue(fe->pool, fe);
+ * -------------------------------------------------------------------------- */
+bool wake_claim(goc_chan* ch, goc_entry* e, void* value, goc_entry** fe_out)
+{
+    *fe_out = NULL;
+
+    if (atomic_load_explicit(&e->cancelled, memory_order_acquire)) {
+        ch->dead_count++;
+        return false;
+    }
+
+    if (!try_claim_wake(e)) {
+        ch->dead_count++;
+        return false;
+    }
+
+    if (e->result_slot != NULL)
+        *e->result_slot = value;
+
+    e->ok = GOC_OK;
+
+    switch (e->kind) {
+    case GOC_FIBER:
+        *fe_out = (goc_entry*)mco_get_user_data(e->coro);
+        return true;
+    case GOC_CALLBACK:
+        post_callback(e, value);
+        return true;
+    case GOC_SYNC:
+        goc_sync_post(e->sync_sem_ptr);
+        return true;
+    }
+    return true; /* unreachable */
+}
+
+/* --------------------------------------------------------------------------
  * compact_dead_entries
  *
  * Must be called with ch->lock held. Walks both takers and putters lists
@@ -320,9 +366,15 @@ goc_val_t* goc_take(goc_chan* ch)
         return r;
     }
 
-    /* Fast path: parked putter */
-    if (chan_take_from_putter(ch, &val)) {
+    /* Fast path: parked putter — claim under lock, spin+post outside */
+    goc_entry* fe_putter = NULL;
+    if (chan_take_from_putter_claim(ch, &val, &fe_putter)) {
         uv_mutex_unlock(ch->lock);
+        if (fe_putter != NULL) {
+            while (atomic_load_explicit(&fe_putter->parked, memory_order_acquire) == 0)
+                sched_yield();
+            post_to_run_queue(fe_putter->pool, fe_putter);
+        }
         goc_val_t* r = goc_malloc(sizeof(goc_val_t));
         r->val = val; r->ok = GOC_OK;
         return r;
@@ -398,9 +450,15 @@ goc_status_t goc_put(goc_chan* ch, void* val)
         return GOC_CLOSED;
     }
 
-    /* Fast path: parked taker */
-    if (chan_put_to_taker(ch, val)) {
+    /* Fast path: parked taker — claim under lock, spin+post outside */
+    goc_entry* fe_taker = NULL;
+    if (chan_put_to_taker_claim(ch, val, &fe_taker)) {
         uv_mutex_unlock(ch->lock);
+        if (fe_taker != NULL) {
+            while (atomic_load_explicit(&fe_taker->parked, memory_order_acquire) == 0)
+                sched_yield();
+            post_to_run_queue(fe_taker->pool, fe_taker);
+        }
         return GOC_OK;
     }
 
