@@ -241,14 +241,29 @@ void goc_stats_init(void) {
 void goc_stats_shutdown(void) {
     if (!atomic_load_explicit(&stats_enabled, memory_order_acquire)) return;
 
+    // (1) Double-check event loop state: only proceed if async handle is valid
+    if (g_stats_async == NULL) {
+        // Already closed, nothing to do
+        g_close_done = 1;
+        return;
+    }
+
+    // (2) Atomic state reset: reset g_close_done before signaling
+    g_close_done = 0;
     atomic_store_explicit(&stats_enabled,   0, memory_order_release);
     atomic_store_explicit(&g_stats_closing, 1, memory_order_release);
     uv_async_send(g_stats_async);
 
+    // (4) Lost wakeup protection: if async is closed after signaling, skip wait
     uv_mutex_lock(&g_close_mutex);
-    while (!g_close_done)
-        uv_cond_wait(&g_close_cond, &g_close_mutex);
-    uv_mutex_unlock(&g_close_mutex);
+    if (g_stats_async == NULL) {
+        g_close_done = 1;
+        uv_mutex_unlock(&g_close_mutex);
+    } else {
+        while (!g_close_done)
+            uv_cond_wait(&g_close_cond, &g_close_mutex);
+        uv_mutex_unlock(&g_close_mutex);
+    }
 
     uv_mutex_lock(&g_cb_mutex);
     atomic_store_explicit(&g_cb,    NULL, memory_order_release);

@@ -740,10 +740,19 @@ static void test_s6_2(void) {
     ASSERT(allocs1 - allocs0 == S6_2_N);
 
     /* Wait for all timeout channels to fire (they close on expiry). */
+
     for (int i = 0; i < S6_2_N; i++)
         goc_take_sync(chs[i]);
 
-    goc_timeout_get_stats(&allocs1, &expires1);
+    /* Robust: poll for expirations with timeout (max 100ms total) */
+    const int max_wait_ms = 100;
+    int waited = 0;
+    do {
+        goc_timeout_get_stats(&allocs1, &expires1);
+        if ((int)(expires1 - expires0) == S6_2_N) break;
+        goc_nanosleep(1000000); /* 1ms */
+        waited++;
+    } while (waited < max_wait_ms);
     ASSERT(expires1 - expires0 == S6_2_N);
 
     TEST_PASS();
