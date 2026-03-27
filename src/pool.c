@@ -345,10 +345,21 @@ static void pool_worker_fn(void* arg) {
 
         /* 4. No work found anywhere — go idle.
          *
-         * Increment idle_count with seq_cst BEFORE sleeping so that a
-         * concurrent post_to_run_queue can observe it after its own seq_cst
-         * operation.  Then double-check own injector and deque to close the
-         * sleep-miss race window. */
+         * Before parking, if there is still work in our own deque and any workers are idle,
+         * wake one to encourage stealing. This preserves locality for ping-pong workloads,
+         * but avoids leaving work stranded if we're about to park. */
+        /* Chase–Lev: deque is non-empty if b > t (loads in this order reduce race window).
+         * Skip entirely at pool=1 — thread_count is immutable so this branch is free. */
+        if (pool->thread_count > 1) {
+            size_t t    = atomic_load_explicit(&tl_worker->deque.top,    memory_order_acquire);
+            size_t b    = atomic_load_explicit(&tl_worker->deque.bottom, memory_order_relaxed);
+            size_t idle = atomic_load_explicit(&pool->idle_count,        memory_order_seq_cst);
+            if (b > t && idle > 0) {
+                size_t idx = (tl_worker->index + 1) % pool->thread_count;
+                uv_sem_post(&pool->workers[idx].idle_sem);
+            }
+        }
+
         atomic_fetch_add_explicit(&pool->idle_count, 1, memory_order_seq_cst);
 
         entry = injector_pop(&tl_worker->injector);
