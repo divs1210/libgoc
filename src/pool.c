@@ -40,6 +40,7 @@ typedef struct {
     goc_pool*        pool;
     _Atomic uint64_t steal_attempts;  /* relaxed counter; read at STOPPED event */
     _Atomic uint64_t steal_successes;
+    size_t           last_steal_victim; /* victim hint for next steal, SIZE_MAX = unset */
 } goc_worker;
 
 /* Global lifetime steal totals across all pools/workers — read via accessor */
@@ -301,6 +302,7 @@ void pool_submit_spawn(goc_pool* pool,
 static void pool_worker_fn(void* arg) {
     tl_worker     = (goc_worker*)arg;
     goc_pool* pool = tl_worker->pool;
+    tl_worker->last_steal_victim = SIZE_MAX;
 
     /* Per-worker PRNG seed for randomised steal order (anti-thundering-herd).
      * Combines index with the worker pointer for uniqueness. */
@@ -318,11 +320,25 @@ static void pool_worker_fn(void* arg) {
         entry = wsdq_pop_bottom(&tl_worker->deque);
         if (entry != NULL) goto run;
 
-        /* 3. Steal phase: try each other worker exactly once, starting from a
-         *    randomised offset to avoid thundering-herd on a fixed victim.
-         *    Self is explicitly excluded. */
+        /* 3. Steal phase: victim hinting, then randomized scan. */
         if (pool->thread_count > 1) {
-            /* xorshift32 — portable thread-local PRNG (no rand_r on Windows). */
+            size_t victim_hint = tl_worker->last_steal_victim;
+            if (victim_hint != SIZE_MAX && victim_hint != tl_worker->index) {
+#ifdef GOC_ENABLE_STATS
+                atomic_fetch_add_explicit(&tl_worker->steal_attempts, 1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_steal_attempts,           1, memory_order_relaxed);
+#endif
+                entry = wsdq_steal_top(&pool->workers[victim_hint].deque);
+                if (entry != NULL) {
+#ifdef GOC_ENABLE_STATS
+                    atomic_fetch_add_explicit(&tl_worker->steal_successes, 1, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&g_steal_successes,           1, memory_order_relaxed);
+#endif
+                    tl_worker->last_steal_victim = victim_hint;
+                    goto run;
+                }
+            }
+            /* Fallback: randomized scan as before */
             seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
             size_t offset = 1 + (size_t)(seed % (uint32_t)(pool->thread_count - 1));
             for (size_t i = 0; i < pool->thread_count; i++) {
@@ -338,9 +354,12 @@ static void pool_worker_fn(void* arg) {
                     atomic_fetch_add_explicit(&tl_worker->steal_successes, 1, memory_order_relaxed);
                     atomic_fetch_add_explicit(&g_steal_successes,           1, memory_order_relaxed);
 #endif
+                    tl_worker->last_steal_victim = victim;
                     goto run;
                 }
             }
+            /* If all fail, clear the hint for next round */
+            tl_worker->last_steal_victim = SIZE_MAX;
         }
 
         /* 4. No work found anywhere — go idle.
