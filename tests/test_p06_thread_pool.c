@@ -98,6 +98,9 @@
  *          STOPPED events for the pool's workers equals the delta reported by
  *          goc_pool_get_steal_stats before and after that pool's lifetime
  *
+ *   P6.26  wsdq_approx_size returns 0 on an empty deque
+ *   P6.27  wsdq_approx_size tracks push/pop correctly (push 3 → 3, pop 1 → 2)
+ *
  * Notes:
  *   - goc_init() is called once in main() before any test runs.
  *   - goc_shutdown() is called once in main() after all tests complete.
@@ -116,9 +119,7 @@
 #include "test_harness.h"
 #include "goc.h"
 #include "wsdq.h"
-#ifdef GOC_ENABLE_STATS
 #include "goc_stats.h"
-#endif
 
 /* =========================================================================
  * done_t — lightweight fiber-to-main synchronisation via mutex + condvar
@@ -1618,8 +1619,6 @@ done:;
  * P6.24 / P6.25 — steal telemetry tests (GOC_ENABLE_STATS only)
  * ====================================================================== */
 
-#ifdef GOC_ENABLE_STATS
-
 /* Minimal local event buffer for P6.24 / P6.25.
  * We install a temporary callback, run the pool, then restore the old one. */
 #define P6_STEAL_EV_CAP 1024
@@ -1740,7 +1739,53 @@ done:
     uv_mutex_destroy(&evbuf.mtx);
 }
 
-#endif /* GOC_ENABLE_STATS */
+/* ---- P6.26 ---- */
+/*
+ * P6.26 — wsdq_approx_size returns 0 on an empty deque
+ */
+static void test_p6_26(void) {
+    TEST_BEGIN("P6.26  wsdq_approx_size returns 0 on empty deque");
+
+    goc_wsdq dq;
+    wsdq_init(&dq, 4);
+    ASSERT(wsdq_approx_size(&dq) == 0);
+    wsdq_destroy(&dq);
+    TEST_PASS();
+done:;
+}
+
+/* ---- P6.27 ---- */
+/*
+ * P6.27 — wsdq_approx_size reflects push and pop correctly
+ *
+ * Push 3 entries: assert size == 3.
+ * Pop 1 (bottom): assert size == 2.
+ */
+static void test_p6_27(void) {
+    TEST_BEGIN("P6.27  wsdq_approx_size tracks push/pop correctly");
+
+    goc_wsdq dq;
+    wsdq_init(&dq, 8);
+
+    goc_entry* e1 = make_entry(1);
+    goc_entry* e2 = make_entry(2);
+    goc_entry* e3 = make_entry(3);
+    wsdq_push_bottom(&dq, e1);
+    wsdq_push_bottom(&dq, e2);
+    wsdq_push_bottom(&dq, e3);
+    ASSERT(wsdq_approx_size(&dq) == 3);
+
+    goc_entry* popped = wsdq_pop_bottom(&dq);
+    ASSERT(popped != NULL);
+    free(popped);
+    ASSERT(wsdq_approx_size(&dq) == 2);
+
+    free(wsdq_pop_bottom(&dq));
+    free(wsdq_pop_bottom(&dq));
+    wsdq_destroy(&dq);
+    TEST_PASS();
+done:;
+}
 
 /* ---- P6.23: GC bitmap write-ordering: slot data visible before bit ---- */
 /*
@@ -1860,10 +1905,10 @@ int main(void) {
     test_p6_21();
     test_p6_22();
     test_p6_23();
-#ifdef GOC_ENABLE_STATS
     test_p6_24();
     test_p6_25();
-#endif
+    test_p6_26();
+    test_p6_27();
     printf("\n");
 
     if (!g_skip_shutdown) {
