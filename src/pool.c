@@ -428,22 +428,21 @@ run:
             goc_fiber_root_update_sp(fe->fiber_root_handle, coro);
 
         /* Post-yield wakeup:
-         * If we have more than GOC_YIELD_WAKE_THRESHOLD items in our deque,
+         * If we have more than capacity / 2 items in our deque,
          * and any workers are idle, wake a neighbor.
-         * This causes livelocks!!!
          */
-        // #define GOC_POST_YIELD_WAKE_THRESHOLD (pool->thread_count * 2)
-
-        // if (st == MCO_SUSPENDED && pool->thread_count > 1) {
-        //     size_t depth = wsdq_approx_size(&tl_worker->deque);
-        //     size_t idle = atomic_load_explicit(&pool->idle_count, memory_order_seq_cst);
-        //     if (depth > GOC_POST_YIELD_WAKE_THRESHOLD && idle > 0) {
-        //         size_t neighbor = (tl_worker->index + 1) % pool->thread_count;
-        //         if (neighbor != tl_worker->index) {
-        //             uv_sem_post(&pool->workers[neighbor].idle_sem);
-        //         }
-        //     }
-        // }
+        if (st == MCO_SUSPENDED && pool->thread_count > 1) {
+            size_t depth = wsdq_approx_size(&tl_worker->deque);
+            size_t idle = atomic_load_explicit(&pool->idle_count, memory_order_seq_cst);
+            if (depth > tl_worker->deque.capacity/2 && idle > 0) {
+                size_t neighbor = (tl_worker->index + 1) % pool->thread_count;
+                if (neighbor != tl_worker->index) {
+                    /* Prevent compiler from optimizing away the depth calculation. */
+                    __asm__ volatile("" ::: "memory");
+                    uv_sem_post(&pool->workers[neighbor].idle_sem);
+                }
+            }
+        }
 
         /* If the fiber just parked, release the yield-gate so that any
          * wake() spinning on parked==0 can proceed. */
