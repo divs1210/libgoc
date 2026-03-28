@@ -31,6 +31,9 @@
  *   S4.1  goc_stats_shutdown() disables stats delivery
  *   S5.1  Worker STOPPED event carries valid steal_attempts/steal_successes
  *   S6.1  goc_cb_queue_get_hwm() reflects peak callback-queue depth
+ *   S6.4  steal counters readable; misses<=attempts invariant holds (no-work pool)
+ *   S6.5  idle_wakeups increments after external injection (pool=2, 1 fiber)
+ *   S6.6  goc_pool_get_steal_stats extended signature returns valid values
  *
  *   (See test source for details on each scenario.)
  */
@@ -46,6 +49,7 @@
 #include "test_harness.h"
 #include "goc.h"
 #include "goc_stats.h"
+#include "../src/internal.h"
 
 /* =========================================================================
  * Event collection buffer
@@ -779,20 +783,99 @@ done:;
 static void test_s6_3(void) {
     TEST_BEGIN("S6.3  goc_pool_get_steal_stats returns non-decreasing totals");
 
-    uint64_t att0, suc0;
-    goc_pool_get_steal_stats(&att0, &suc0);
+    uint64_t att0, suc0, mis0, wak0;
+    goc_pool_get_steal_stats(&att0, &suc0, &mis0, &wak0);
 
     goc_pool* pool = goc_pool_make(2);
     for (int i = 0; i < 64; i++)
         goc_go_on(pool, noop_fiber, NULL);
     goc_pool_destroy(pool);
 
-    uint64_t att1, suc1;
-    goc_pool_get_steal_stats(&att1, &suc1);
+    uint64_t att1, suc1, mis1, wak1;
+    goc_pool_get_steal_stats(&att1, &suc1, &mis1, &wak1);
 
     ASSERT(att1 >= att0);
     ASSERT(suc1 >= suc0);
     ASSERT((suc1 - suc0) <= (att1 - att0));
+
+    TEST_PASS();
+done:;
+}
+
+/*
+ * S6.4 — steal_misses and idle_wakeups counters are readable; invariants hold
+ *
+ * Create a pool and immediately destroy it without posting any fibers.
+ * Verifies that the new counters compile, are accessible, and satisfy the
+ * invariant misses <= attempts.
+ *
+ * Note: neither steal_misses nor idle_wakeups is asserted to be zero.
+ * Workers scan each other's empty deques before going idle (incrementing
+ * steal_misses), and goc_pool_destroy wakes every worker for shutdown
+ * (incrementing idle_wakeups) — both happen even with no work posted.
+ */
+static void test_s6_4(void) {
+    TEST_BEGIN("S6.4  steal counters readable and misses<=attempts invariant holds");
+
+    uint64_t att0, suc0, mis0, wak0;
+    goc_pool_get_steal_stats(&att0, &suc0, &mis0, &wak0);
+
+    goc_pool* pool = goc_pool_make(2);
+    goc_pool_destroy(pool);
+
+    uint64_t att1, suc1, mis1, wak1;
+    goc_pool_get_steal_stats(&att1, &suc1, &mis1, &wak1);
+
+    ASSERT((mis1 - mis0) <= (att1 - att0));
+    ASSERT((suc1 - suc0) <= (att1 - att0));
+
+    TEST_PASS();
+done:;
+}
+
+/*
+ * S6.5 — idle_wakeups increments on each sleep/wake cycle
+ *
+ * Post a single fiber from the main thread (external injection) on a 2-worker
+ * pool.  At least one worker must wake to pick it up, so global idle_wakeups
+ * must increase by at least 1 after the pool is destroyed.
+ */
+static void test_s6_5(void) {
+    TEST_BEGIN("S6.5  idle_wakeups increments after external injection");
+
+    uint64_t att0, suc0, mis0, wak0;
+    goc_pool_get_steal_stats(&att0, &suc0, &mis0, &wak0);
+
+    goc_pool* pool = goc_pool_make(2);
+    /* Wait until both workers are parked before posting, so the external
+     * injection is guaranteed to wake at least one via uv_sem_post. */
+    pool_wait_all_idle(pool, 2);
+    goc_go_on(pool, noop_fiber, NULL);
+    goc_pool_destroy(pool);
+
+    uint64_t att1, suc1, mis1, wak1;
+    goc_pool_get_steal_stats(&att1, &suc1, &mis1, &wak1);
+
+    ASSERT((wak1 - wak0) >= 1);
+
+    TEST_PASS();
+done:;
+}
+
+/*
+ * S6.6 — goc_pool_get_steal_stats extended signature: all counters non-negative
+ *
+ * Verify the 4-output-param accessor compiles and returns plausible values:
+ * all counters >= 0 and successes <= attempts, misses <= attempts.
+ */
+static void test_s6_6(void) {
+    TEST_BEGIN("S6.6  goc_pool_get_steal_stats extended signature returns valid values");
+
+    uint64_t attempts = 0, successes = 0, misses = 0, idle_wakeups = 0;
+    goc_pool_get_steal_stats(&attempts, &successes, &misses, &idle_wakeups);
+
+    ASSERT(successes <= attempts);
+    ASSERT(misses    <= attempts);
 
     TEST_PASS();
 done:;
@@ -850,6 +933,9 @@ int main(void) {
     test_s6_1();
     test_s6_2();
     test_s6_3();
+    test_s6_4();
+    test_s6_5();
+    test_s6_6();
     test_s4_1();
     printf("\n");
 

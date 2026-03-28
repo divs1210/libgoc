@@ -372,6 +372,6 @@ bool goc_stats_is_enabled(void) { return false; }
 
 
 size_t goc_cb_queue_get_hwm(void)                       { return 0; }
-void   goc_pool_get_steal_stats(uint64_t *a, uint64_t *s) { *a = 0; *s = 0; }
+void   goc_pool_get_steal_stats(uint64_t *a, uint64_t *s, uint64_t *m, uint64_t *w) { *a = 0; *s = 0; *m = 0; *w = 0; }
 
 #endif /* GOC_ENABLE_STATS */

@@ -40,11 +40,16 @@ typedef struct {
     goc_pool*        pool;
     _Atomic uint64_t steal_attempts;  /* relaxed counter; read at STOPPED event */
     _Atomic uint64_t steal_successes;
+    _Atomic uint64_t steal_misses;    /* wsdq_steal_top returned NULL */
+    _Atomic uint64_t idle_wakeups;    /* uv_sem_wait returned (each sleep/wake cycle) */
+    size_t           last_steal_victim; /* victim hint for next steal, SIZE_MAX = unset */
 } goc_worker;
 
 /* Global lifetime steal totals across all pools/workers — read via accessor */
 static _Atomic uint64_t g_steal_attempts  = 0;
 static _Atomic uint64_t g_steal_successes = 0;
+static _Atomic uint64_t g_steal_misses    = 0;
+static _Atomic uint64_t g_idle_wakeups    = 0;
 
 /* -------------------------------------------------------------------------
  * goc_pool — full definition (opaque outside pool.c)
@@ -301,6 +306,7 @@ void pool_submit_spawn(goc_pool* pool,
 static void pool_worker_fn(void* arg) {
     tl_worker     = (goc_worker*)arg;
     goc_pool* pool = tl_worker->pool;
+    tl_worker->last_steal_victim = SIZE_MAX;
 
     /* Per-worker PRNG seed for randomised steal order (anti-thundering-herd).
      * Combines index with the worker pointer for uniqueness. */
@@ -310,19 +316,37 @@ static void pool_worker_fn(void* arg) {
 
     while (!atomic_load_explicit(&pool->shutdown, memory_order_acquire)) {
 
-        /* 1. Drain own injector first (entries posted by external callers). */
-        entry = injector_pop(&tl_worker->injector);
-        if (entry != NULL) goto run;
-
-        /* 2. Pop from own deque (LIFO, cache-warm). */
+        /* 1. Pop from own deque (LIFO, cache-warm). */
         entry = wsdq_pop_bottom(&tl_worker->deque);
         if (entry != NULL) goto run;
 
-        /* 3. Steal phase: try each other worker exactly once, starting from a
-         *    randomised offset to avoid thundering-herd on a fixed victim.
-         *    Self is explicitly excluded. */
+        /* 2. Drain own injector (entries posted by external callers). */
+        entry = injector_pop(&tl_worker->injector);
+        if (entry != NULL) goto run;
+
+        /* 3. Steal phase: victim hinting, then randomized scan. */
         if (pool->thread_count > 1) {
-            /* xorshift32 — portable thread-local PRNG (no rand_r on Windows). */
+            size_t victim_hint = tl_worker->last_steal_victim;
+            if (victim_hint != SIZE_MAX && victim_hint != tl_worker->index) {
+#ifdef GOC_ENABLE_STATS
+                atomic_fetch_add_explicit(&tl_worker->steal_attempts, 1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_steal_attempts,           1, memory_order_relaxed);
+#endif
+                entry = wsdq_steal_top(&pool->workers[victim_hint].deque);
+                if (entry != NULL) {
+#ifdef GOC_ENABLE_STATS
+                    atomic_fetch_add_explicit(&tl_worker->steal_successes, 1, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&g_steal_successes,           1, memory_order_relaxed);
+#endif
+                    tl_worker->last_steal_victim = victim_hint;
+                    goto run;
+                }
+#ifdef GOC_ENABLE_STATS
+                atomic_fetch_add_explicit(&tl_worker->steal_misses, 1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_steal_misses,           1, memory_order_relaxed);
+#endif
+            }
+            /* Fallback: randomized scan as before */
             seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
             size_t offset = 1 + (size_t)(seed % (uint32_t)(pool->thread_count - 1));
             for (size_t i = 0; i < pool->thread_count; i++) {
@@ -338,22 +362,39 @@ static void pool_worker_fn(void* arg) {
                     atomic_fetch_add_explicit(&tl_worker->steal_successes, 1, memory_order_relaxed);
                     atomic_fetch_add_explicit(&g_steal_successes,           1, memory_order_relaxed);
 #endif
+                    tl_worker->last_steal_victim = victim;
                     goto run;
                 }
+#ifdef GOC_ENABLE_STATS
+                atomic_fetch_add_explicit(&tl_worker->steal_misses, 1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_steal_misses,           1, memory_order_relaxed);
+#endif
             }
+            /* If all fail, clear the hint for next round */
+            tl_worker->last_steal_victim = SIZE_MAX;
         }
 
         /* 4. No work found anywhere — go idle.
          *
-         * Increment idle_count with seq_cst BEFORE sleeping so that a
-         * concurrent post_to_run_queue can observe it after its own seq_cst
-         * operation.  Then double-check own injector and deque to close the
-         * sleep-miss race window. */
+         * Before parking, if there is still work in our own deque and any workers are idle,
+         * wake one to encourage stealing. This preserves locality for ping-pong workloads,
+         * but avoids leaving work stranded if we're about to park.
+         * Skip entirely at pool=1 — thread_count is immutable so this branch is free. 
+         */
+        if (pool->thread_count > 1) {
+            size_t depth = wsdq_approx_size(&tl_worker->deque);
+            size_t idle = atomic_load_explicit(&pool->idle_count, memory_order_seq_cst);
+            if (depth > 0 && idle > 0) {
+                size_t idx = (tl_worker->index + 1) % pool->thread_count;
+                uv_sem_post(&pool->workers[idx].idle_sem);
+            }
+        }
+
         atomic_fetch_add_explicit(&pool->idle_count, 1, memory_order_seq_cst);
 
-        entry = injector_pop(&tl_worker->injector);
+        entry = wsdq_pop_bottom(&tl_worker->deque);
         if (entry == NULL)
-            entry = wsdq_pop_bottom(&tl_worker->deque);
+            entry = injector_pop(&tl_worker->injector);
         if (entry != NULL) {
             atomic_fetch_sub_explicit(&pool->idle_count, 1, memory_order_relaxed);
             goto run;
@@ -361,6 +402,10 @@ static void pool_worker_fn(void* arg) {
 
         GOC_STATS_WORKER_STATUS((int)tl_worker->index, pool, GOC_WORKER_IDLE, (int)pool->live_count, 0, 0);
         uv_sem_wait(&tl_worker->idle_sem);
+#ifdef GOC_ENABLE_STATS
+        atomic_fetch_add_explicit(&tl_worker->idle_wakeups, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_idle_wakeups,           1, memory_order_relaxed);
+#endif
         atomic_fetch_sub_explicit(&pool->idle_count, 1, memory_order_relaxed);
         GOC_STATS_WORKER_STATUS((int)tl_worker->index, pool, GOC_WORKER_RUNNING, (int)pool->live_count, 0, 0);
         continue;   /* re-check shutdown and try again */
@@ -394,8 +439,26 @@ run:
 
         /* Update cached fiber SP so the next GC cycle scans only the used
          * portion of the stack instead of the full vmem allocation. */
+
         if (st == MCO_SUSPENDED && fe != NULL)
             goc_fiber_root_update_sp(fe->fiber_root_handle, coro);
+
+        /* Post-yield wakeup:
+         * If we have more than capacity / 2 items in our deque,
+         * and any workers are idle, wake a neighbor.
+         */
+        if (st == MCO_SUSPENDED && pool->thread_count > 1) {
+            size_t depth = wsdq_approx_size(&tl_worker->deque);
+            size_t idle = atomic_load_explicit(&pool->idle_count, memory_order_seq_cst);
+            if (depth > tl_worker->deque.capacity/2 && idle > 0) {
+                size_t neighbor = (tl_worker->index + 1) % pool->thread_count;
+                if (neighbor != tl_worker->index) {
+                    /* Prevent compiler from optimizing away the depth calculation. */
+                    __asm__ volatile("" ::: "memory");
+                    uv_sem_post(&pool->workers[neighbor].idle_sem);
+                }
+            }
+        }
 
         /* If the fiber just parked, release the yield-gate so that any
          * wake() spinning on parked==0 can proceed. */
@@ -655,8 +718,19 @@ goc_drain_result_t goc_pool_destroy_timeout(goc_pool* pool, uint64_t ms) {
 /* -------------------------------------------------------------------------
  * goc_pool_get_steal_stats — aggregate steal counters across all pools/workers
  * ---------------------------------------------------------------------- */
-void goc_pool_get_steal_stats(uint64_t *attempts, uint64_t *successes)
+void goc_pool_get_steal_stats(uint64_t *attempts, uint64_t *successes,
+                              uint64_t *misses,   uint64_t *idle_wakeups)
 {
-    *attempts  = atomic_load_explicit(&g_steal_attempts,  memory_order_relaxed);
-    *successes = atomic_load_explicit(&g_steal_successes, memory_order_relaxed);
+    *attempts     = atomic_load_explicit(&g_steal_attempts,  memory_order_relaxed);
+    *successes    = atomic_load_explicit(&g_steal_successes, memory_order_relaxed);
+    *misses       = atomic_load_explicit(&g_steal_misses,    memory_order_relaxed);
+    *idle_wakeups = atomic_load_explicit(&g_idle_wakeups,    memory_order_relaxed);
+}
+
+/* -------------------------------------------------------------------------
+ * pool_wait_all_idle — test helper
+ * ---------------------------------------------------------------------- */
+void pool_wait_all_idle(goc_pool* pool, size_t n) {
+    while (atomic_load_explicit(&pool->idle_count, memory_order_seq_cst) < n)
+        uv_sleep(0);
 }
