@@ -31,14 +31,11 @@
  * use a uv_async_t bridge so they can be called safely from fiber or
  * OS-thread context.
  *
- * Handle initialisation (uv_tcp_init, uv_pipe_init, uv_udp_init, etc.) is
- * the caller's responsibility.  Most uv_*_init functions modify loop-internal
- * state without a lock and must be called from the event loop thread.
- * uv_async_init is the one exception (safe from any thread).  All handles
- * used with libgoc must be GC-allocated and registered:
+ * Handle initialisation (uv_tcp_init, uv_pipe_init, uv_udp_init, etc.) must
+ * reach the event loop thread; use goc_io_tcp_init / goc_io_pipe_init /
+ * goc_io_udp_init which dispatch there and register the handle automatically:
  *   uv_tcp_t* tcp = goc_malloc(sizeof(uv_tcp_t));
- *   uv_tcp_init(goc_scheduler(), tcp);   /* from loop thread only */
- *   goc_io_handle_register((uv_handle_t*)tcp);  /* safe from any thread */
+ *   int rc = goc_unbox_int(goc_take(goc_io_tcp_init(tcp))->val);
  *
  * Compile requirements: -std=c11
  *   Include this header explicitly: #include "goc_io.h"
@@ -441,14 +438,17 @@ goc_chan* goc_io_getnameinfo(const struct sockaddr* addr, int flags);
  * premature collection.  goc_io_handle_register pins the handle in a
  * GC-visible root array; goc_io_handle_unregister / goc_io_handle_close remove it.
  *
- * Typical usage:
+ * Typical usage (preferred — safe from any thread):
  *
  *   uv_tcp_t* tcp = goc_malloc(sizeof(uv_tcp_t));
- *   uv_tcp_init(goc_scheduler(), tcp);
- *   goc_io_handle_register((uv_handle_t*)tcp);
+ *   int rc = goc_unbox_int(goc_take(goc_io_tcp_init(tcp))->val);
+ *   // tcp is now initialised and registered; rc == 0 on success.
  *
  *   // ... later, to tear down:
  *   goc_io_handle_close((uv_handle_t*)tcp, NULL);  // unregisters automatically
+ *
+ * If you are already on the event loop thread and do not want a channel
+ * round-trip, call uv_tcp_init() directly and then goc_io_handle_register().
  *
  * If you need a close callback AND are managing teardown yourself, you may
  * call uv_close() directly and then goc_io_handle_unregister() from within your
@@ -458,6 +458,118 @@ goc_chan* goc_io_getnameinfo(const struct sockaddr* addr, int flags);
  * before calling uv_close.  Do not use handle->data after calling
  * goc_io_handle_close().
  * ====================================================================== */
+
+/**
+ * goc_io_tcp_init() — Initialise a GC-allocated uv_tcp_t from any thread.
+ *
+ * handle : GC-allocated uv_tcp_t (via goc_malloc).
+ *
+ * Dispatches uv_tcp_init() to the event loop thread, then registers the handle
+ * with goc_io_handle_register().  Returns a channel delivering
+ * (void*)(intptr_t)status; 0 on success, a negative libuv error on failure.
+ * On success the handle is initialised and pinned as a GC root; call
+ * goc_io_handle_close() to tear it down.
+ *
+ * Safe to call from any context.
+ */
+goc_chan* goc_io_tcp_init(uv_tcp_t* handle);
+
+/**
+ * goc_io_pipe_init() — Initialise a GC-allocated uv_pipe_t from any thread.
+ *
+ * handle : GC-allocated uv_pipe_t (via goc_malloc).
+ * ipc    : non-zero if this pipe will be used for handle passing.
+ *
+ * Dispatches uv_pipe_init() to the event loop thread, then registers the
+ * handle.  Returns a channel delivering (void*)(intptr_t)status; 0 on success,
+ * a negative libuv error on failure.
+ *
+ * Safe to call from any context.
+ */
+goc_chan* goc_io_pipe_init(uv_pipe_t* handle, int ipc);
+
+/**
+ * goc_io_udp_init() — Initialise a GC-allocated uv_udp_t from any thread.
+ *
+ * handle : GC-allocated uv_udp_t (via goc_malloc).
+ *
+ * Dispatches uv_udp_init() to the event loop thread, then registers the
+ * handle.  Returns a channel delivering (void*)(intptr_t)status; 0 on success,
+ * a negative libuv error on failure.
+ *
+ * Safe to call from any context.
+ */
+goc_chan* goc_io_udp_init(uv_udp_t* handle);
+
+/**
+ * goc_io_tty_init() — Initialise a GC-allocated uv_tty_t from any thread.
+ *
+ * handle : GC-allocated uv_tty_t (via goc_malloc).
+ * fd     : file descriptor for the TTY (e.g. 0=stdin, 1=stdout, 2=stderr).
+ *
+ * Dispatches uv_tty_init() to the event loop thread, then registers the
+ * handle.  Returns a channel delivering (void*)(intptr_t)status; 0 on success,
+ * a negative libuv error on failure.
+ *
+ * Safe to call from any context.
+ */
+goc_chan* goc_io_tty_init(uv_tty_t* handle, uv_file fd);
+
+/**
+ * goc_io_signal_init() — Initialise a GC-allocated uv_signal_t from any thread.
+ *
+ * handle : GC-allocated uv_signal_t (via goc_malloc).
+ *
+ * Dispatches uv_signal_init() to the event loop thread, then registers the
+ * handle.  Returns a channel delivering (void*)(intptr_t)status; 0 on success,
+ * a negative libuv error on failure.
+ *
+ * Safe to call from any context.
+ */
+goc_chan* goc_io_signal_init(uv_signal_t* handle);
+
+/**
+ * goc_io_fs_event_init() — Initialise a GC-allocated uv_fs_event_t from any thread.
+ *
+ * handle : GC-allocated uv_fs_event_t (via goc_malloc).
+ *
+ * Dispatches uv_fs_event_init() to the event loop thread, then registers the
+ * handle.  Returns a channel delivering (void*)(intptr_t)status; 0 on success,
+ * a negative libuv error on failure.
+ *
+ * Safe to call from any context.
+ */
+goc_chan* goc_io_fs_event_init(uv_fs_event_t* handle);
+
+/**
+ * goc_io_fs_poll_init() — Initialise a GC-allocated uv_fs_poll_t from any thread.
+ *
+ * handle : GC-allocated uv_fs_poll_t (via goc_malloc).
+ *
+ * Dispatches uv_fs_poll_init() to the event loop thread, then registers the
+ * handle.  Returns a channel delivering (void*)(intptr_t)status; 0 on success,
+ * a negative libuv error on failure.
+ *
+ * Safe to call from any context.
+ */
+goc_chan* goc_io_fs_poll_init(uv_fs_poll_t* handle);
+
+/**
+ * goc_io_process_spawn() — Spawn a child process from any thread.
+ *
+ * handle : GC-allocated uv_process_t (via goc_malloc).
+ * opts   : spawn options; pointer must remain valid until the channel delivers
+ *          its value (i.e. until the caller takes from the returned channel).
+ *
+ * Dispatches uv_spawn() to the event loop thread.  On success (rc == 0) the
+ * handle is registered as a GC root and the child process is running.
+ * Returns a channel delivering (void*)(intptr_t)status; 0 on success, a
+ * negative libuv error on failure.
+ *
+ * Safe to call from any context.
+ */
+goc_chan* goc_io_process_spawn(uv_process_t* handle,
+                               const uv_process_options_t* opts);
 
 /**
  * goc_io_handle_register() — Pin a GC-allocated libuv handle as a GC root.

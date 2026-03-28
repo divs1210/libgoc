@@ -1064,6 +1064,133 @@ int goc_io_udp_recv_stop(uv_udp_t* handle)
  * 5. GC handle lifetime management
  * ====================================================================== */
 
+/* -------------------------------------------------------------------------
+ * goc_io_tcp_init / goc_io_pipe_init / goc_io_udp_init /
+ * goc_io_tty_init / goc_io_signal_init /
+ * goc_io_fs_event_init / goc_io_fs_poll_init
+ *
+ * Dispatch uv_*_init to the loop thread (since these functions modify loop
+ * internals without a lock and must not be called from worker threads).
+ * On success the handle is registered as a GC root.
+ * ---------------------------------------------------------------------- */
+
+typedef struct {
+    uv_async_t  async;   /* MUST be first member */
+    void*       handle;
+    int         ipc;     /* pipe only */
+    uv_file     fd;      /* tty only */
+    goc_chan*   ch;
+    int         kind;    /* 0=tcp 1=pipe 2=udp 3=tty 4=signal 5=fs_event 6=fs_poll */
+} goc_handle_init_dispatch_t;
+
+static void on_handle_init_dispatch(uv_async_t* h)
+{
+    goc_handle_init_dispatch_t* d = (goc_handle_init_dispatch_t*)h;
+    int rc;
+    switch (d->kind) {
+        case 0: rc = uv_tcp_init(g_loop,      (uv_tcp_t*)d->handle);            break;
+        case 1: rc = uv_pipe_init(g_loop,     (uv_pipe_t*)d->handle, d->ipc);   break;
+        case 2: rc = uv_udp_init(g_loop,      (uv_udp_t*)d->handle);            break;
+        case 3: rc = uv_tty_init(g_loop,      (uv_tty_t*)d->handle, d->fd, 0); break;
+        case 4: rc = uv_signal_init(g_loop,   (uv_signal_t*)d->handle);         break;
+        case 5: rc = uv_fs_event_init(g_loop, (uv_fs_event_t*)d->handle);       break;
+        case 6: rc = uv_fs_poll_init(g_loop,  (uv_fs_poll_t*)d->handle);        break;
+        default: rc = UV_EINVAL; break;
+    }
+    if (rc == 0)
+        gc_handle_register(d->handle);
+    goc_put_cb(d->ch, SCALAR(rc), close_on_put, d->ch);
+    uv_close((uv_handle_t*)h, unregister_io_handle);
+}
+
+static goc_chan* handle_init_dispatch(void* handle, int kind, int ipc, uv_file fd)
+{
+    goc_chan*                    ch = goc_chan_make(1);
+    goc_handle_init_dispatch_t*  d  = (goc_handle_init_dispatch_t*)goc_malloc(
+                                          sizeof(goc_handle_init_dispatch_t));
+    d->handle = handle;
+    d->kind   = kind;
+    d->ipc    = ipc;
+    d->fd     = fd;
+    d->ch     = ch;
+    gc_handle_register(d);
+    dispatch_async_or_abort(&d->async, on_handle_init_dispatch, "goc_io_*_init");
+    return ch;
+}
+
+goc_chan* goc_io_tcp_init(uv_tcp_t* handle)
+{
+    return handle_init_dispatch(handle, 0, 0, 0);
+}
+
+goc_chan* goc_io_pipe_init(uv_pipe_t* handle, int ipc)
+{
+    return handle_init_dispatch(handle, 1, ipc, 0);
+}
+
+goc_chan* goc_io_udp_init(uv_udp_t* handle)
+{
+    return handle_init_dispatch(handle, 2, 0, 0);
+}
+
+goc_chan* goc_io_tty_init(uv_tty_t* handle, uv_file fd)
+{
+    return handle_init_dispatch(handle, 3, 0, fd);
+}
+
+goc_chan* goc_io_signal_init(uv_signal_t* handle)
+{
+    return handle_init_dispatch(handle, 4, 0, 0);
+}
+
+goc_chan* goc_io_fs_event_init(uv_fs_event_t* handle)
+{
+    return handle_init_dispatch(handle, 5, 0, 0);
+}
+
+goc_chan* goc_io_fs_poll_init(uv_fs_poll_t* handle)
+{
+    return handle_init_dispatch(handle, 6, 0, 0);
+}
+
+/* -------------------------------------------------------------------------
+ * goc_io_process_spawn
+ *
+ * uv_spawn both initialises the uv_process_t and starts the child process.
+ * The options pointer must remain valid until the channel delivers its value.
+ * ---------------------------------------------------------------------- */
+
+typedef struct {
+    uv_async_t               async;   /* MUST be first member */
+    uv_process_t*            handle;
+    const uv_process_options_t* opts;
+    goc_chan*                ch;
+} goc_process_spawn_dispatch_t;
+
+static void on_process_spawn_dispatch(uv_async_t* h)
+{
+    goc_process_spawn_dispatch_t* d = (goc_process_spawn_dispatch_t*)h;
+    int rc = uv_spawn(g_loop, d->handle, d->opts);
+    if (rc == 0)
+        gc_handle_register(d->handle);
+    goc_put_cb(d->ch, SCALAR(rc), close_on_put, d->ch);
+    uv_close((uv_handle_t*)h, unregister_io_handle);
+}
+
+goc_chan* goc_io_process_spawn(uv_process_t* handle,
+                               const uv_process_options_t* opts)
+{
+    goc_chan*                      ch = goc_chan_make(1);
+    goc_process_spawn_dispatch_t*  d  = (goc_process_spawn_dispatch_t*)goc_malloc(
+                                            sizeof(goc_process_spawn_dispatch_t));
+    d->handle = handle;
+    d->opts   = opts;
+    d->ch     = ch;
+    gc_handle_register(d);
+    dispatch_async_or_abort(&d->async, on_process_spawn_dispatch, "goc_io_process_spawn");
+    return ch;
+}
+
 void goc_io_handle_register(uv_handle_t* handle)
 {
     gc_handle_register(handle);
