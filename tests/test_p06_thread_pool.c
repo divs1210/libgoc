@@ -1944,6 +1944,7 @@ static void test_p6_30(void) {
     ASSERT(ok);
 
     goc_pool_destroy(pool);
+    done_destroy(&done);
     TEST_PASS();
 done:;
 }
