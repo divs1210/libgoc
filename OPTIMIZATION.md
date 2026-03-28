@@ -142,17 +142,69 @@ Motivated by a flakiness fix (P6.22), the `goc_take` / `goc_put` hot paths and `
 
 ## Phase 1 — Benchmark-Driven Near-Term Work
 
-### 1) Scheduler scaling: cross-worker handoff and steal efficiency
+### 1) Scheduler scaling: cross-worker handoff and steal efficiency — Phase 1.1 (Completed)
 
-Prioritize ring/fan-in/fan-out bottlenecks with scheduler-focused changes:
+Active work stealing with victim hinting is implemented. Workers probe recently productive victims before falling back to a full random scan. The post-yield wake condition used is `depth > dq capacity / 2` (rather than the originally planned `depth > 1`) to avoid missed-wake races when the deque is nearly empty.
 
-- work-steal victim hinting (probe recently productive victims before full random scan)
-- tighter instrumentation of failed steal probes and wake/sleep churn
-- verify improvements at thread counts 2/4/8
+**Telemetry (canary, `GOC_ENABLE_STATS=1`, 2026-03-28):**
 
-- **Why**: both ring and fan-out/fan-in show a consistent pool=4→8 throughput dip, indicating cross-worker contention that doesn't resolve with more threads. Ring at 0.44× Go and fan-out dropping ~8% from pool=4 to pool=8 are the clearest remaining scheduler signals.
-- **Impact**: high for throughput scaling.
-- **Risk**: low-medium.
+```
+=== Pool Size: 1 ===
+Channel ping-pong: 200000 round trips in 122ms (1626194 round trips/s)
+  [stats] steal: 0 attempts / 0 successes / 0 misses  |  idle wakeups: 1  |  timeouts: 0 alloc / 0 fired  |  cb-queue hwm: 0
+Ring benchmark: 500000 hops across 128 tasks in 532ms (939254 hops/s)
+  [stats] steal: 0 attempts / 0 successes / 0 misses  |  idle wakeups: 1  |  timeouts: 0 alloc / 0 fired  |  cb-queue hwm: 0
+Selective receive / fan-out / fan-in: 200000 messages with 8 workers in 989ms (202205 msg/s)
+  [stats] steal: 0 attempts / 0 successes / 0 misses  |  idle wakeups: 1  |  timeouts: 0 alloc / 0 fired  |  cb-queue hwm: 0
+Spawn idle tasks: 200000 fibers in 2809ms (71179 tasks/s)
+  [stats] steal: 0 attempts / 0 successes / 0 misses  |  idle wakeups: 1  |  timeouts: 0 alloc / 0 fired  |  cb-queue hwm: 0
+Prime sieve: 2262 primes up to 20000 in 843ms (2680 primes/s)
+  [stats] steal: 0 attempts / 0 successes / 0 misses  |  idle wakeups: 1  |  timeouts: 0 alloc / 0 fired  |  cb-queue hwm: 0
+
+=== Pool Size: 2 ===
+Channel ping-pong: 200000 round trips in 131ms (1521114 round trips/s)
+  [stats] steal: 2 attempts / 0 successes / 2 misses  |  idle wakeups: 1  |  timeouts: 0 alloc / 0 fired  |  cb-queue hwm: 0
+Ring benchmark: 500000 hops across 128 tasks in 718ms (696198 hops/s)
+  [stats] steal: 2 attempts / 0 successes / 2 misses  |  idle wakeups: 1  |  timeouts: 0 alloc / 0 fired  |  cb-queue hwm: 0
+Selective receive / fan-out / fan-in: 200000 messages with 8 workers in 1046ms (191135 msg/s)
+  [stats] steal: 2 attempts / 0 successes / 2 misses  |  idle wakeups: 1  |  timeouts: 0 alloc / 0 fired  |  cb-queue hwm: 0
+Spawn idle tasks: 200000 fibers in 5276ms (37903 tasks/s)
+  [stats] steal: 104231 attempts / 104227 successes / 4 misses  |  idle wakeups: 2  |  timeouts: 0 alloc / 0 fired  |  cb-queue hwm: 0
+Prime sieve: 2262 primes up to 20000 in 919ms (2459 primes/s)
+  [stats] steal: 104231 attempts / 104227 successes / 4 misses  |  idle wakeups: 2  |  timeouts: 0 alloc / 0 fired  |  cb-queue hwm: 0
+
+=== Pool Size: 4 ===
+Channel ping-pong: 200000 round trips in 117ms (1698720 round trips/s)
+  [stats] steal: 12 attempts / 0 successes / 12 misses  |  idle wakeups: 1  |  timeouts: 0 alloc / 0 fired  |  cb-queue hwm: 0
+Ring benchmark: 500000 hops across 128 tasks in 690ms (724363 hops/s)
+  [stats] steal: 12 attempts / 0 successes / 12 misses  |  idle wakeups: 1  |  timeouts: 0 alloc / 0 fired  |  cb-queue hwm: 0
+Selective receive / fan-out / fan-in: 200000 messages with 8 workers in 1011ms (197775 msg/s)
+  [stats] steal: 12 attempts / 0 successes / 12 misses  |  idle wakeups: 1  |  timeouts: 0 alloc / 0 fired  |  cb-queue hwm: 0
+Spawn idle tasks: 200000 fibers in 5310ms (37658 tasks/s)
+  [stats] steal: 106104 attempts / 106087 successes / 17 misses  |  idle wakeups: 2  |  timeouts: 0 alloc / 0 fired  |  cb-queue hwm: 0
+Prime sieve: 2262 primes up to 20000 in 892ms (2534 primes/s)
+  [stats] steal: 106104 attempts / 106087 successes / 17 misses  |  idle wakeups: 2  |  timeouts: 0 alloc / 0 fired  |  cb-queue hwm: 0
+
+=== Pool Size: 8 ===
+Channel ping-pong: 200000 round trips in 106ms (1882440 round trips/s)
+  [stats] steal: 56 attempts / 0 successes / 56 misses  |  idle wakeups: 1  |  timeouts: 0 alloc / 0 fired  |  cb-queue hwm: 0
+Ring benchmark: 500000 hops across 128 tasks in 540ms (924375 hops/s)
+  [stats] steal: 56 attempts / 0 successes / 56 misses  |  idle wakeups: 1  |  timeouts: 0 alloc / 0 fired  |  cb-queue hwm: 0
+Selective receive / fan-out / fan-in: 200000 messages with 8 workers in 1011ms (197775 msg/s)
+  [stats] steal: 56 attempts / 0 successes / 56 misses  |  idle wakeups: 1  |  timeouts: 0 alloc / 0 fired  |  cb-queue hwm: 0
+Spawn idle tasks: 200000 fibers in 5254ms (38063 tasks/s)
+  [stats] steal: 106786 attempts / 106713 successes / 73 misses  |  idle wakeups: 2  |  timeouts: 0 alloc / 0 fired  |  cb-queue hwm: 0
+Prime sieve: 2262 primes up to 20000 in 869ms (2602 primes/s)
+  [stats] steal: 106786 attempts / 106713 successes / 73 misses  |  idle wakeups: 2  |  timeouts: 0 alloc / 0 fired  |  cb-queue hwm: 0
+```
+
+**Key findings vs. Phase 0 baseline:**
+
+- **Ring improved significantly at pool=1**: 939k vs 377k hops/s (2.5×). Pool=2/4/8 are mixed relative to Phase 0.
+- **Fan-out/fan-in improved at pool=1**: 202k vs 143k msg/s. Pool=2/4/8 slightly lower than Phase 0 peak (236k).
+- **Spawn idle severely regressed at pool≥2**: ~38k tasks/s vs ~74k in Phase 0 (≈2× slower). Steal stats confirm the cause: 104k–107k steal *successes* during spawn idle at pool≥2, indicating active steal thrashing. Each newly spawned idle fiber is being stolen and re-stolen continuously rather than completing in place.
+- **Push-based workloads (ping-pong, ring, fan-out) still show 0 steal successes** at pool≥2 for the non-spawn benchmarks, confirming stealing only fires in the spawn-idle pattern where many short-lived fibers are queued in bursts.
+- **Open issue**: spawn idle regressed ~2× at pool≥2 due to steal thrashing. Suppressing this (e.g., throttling steals when per-fiber time is very short, or biasing newly spawned fibers to stay on their origin worker's deque) is tracked as a follow-on item.
 
 ### 2) Spawn/materialization and stack policy
 

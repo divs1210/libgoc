@@ -77,7 +77,7 @@ make -C clojure run-all
 | **OS**          | Ubuntu 24.04.4 LTS             |
 | **Kernel**      | Linux 6.11.0 x86_64            |
 
-3 runs of each benchmark (Go, libgoc canary, libgoc vmem, Clojure) can be found in the [bench/logs/](logs/) directory.
+3 runs of each benchmark (Go, libgoc canary, libgoc vmem, Clojure) can be found in the [bench/logs/](logs/) directory. All numbers in the report below are the best of those 3 runs for each pool size.
 
 ## Report: libgoc vs. Go Baseline (+ Clojure)
 
