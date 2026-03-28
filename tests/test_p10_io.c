@@ -26,6 +26,8 @@
  *   P10.11 goc_io_fs_sendfile: copy bytes between two file descriptors
  *   P10.12 Channel-based goc_io_fs_open integrates with goc_alts (select
  *          on open vs. a dummy channel that never fires)
+ *   P10.13 goc_io_handle_register + goc_io_handle_close: GC-allocated
+ *          uv_tcp_t handle registers, closes, and unregisters cleanly
  */
 
 #if !defined(_WIN32) && !defined(__APPLE__)
@@ -539,6 +541,36 @@ done:;
 }
 
 /* =========================================================================
+ * P10.13 goc_io_handle_register + goc_io_handle_close
+ * ====================================================================== */
+
+static void fiber_p10_13(void* arg)
+{
+    fiber_result_t* r = (fiber_result_t*)arg;
+
+    uv_tcp_t* tcp = (uv_tcp_t*)goc_malloc(sizeof(uv_tcp_t));
+    int rc = uv_tcp_init(goc_scheduler(), tcp);
+    if (rc != 0) goto done;
+
+    goc_io_handle_register((uv_handle_t*)tcp);
+    goc_io_handle_close((uv_handle_t*)tcp, NULL);
+
+    r->ok = 1;
+done:;
+}
+
+static void test_p10_13(void)
+{
+    TEST_BEGIN("P10.13 goc_io_handle_register + goc_io_handle_close: no crash");
+    fiber_result_t r = {0};
+    goc_chan* done_ch = goc_go(fiber_p10_13, &r);
+    goc_take_sync(done_ch);
+    ASSERT(r.ok);
+    TEST_PASS();
+done:;
+}
+
+/* =========================================================================
  * main
  * ====================================================================== */
 
@@ -564,6 +596,7 @@ int main(void)
     test_p10_10();
     test_p10_11();
     test_p10_12();
+    test_p10_13();
 
     printf("\n%d/%d tests passed", g_tests_passed, g_tests_run);
     if (g_tests_failed)
