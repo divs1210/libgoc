@@ -312,12 +312,12 @@ static void pool_worker_fn(void* arg) {
 
     while (!atomic_load_explicit(&pool->shutdown, memory_order_acquire)) {
 
-        /* 1. Drain own injector first (entries posted by external callers). */
-        entry = injector_pop(&tl_worker->injector);
+        /* 1. Pop from own deque (LIFO, cache-warm). */
+        entry = wsdq_pop_bottom(&tl_worker->deque);
         if (entry != NULL) goto run;
 
-        /* 2. Pop from own deque (LIFO, cache-warm). */
-        entry = wsdq_pop_bottom(&tl_worker->deque);
+        /* 2. Drain own injector (entries posted by external callers). */
+        entry = injector_pop(&tl_worker->injector);
         if (entry != NULL) goto run;
 
         /* 3. Steal phase: victim hinting, then randomized scan. */
@@ -381,9 +381,9 @@ static void pool_worker_fn(void* arg) {
 
         atomic_fetch_add_explicit(&pool->idle_count, 1, memory_order_seq_cst);
 
-        entry = injector_pop(&tl_worker->injector);
+        entry = wsdq_pop_bottom(&tl_worker->deque);
         if (entry == NULL)
-            entry = wsdq_pop_bottom(&tl_worker->deque);
+            entry = injector_pop(&tl_worker->injector);
         if (entry != NULL) {
             atomic_fetch_sub_explicit(&pool->idle_count, 1, memory_order_relaxed);
             goto run;
