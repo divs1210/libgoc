@@ -31,6 +31,9 @@
  *   S4.1  goc_stats_shutdown() disables stats delivery
  *   S5.1  Worker STOPPED event carries valid steal_attempts/steal_successes
  *   S6.1  goc_cb_queue_get_hwm() reflects peak callback-queue depth
+ *   S6.4  steal_misses/idle_wakeups delta is zero when no work is done
+ *   S6.5  idle_wakeups increments after external injection (pool=2, 1 fiber)
+ *   S6.6  goc_pool_get_steal_stats extended signature returns valid values
  *
  *   (See test source for details on each scenario.)
  */
@@ -799,6 +802,76 @@ done:;
 }
 
 /*
+ * S6.4 — steal_misses and idle_wakeups delta is zero when no work is done
+ *
+ * Create a pool and immediately destroy it without posting any fibers.
+ * The deltas for both new counter fields must be 0.
+ */
+static void test_s6_4(void) {
+    TEST_BEGIN("S6.4  steal_misses/idle_wakeups delta is zero with no work");
+
+    uint64_t att0, suc0, mis0, wak0;
+    goc_pool_get_steal_stats(&att0, &suc0, &mis0, &wak0);
+
+    goc_pool* pool = goc_pool_make(2);
+    goc_pool_destroy(pool);
+
+    uint64_t att1, suc1, mis1, wak1;
+    goc_pool_get_steal_stats(&att1, &suc1, &mis1, &wak1);
+
+    ASSERT((mis1 - mis0) == 0);
+    ASSERT((wak1 - wak0) == 0);
+
+    TEST_PASS();
+done:;
+}
+
+/*
+ * S6.5 — idle_wakeups increments on each sleep/wake cycle
+ *
+ * Post a single fiber from the main thread (external injection) on a 2-worker
+ * pool.  At least one worker must wake to pick it up, so global idle_wakeups
+ * must increase by at least 1 after the pool is destroyed.
+ */
+static void test_s6_5(void) {
+    TEST_BEGIN("S6.5  idle_wakeups increments after external injection");
+
+    uint64_t att0, suc0, mis0, wak0;
+    goc_pool_get_steal_stats(&att0, &suc0, &mis0, &wak0);
+
+    goc_pool* pool = goc_pool_make(2);
+    goc_go_on(pool, noop_fiber, NULL);
+    goc_pool_destroy(pool);
+
+    uint64_t att1, suc1, mis1, wak1;
+    goc_pool_get_steal_stats(&att1, &suc1, &mis1, &wak1);
+
+    ASSERT((wak1 - wak0) >= 1);
+
+    TEST_PASS();
+done:;
+}
+
+/*
+ * S6.6 — goc_pool_get_steal_stats extended signature: all counters non-negative
+ *
+ * Verify the 4-output-param accessor compiles and returns plausible values:
+ * all counters >= 0 and successes <= attempts, misses <= attempts.
+ */
+static void test_s6_6(void) {
+    TEST_BEGIN("S6.6  goc_pool_get_steal_stats extended signature returns valid values");
+
+    uint64_t attempts = 0, successes = 0, misses = 0, idle_wakeups = 0;
+    goc_pool_get_steal_stats(&attempts, &successes, &misses, &idle_wakeups);
+
+    ASSERT(successes <= attempts);
+    ASSERT(misses    <= attempts);
+
+    TEST_PASS();
+done:;
+}
+
+/*
  * S4_1 — goc_stats_shutdown() disables stats delivery
  */
 static void test_s4_1(void) {
@@ -850,6 +923,9 @@ int main(void) {
     test_s6_1();
     test_s6_2();
     test_s6_3();
+    test_s6_4();
+    test_s6_5();
+    test_s6_6();
     test_s4_1();
     printf("\n");
 
