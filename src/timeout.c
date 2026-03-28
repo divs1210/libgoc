@@ -2,13 +2,13 @@
  * src/timeout.c — Timeout channels via libuv timers
  *
  * Implements: goc_timeout
- * All timer handles are malloc-allocated and live on the libuv event loop
- * thread. The GC heap is never used for handle storage.
+ * All timer context structs are GC-allocated and registered via
+ * gc_handle_register so the collector keeps them alive while libuv holds
+ * references to them.
  */
 
 #include <stdlib.h>
 #include <stdio.h>
-#include <assert.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <uv.h>
@@ -40,16 +40,15 @@ typedef struct goc_timeout_timer_ctx {
  * Static callbacks (loop thread)
  * ---------------------------------------------------------------------- */
 
-static void free_handle_cb(uv_handle_t* h) { free(h); }
+static void unregister_handle_cb(uv_handle_t* h) { gc_handle_unregister(h); }
 
 static void on_timeout(uv_timer_t* t)
 {
     goc_timeout_timer_ctx* tctx = (goc_timeout_timer_ctx*)t;
     goc_chan* ch = tctx->ch;
     atomic_fetch_add_explicit(&g_timeout_expirations, 1, memory_order_relaxed);
-    uv_handle_chan_unregister(ch);
     goc_close(ch);
-    uv_close((uv_handle_t*)t, free_handle_cb);
+    uv_close((uv_handle_t*)t, unregister_handle_cb);
 }
 
 static void on_start_timer(uv_async_t* h)
@@ -69,24 +68,22 @@ static void on_start_timer(uv_async_t* h)
 
     int rc = uv_timer_init(g_loop, &req->timer_ctx->timer);
     if (rc < 0) {
-        uv_handle_chan_unregister(req->timer_ctx->ch);
         goc_close(req->timer_ctx->ch);
-        free(req->timer_ctx);
-        uv_close((uv_handle_t*)h, free_handle_cb);
+        gc_handle_unregister(req->timer_ctx);
+        uv_close((uv_handle_t*)h, unregister_handle_cb);
         return;
     }
 
     rc = uv_timer_start(&req->timer_ctx->timer, on_timeout, remaining, 0);  /* one-shot */
     if (rc < 0) {
-        uv_handle_chan_unregister(req->timer_ctx->ch);
         goc_close(req->timer_ctx->ch);
-        uv_close((uv_handle_t*)&req->timer_ctx->timer, free_handle_cb);
-        uv_close((uv_handle_t*)h, free_handle_cb);
+        uv_close((uv_handle_t*)&req->timer_ctx->timer, unregister_handle_cb);
+        uv_close((uv_handle_t*)h, unregister_handle_cb);
         return;
     }
 
     /* Close the async handle; it is one-shot and no longer needed. */
-    uv_close((uv_handle_t*)h, free_handle_cb);
+    uv_close((uv_handle_t*)h, unregister_handle_cb);
 }
 
 /* -------------------------------------------------------------------------
@@ -96,10 +93,8 @@ static void on_start_timer(uv_async_t* h)
 goc_chan* goc_timeout(uint64_t ms)
 {
     goc_chan*               ch   = goc_chan_make(0);   /* rendezvous channel */
-    goc_timeout_req*        req  = (goc_timeout_req*)malloc(sizeof(goc_timeout_req));
-    goc_timeout_timer_ctx*  tctx = (goc_timeout_timer_ctx*)malloc(sizeof(goc_timeout_timer_ctx));
-    assert(req);
-    assert(tctx);
+    goc_timeout_req*        req  = (goc_timeout_req*)goc_malloc(sizeof(goc_timeout_req));
+    goc_timeout_timer_ctx*  tctx = (goc_timeout_timer_ctx*)goc_malloc(sizeof(goc_timeout_timer_ctx));
 
     tctx->ch = ch;
 
@@ -107,15 +102,17 @@ goc_chan* goc_timeout(uint64_t ms)
     req->ms          = ms;
     req->deadline_ns = uv_hrtime();  /* snapshot call time for dispatch-latency correction */
 
-    uv_handle_chan_register(ch);      /* keep ch alive while timer is pending */
+    /* Register both structs: req holds the async handle libuv will reference,
+     * tctx holds the timer handle and the channel pointer. */
+    gc_handle_register(req);
+    gc_handle_register(tctx);
 
     /* uv_async_init is safe to call from any thread. */
     int rc = uv_async_init(g_loop, &req->async, on_start_timer);
     if (rc < 0) {
-        uv_handle_chan_unregister(ch);
         goc_close(ch);
-        free(tctx);
-        free(req);
+        gc_handle_unregister(req);
+        gc_handle_unregister(tctx);
         return ch;
     }
 

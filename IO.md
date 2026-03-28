@@ -28,6 +28,7 @@
 - [2. UDP (Datagrams)](#2-udp-datagrams)
 - [3. File System Operations](#3-file-system-operations)
 - [4. DNS & Resolution](#4-dns--resolution)
+- [5. GC handle lifetime management](#5-gc-handle-lifetime-management)
 
 ---
 
@@ -54,13 +55,20 @@ Stream and UDP operations (`uv_write`, `uv_read_start`, etc.) use a
 `uv_async_t` bridge and are safe to call from fiber or OS-thread context.
 
 Handle initialisation (`uv_tcp_init`, `uv_pipe_init`, `uv_udp_init`, etc.)
-is synchronous and takes no callback, so it is outside the scope of `goc_io`.
-Use raw libuv functions with `goc_scheduler()` as the loop argument:
+modifies internal loop state and must reach the event loop thread. Use the
+provided init helpers (`goc_io_tcp_init`, `goc_io_pipe_init`, `goc_io_udp_init`,
+`goc_io_tty_init`, `goc_io_signal_init`, `goc_io_fs_event_init`,
+`goc_io_fs_poll_init`, `goc_io_process_spawn`) — they dispatch to the loop
+thread and register the handle automatically:
 
 ```c
 uv_tcp_t* tcp = goc_malloc(sizeof(uv_tcp_t));
-uv_tcp_init(goc_scheduler(), tcp);
+int rc = goc_unbox_int(goc_take(goc_io_tcp_init(tcp))->val);
+// ... later:
+goc_io_handle_close((uv_handle_t*)tcp, NULL);  /* unregisters automatically */
 ```
+
+See [GC handle lifetime management](#5-gc-handle-lifetime-management) for full details.
 
 For **write / send** operations the caller must keep the `uv_buf_t` array and
 all `buf.base` pointers valid until the result channel delivers its value (i.e.
@@ -296,6 +304,65 @@ int main(void) {
     goc_shutdown();
     return 0;
 }
+```
+
+---
+
+## 5. GC handle lifetime management
+
+libuv holds an opaque internal reference to every handle until `uv_close`
+completes.  That reference is invisible to Boehm GC, so a handle allocated
+with `goc_malloc` would risk premature collection.  These functions pin the
+handle in a GC-visible root array for the duration of its libuv lifetime.
+
+### Handle init helpers
+
+| Function | Signature | Description |
+|---|---|---|
+| `goc_io_tcp_init` | `goc_chan* goc_io_tcp_init(uv_tcp_t* handle)` | Dispatch `uv_tcp_init` to the loop thread and register the handle. Channel delivers `goc_box_int(status)`; 0 on success. Safe from any context. |
+| `goc_io_pipe_init` | `goc_chan* goc_io_pipe_init(uv_pipe_t* handle, int ipc)` | Dispatch `uv_pipe_init` to the loop thread and register the handle. Channel delivers `goc_box_int(status)`; 0 on success. Safe from any context. |
+| `goc_io_udp_init` | `goc_chan* goc_io_udp_init(uv_udp_t* handle)` | Dispatch `uv_udp_init` to the loop thread and register the handle. Channel delivers `goc_box_int(status)`; 0 on success. Safe from any context. |
+| `goc_io_tty_init` | `goc_chan* goc_io_tty_init(uv_tty_t* handle, uv_file fd)` | Dispatch `uv_tty_init` to the loop thread and register the handle. `fd`: 0=stdin, 1=stdout, 2=stderr. Channel delivers `goc_box_int(status)`; 0 on success. Safe from any context. |
+| `goc_io_signal_init` | `goc_chan* goc_io_signal_init(uv_signal_t* handle)` | Dispatch `uv_signal_init` to the loop thread and register the handle. Channel delivers `goc_box_int(status)`; 0 on success. Safe from any context. |
+| `goc_io_fs_event_init` | `goc_chan* goc_io_fs_event_init(uv_fs_event_t* handle)` | Dispatch `uv_fs_event_init` to the loop thread and register the handle. Channel delivers `goc_box_int(status)`; 0 on success. Safe from any context. |
+| `goc_io_fs_poll_init` | `goc_chan* goc_io_fs_poll_init(uv_fs_poll_t* handle)` | Dispatch `uv_fs_poll_init` to the loop thread and register the handle. Channel delivers `goc_box_int(status)`; 0 on success. Safe from any context. |
+| `goc_io_process_spawn` | `goc_chan* goc_io_process_spawn(uv_process_t* handle, const uv_process_options_t* opts)` | Dispatch `uv_spawn` to the loop thread. On success the process is running and the handle is registered. The `opts` pointer must remain valid until the channel delivers. Channel delivers `goc_box_int(status)`; 0 on success. Safe from any context. |
+
+### Lifetime management
+
+| Function | Signature | Description |
+|---|---|---|
+| `goc_io_handle_register` | `void goc_io_handle_register(uv_handle_t* handle)` | Pin a GC-allocated handle as a GC root. Only needed if you call `uv_*_init` yourself (e.g. from the loop thread). Safe from any context. |
+| `goc_io_handle_unregister` | `void goc_io_handle_unregister(uv_handle_t* handle)` | Remove the handle from the root array. Call from inside your `uv_close` callback. Safe from any context. |
+| `goc_io_handle_close` | `void goc_io_handle_close(uv_handle_t* handle, uv_close_cb cb)` | Dispatch `uv_close` to the loop thread and automatically unregister on completion, then forward to `cb` (may be NULL). Safe from any context. Overwrites `handle->data` from the loop thread before calling `uv_close`. |
+
+**Example — TCP handle from fiber context**
+
+```c
+#include "goc.h"
+#include "goc_io.h"
+
+static void tcp_fiber(void* _) {
+    uv_tcp_t* tcp = goc_malloc(sizeof(uv_tcp_t));
+    int rc = goc_unbox_int(goc_take(goc_io_tcp_init(tcp))->val);
+    if (rc < 0) return;  /* init failed */
+
+    /* ... connect, read, write ... */
+
+    goc_io_handle_close((uv_handle_t*)tcp, NULL);
+}
+```
+
+If you need the close callback for your own cleanup and are calling `uv_close`
+directly from the loop thread, use `goc_io_handle_unregister` from within it
+instead of `goc_io_handle_close`:
+
+```c
+static void on_closed(uv_handle_t* h) {
+    goc_io_handle_unregister(h);
+    /* h is GC-managed; no free() needed */
+}
+uv_close((uv_handle_t*)tcp, on_closed);  /* must be on loop thread */
 ```
 
 ---
