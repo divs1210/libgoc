@@ -1703,8 +1703,8 @@ static void test_p6_25(void) {
     goc_stats_init();
     goc_stats_set_callback(p6_steal_collect, &evbuf);
 
-    uint64_t att0 = 0, suc0 = 0;
-    goc_pool_get_steal_stats(&att0, &suc0);
+    uint64_t att0 = 0, suc0 = 0, mis0 = 0, wak0 = 0;
+    goc_pool_get_steal_stats(&att0, &suc0, &mis0, &wak0);
 
     goc_pool* pool = goc_pool_make(2);
     ASSERT(pool != NULL);
@@ -1716,8 +1716,8 @@ static void test_p6_25(void) {
     goc_pool_destroy(pool);
     goc_stats_flush();
 
-    uint64_t att1 = 0, suc1 = 0;
-    goc_pool_get_steal_stats(&att1, &suc1);
+    uint64_t att1 = 0, suc1 = 0, mis1 = 0, wak1 = 0;
+    goc_pool_get_steal_stats(&att1, &suc1, &mis1, &wak1);
 
     goc_stats_shutdown();
 

@@ -124,7 +124,8 @@ void goc_stats_submit_event_channel(int id, int status, int buf_size, int item_c
 /* Telemetry accessors — available when GOC_ENABLE_STATS is defined */
 void   goc_timeout_get_stats(uint64_t *allocations, uint64_t *expirations);
 size_t goc_cb_queue_get_hwm(void);
-void   goc_pool_get_steal_stats(uint64_t *attempts, uint64_t *successes);
+void   goc_pool_get_steal_stats(uint64_t *attempts, uint64_t *successes,
+                                uint64_t *misses,   uint64_t *idle_wakeups);
 #endif
 
 /* -------------------------------------------------------------------------

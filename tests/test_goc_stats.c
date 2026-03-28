@@ -779,16 +779,16 @@ done:;
 static void test_s6_3(void) {
     TEST_BEGIN("S6.3  goc_pool_get_steal_stats returns non-decreasing totals");
 
-    uint64_t att0, suc0;
-    goc_pool_get_steal_stats(&att0, &suc0);
+    uint64_t att0, suc0, mis0, wak0;
+    goc_pool_get_steal_stats(&att0, &suc0, &mis0, &wak0);
 
     goc_pool* pool = goc_pool_make(2);
     for (int i = 0; i < 64; i++)
         goc_go_on(pool, noop_fiber, NULL);
     goc_pool_destroy(pool);
 
-    uint64_t att1, suc1;
-    goc_pool_get_steal_stats(&att1, &suc1);
+    uint64_t att1, suc1, mis1, wak1;
+    goc_pool_get_steal_stats(&att1, &suc1, &mis1, &wak1);
 
     ASSERT(att1 >= att0);
     ASSERT(suc1 >= suc0);

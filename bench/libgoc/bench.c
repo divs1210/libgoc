@@ -74,8 +74,8 @@
  */
 #ifdef GOC_ENABLE_STATS
 static void bench_print_stats(void) {
-    uint64_t steal_att = 0, steal_suc = 0;
-    goc_pool_get_steal_stats(&steal_att, &steal_suc);
+    uint64_t steal_att = 0, steal_suc = 0, steal_mis = 0, idle_wak = 0;
+    goc_pool_get_steal_stats(&steal_att, &steal_suc, &steal_mis, &idle_wak);
 
     uint64_t to_allocs = 0, to_expires = 0;
     goc_timeout_get_stats(&to_allocs, &to_expires);
@@ -83,9 +83,11 @@ static void bench_print_stats(void) {
     size_t cb_hwm = goc_cb_queue_get_hwm();
 
     printf("  [stats] steal: %" PRIu64 " attempts / %" PRIu64 " successes"
+           " / %" PRIu64 " misses"
+           "  |  idle wakeups: %" PRIu64
            "  |  timeouts: %" PRIu64 " alloc / %" PRIu64 " fired"
            "  |  cb-queue hwm: %zu\n",
-           steal_att, steal_suc, to_allocs, to_expires, cb_hwm);
+           steal_att, steal_suc, steal_mis, idle_wak, to_allocs, to_expires, cb_hwm);
 }
 #else
 static inline void bench_print_stats(void) {}

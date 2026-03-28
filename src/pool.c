@@ -40,12 +40,16 @@ typedef struct {
     goc_pool*        pool;
     _Atomic uint64_t steal_attempts;  /* relaxed counter; read at STOPPED event */
     _Atomic uint64_t steal_successes;
+    _Atomic uint64_t steal_misses;    /* wsdq_steal_top returned NULL */
+    _Atomic uint64_t idle_wakeups;    /* uv_sem_wait returned (each sleep/wake cycle) */
     size_t           last_steal_victim; /* victim hint for next steal, SIZE_MAX = unset */
 } goc_worker;
 
 /* Global lifetime steal totals across all pools/workers — read via accessor */
 static _Atomic uint64_t g_steal_attempts  = 0;
 static _Atomic uint64_t g_steal_successes = 0;
+static _Atomic uint64_t g_steal_misses    = 0;
+static _Atomic uint64_t g_idle_wakeups    = 0;
 
 /* -------------------------------------------------------------------------
  * goc_pool — full definition (opaque outside pool.c)
@@ -337,6 +341,10 @@ static void pool_worker_fn(void* arg) {
                     tl_worker->last_steal_victim = victim_hint;
                     goto run;
                 }
+#ifdef GOC_ENABLE_STATS
+                atomic_fetch_add_explicit(&tl_worker->steal_misses, 1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_steal_misses,           1, memory_order_relaxed);
+#endif
             }
             /* Fallback: randomized scan as before */
             seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
@@ -357,6 +365,10 @@ static void pool_worker_fn(void* arg) {
                     tl_worker->last_steal_victim = victim;
                     goto run;
                 }
+#ifdef GOC_ENABLE_STATS
+                atomic_fetch_add_explicit(&tl_worker->steal_misses, 1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_steal_misses,           1, memory_order_relaxed);
+#endif
             }
             /* If all fail, clear the hint for next round */
             tl_worker->last_steal_victim = SIZE_MAX;
@@ -390,6 +402,10 @@ static void pool_worker_fn(void* arg) {
 
         GOC_STATS_WORKER_STATUS((int)tl_worker->index, pool, GOC_WORKER_IDLE, (int)pool->live_count, 0, 0);
         uv_sem_wait(&tl_worker->idle_sem);
+#ifdef GOC_ENABLE_STATS
+        atomic_fetch_add_explicit(&tl_worker->idle_wakeups, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_idle_wakeups,           1, memory_order_relaxed);
+#endif
         atomic_fetch_sub_explicit(&pool->idle_count, 1, memory_order_relaxed);
         GOC_STATS_WORKER_STATUS((int)tl_worker->index, pool, GOC_WORKER_RUNNING, (int)pool->live_count, 0, 0);
         continue;   /* re-check shutdown and try again */
@@ -702,8 +718,11 @@ goc_drain_result_t goc_pool_destroy_timeout(goc_pool* pool, uint64_t ms) {
 /* -------------------------------------------------------------------------
  * goc_pool_get_steal_stats — aggregate steal counters across all pools/workers
  * ---------------------------------------------------------------------- */
-void goc_pool_get_steal_stats(uint64_t *attempts, uint64_t *successes)
+void goc_pool_get_steal_stats(uint64_t *attempts, uint64_t *successes,
+                              uint64_t *misses,   uint64_t *idle_wakeups)
 {
-    *attempts  = atomic_load_explicit(&g_steal_attempts,  memory_order_relaxed);
-    *successes = atomic_load_explicit(&g_steal_successes, memory_order_relaxed);
+    *attempts     = atomic_load_explicit(&g_steal_attempts,  memory_order_relaxed);
+    *successes    = atomic_load_explicit(&g_steal_successes, memory_order_relaxed);
+    *misses       = atomic_load_explicit(&g_steal_misses,    memory_order_relaxed);
+    *idle_wakeups = atomic_load_explicit(&g_idle_wakeups,    memory_order_relaxed);
 }
