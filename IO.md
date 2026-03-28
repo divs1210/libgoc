@@ -28,6 +28,7 @@
 - [2. UDP (Datagrams)](#2-udp-datagrams)
 - [3. File System Operations](#3-file-system-operations)
 - [4. DNS & Resolution](#4-dns--resolution)
+- [5. GC handle lifetime management](#5-gc-handle-lifetime-management)
 
 ---
 
@@ -55,12 +56,18 @@ Stream and UDP operations (`uv_write`, `uv_read_start`, etc.) use a
 
 Handle initialisation (`uv_tcp_init`, `uv_pipe_init`, `uv_udp_init`, etc.)
 is synchronous and takes no callback, so it is outside the scope of `goc_io`.
-Use raw libuv functions with `goc_scheduler()` as the loop argument:
+Use raw libuv functions with `goc_scheduler()` as the loop argument.  All
+handles used with libgoc must be GC-allocated and registered:
 
 ```c
 uv_tcp_t* tcp = goc_malloc(sizeof(uv_tcp_t));
 uv_tcp_init(goc_scheduler(), tcp);
+goc_io_handle_register((uv_handle_t*)tcp);
+// ... later:
+goc_io_handle_close((uv_handle_t*)tcp, NULL);  /* unregisters automatically */
 ```
+
+See [GC handle lifetime management](#5-gc-handle-lifetime-management) for full details.
 
 For **write / send** operations the caller must keep the `uv_buf_t` array and
 all `buf.base` pointers valid until the result channel delivers its value (i.e.
@@ -296,6 +303,50 @@ int main(void) {
     goc_shutdown();
     return 0;
 }
+```
+
+---
+
+## 5. GC handle lifetime management
+
+libuv holds an opaque internal reference to every handle until `uv_close`
+completes.  That reference is invisible to Boehm GC, so a handle allocated
+with `goc_malloc` would risk premature collection.  These functions pin the
+handle in a GC-visible root array for the duration of its libuv lifetime.
+
+| Function | Signature | Description |
+|---|---|---|
+| `goc_io_handle_register` | `void goc_io_handle_register(uv_handle_t* handle)` | Pin a GC-allocated handle as a GC root. Call immediately after `uv_*_init()`. Safe from any context. |
+| `goc_io_handle_unregister` | `void goc_io_handle_unregister(uv_handle_t* handle)` | Remove the handle from the root array. Call from inside your `uv_close` callback. Safe from any context. |
+| `goc_io_handle_close` | `void goc_io_handle_close(uv_handle_t* handle, uv_close_cb cb)` | Call `uv_close` and automatically unregister on completion, then forward to `cb` (may be NULL). Overwrites `handle->data` for the duration of the close. |
+
+**Example**
+
+```c
+#include "goc.h"
+#include "goc_io.h"
+
+static void tcp_fiber(void* _) {
+    uv_tcp_t* tcp = goc_malloc(sizeof(uv_tcp_t));
+    uv_tcp_init(goc_scheduler(), tcp);
+    goc_io_handle_register((uv_handle_t*)tcp);
+
+    /* ... connect, read, write ... */
+
+    /* Tear down: unregisters from GC roots automatically. */
+    goc_io_handle_close((uv_handle_t*)tcp, NULL);
+}
+```
+
+If you need the close callback for your own cleanup and are calling `uv_close`
+directly, call `goc_io_handle_unregister` from within it instead:
+
+```c
+static void on_closed(uv_handle_t* h) {
+    goc_io_handle_unregister(h);
+    /* h is GC-managed; no free() needed */
+}
+uv_close((uv_handle_t*)tcp, on_closed);
 ```
 
 ---

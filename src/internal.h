@@ -217,8 +217,10 @@ void chan_unregister(goc_chan* ch);
 
 /* gc.c → used by timeout.c and goc_io.c */
 void live_uv_handles_init(void);
-void uv_handle_chan_register(goc_chan* ch);
-void uv_handle_chan_unregister(goc_chan* ch);
+
+/* gc.c → used by goc_io.c (goc_handle_register/unregister) */
+void gc_handle_register(void* p);
+void gc_handle_unregister(void* p);
 
 /* gc.c → used by fiber.c, pool.c */
 void* goc_fiber_root_register(mco_coro* coro, void* top, goc_entry* entry);

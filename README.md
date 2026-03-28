@@ -287,7 +287,7 @@ int main(void) {
 **A few things to keep in mind:**
 
 - `goc_malloc` is a thin wrapper around `GC_malloc`. Memory is zero-initialised.
-- **libuv handles** must be allocated with plain `malloc`. See [`goc_malloc`](#memory-allocation).
+- **libuv handles** must be GC-allocated with `goc_malloc` and registered via `goc_io_handle_register`. See [Async I/O](#async-io).
 
 ---
 
@@ -313,7 +313,7 @@ my_obj_t* obj = goc_malloc(sizeof(my_obj_t));
 // obj is automatically collected when no longer reachable
 ```
 
-> **Note:** libuv handles (`uv_timer_t`, `uv_async_t`, etc.) must still be allocated with plain `malloc`, not `goc_malloc`. libuv holds internal references to handles until `uv_close` completes; GC-allocated handles risk collection before `uv_close` fires.
+> **Note:** libuv handles (`uv_timer_t`, `uv_async_t`, etc.) must be allocated with `goc_malloc` and registered via `goc_io_handle_register`. This pins them in a GC-visible root array so they are not collected while libuv holds an internal reference.
 
 ---
 
@@ -677,17 +677,7 @@ if (goc_pool_destroy_timeout(io_pool, 2000) == GOC_DRAIN_TIMEOUT) {
 |---|---|---|
 | `goc_scheduler` | `uv_loop_t* goc_scheduler(void)` | Return the `uv_loop_t*` owned by the runtime. Safe to call from any thread after `goc_init` returns. **Do not call `uv_run` or `uv_loop_close` on the returned pointer.** |
 
-Use `goc_scheduler` to register user-owned libuv handles on the same event loop as the runtime. All such handles must be freed only inside the `uv_close` completion callback. See [`goc_malloc`](#memory-allocation) for allocation requirements.
-
-```c
-static void on_handle_closed(uv_handle_t* h) { free(h); }
-
-uv_tcp_t* server = malloc(sizeof(uv_tcp_t));
-uv_tcp_init(goc_scheduler(), server);
-
-// ... later, to tear down:
-uv_close((uv_handle_t*)server, on_handle_closed);
-```
+Use `goc_scheduler` to register user-owned libuv handles on the same event loop as the runtime. See [IO.md](IO.md) for handle allocation and lifetime requirements.
 
 ---
 

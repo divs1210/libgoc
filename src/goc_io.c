@@ -34,12 +34,14 @@
  *
  * GC safety
  * ---------
- * goc_chan* pointers stored inside malloc-allocated libuv context structs
- * are invisible to Boehm GC.  Every channel-returning function calls
- * uv_handle_chan_register(ch) after submitting the request; every callback
- * calls uv_handle_chan_unregister(ch) before goc_put_cb().  The channel
- * remains in the GC-visible array (live_uv_handles in gc.c) until
- * close_on_put fires goc_close(), at which point chan_unregister removes it.
+ * All context and dispatch structs are GC-allocated via goc_malloc.  The GC
+ * can scan them and see the goc_chan* fields they contain, keeping channels
+ * alive.  Context/dispatch structs are registered with gc_handle_register
+ * before being handed to libuv so they are not collected while libuv holds a
+ * reference to them.  Stream/UDP recv context structs (goc_stream_ctx_t,
+ * goc_udp_recv_ctx_t) are not registered separately — they are kept alive
+ * transitively because they are reachable from handle->data, and the user
+ * handle is registered via goc_io_handle_register.
  */
 
 #include <stdlib.h>
@@ -55,10 +57,10 @@
  * Shared helpers
  * ====================================================================== */
 
-/* Callback that frees a malloc-allocated libuv handle or context struct. */
-static void free_io_handle(uv_handle_t* h)
+/* Callback used as uv_close completion for GC-allocated dispatch structs. */
+static void unregister_io_handle(uv_handle_t* h)
 {
-    free(h);
+    gc_handle_unregister(h);
 }
 
 static void dispatch_async_or_abort(uv_async_t* async,
@@ -114,24 +116,21 @@ static void on_fs_open(uv_fs_t* req)
     goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)req;
     uv_file fd = (uv_file)req->result;
     uv_fs_req_cleanup(req);
-    uv_handle_chan_unregister(ctx->ch);
+    gc_handle_unregister(ctx);
     goc_put_cb(ctx->ch, SCALAR(fd), close_on_put, ctx->ch);
-    free(ctx);
 }
 
 goc_chan* goc_io_fs_open(const char* path, int flags, int mode)
 {
     goc_chan*     ch  = goc_chan_make(1);
-    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)malloc(sizeof(goc_fs_ctx_t));
-    assert(ctx);
+    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)goc_malloc(sizeof(goc_fs_ctx_t));
     ctx->ch = ch;
     int rc = uv_fs_open(g_loop, &ctx->req, path, flags, mode, on_fs_open);
     if (rc < 0) {
         goc_put_cb(ch, SCALAR(rc), close_on_put, ch);
-        free(ctx);
         return ch;
     }
-    uv_handle_chan_register(ch);
+    gc_handle_register(ctx);
     return ch;
 }
 
@@ -145,24 +144,21 @@ static void on_fs_close(uv_fs_t* req)
     goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)req;
     int result = (int)req->result;
     uv_fs_req_cleanup(req);
-    uv_handle_chan_unregister(ctx->ch);
+    gc_handle_unregister(ctx);
     goc_put_cb(ctx->ch, SCALAR(result), close_on_put, ctx->ch);
-    free(ctx);
 }
 
 goc_chan* goc_io_fs_close(uv_file file)
 {
     goc_chan*     ch  = goc_chan_make(1);
-    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)malloc(sizeof(goc_fs_ctx_t));
-    assert(ctx);
+    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)goc_malloc(sizeof(goc_fs_ctx_t));
     ctx->ch = ch;
     int rc = uv_fs_close(g_loop, &ctx->req, file, on_fs_close);
     if (rc < 0) {
         goc_put_cb(ch, SCALAR(rc), close_on_put, ch);
-        free(ctx);
         return ch;
     }
-    uv_handle_chan_register(ch);
+    gc_handle_register(ctx);
     return ch;
 }
 
@@ -176,9 +172,8 @@ static void on_fs_read(uv_fs_t* req)
     goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)req;
     ssize_t result = (ssize_t)req->result;
     uv_fs_req_cleanup(req);
-    uv_handle_chan_unregister(ctx->ch);
+    gc_handle_unregister(ctx);
     goc_put_cb(ctx->ch, SCALAR(result), close_on_put, ctx->ch);
-    free(ctx);
 }
 
 goc_chan* goc_io_fs_read(uv_file file,
@@ -186,17 +181,15 @@ goc_chan* goc_io_fs_read(uv_file file,
                             int64_t offset)
 {
     goc_chan*     ch  = goc_chan_make(1);
-    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)malloc(sizeof(goc_fs_ctx_t));
-    assert(ctx);
+    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)goc_malloc(sizeof(goc_fs_ctx_t));
     ctx->ch = ch;
     int rc = uv_fs_read(g_loop, &ctx->req, file, bufs, nbufs, offset,
                         on_fs_read);
     if (rc < 0) {
         goc_put_cb(ch, SCALAR(rc), close_on_put, ch);
-        free(ctx);
         return ch;
     }
-    uv_handle_chan_register(ch);
+    gc_handle_register(ctx);
     return ch;
 }
 
@@ -210,9 +203,8 @@ static void on_fs_write(uv_fs_t* req)
     goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)req;
     ssize_t result = (ssize_t)req->result;
     uv_fs_req_cleanup(req);
-    uv_handle_chan_unregister(ctx->ch);
+    gc_handle_unregister(ctx);
     goc_put_cb(ctx->ch, SCALAR(result), close_on_put, ctx->ch);
-    free(ctx);
 }
 
 goc_chan* goc_io_fs_write(uv_file file,
@@ -220,17 +212,15 @@ goc_chan* goc_io_fs_write(uv_file file,
                              int64_t offset)
 {
     goc_chan*     ch  = goc_chan_make(1);
-    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)malloc(sizeof(goc_fs_ctx_t));
-    assert(ctx);
+    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)goc_malloc(sizeof(goc_fs_ctx_t));
     ctx->ch = ch;
     int rc = uv_fs_write(g_loop, &ctx->req, file, bufs, nbufs, offset,
                          on_fs_write);
     if (rc < 0) {
         goc_put_cb(ch, SCALAR(rc), close_on_put, ch);
-        free(ctx);
         return ch;
     }
-    uv_handle_chan_register(ch);
+    gc_handle_register(ctx);
     return ch;
 }
 
@@ -244,24 +234,21 @@ static void on_fs_unlink(uv_fs_t* req)
     goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)req;
     int result = (int)req->result;
     uv_fs_req_cleanup(req);
-    uv_handle_chan_unregister(ctx->ch);
+    gc_handle_unregister(ctx);
     goc_put_cb(ctx->ch, SCALAR(result), close_on_put, ctx->ch);
-    free(ctx);
 }
 
 goc_chan* goc_io_fs_unlink(const char* path)
 {
     goc_chan*     ch  = goc_chan_make(1);
-    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)malloc(sizeof(goc_fs_ctx_t));
-    assert(ctx);
+    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)goc_malloc(sizeof(goc_fs_ctx_t));
     ctx->ch = ch;
     int rc = uv_fs_unlink(g_loop, &ctx->req, path, on_fs_unlink);
     if (rc < 0) {
         goc_put_cb(ch, SCALAR(rc), close_on_put, ch);
-        free(ctx);
         return ch;
     }
-    uv_handle_chan_register(ch);
+    gc_handle_register(ctx);
     return ch;
 }
 
@@ -278,26 +265,23 @@ static void on_fs_stat(uv_fs_t* req)
     if (req->result == 0)
         res->statbuf = req->statbuf;
     uv_fs_req_cleanup(req);
-    uv_handle_chan_unregister(ctx->ch);
+    gc_handle_unregister(ctx);
     goc_put_cb(ctx->ch, res, close_on_put, ctx->ch);
-    free(ctx);
 }
 
 goc_chan* goc_io_fs_stat(const char* path)
 {
     goc_chan*     ch  = goc_chan_make(1);
-    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)malloc(sizeof(goc_fs_ctx_t));
-    assert(ctx);
+    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)goc_malloc(sizeof(goc_fs_ctx_t));
     ctx->ch = ch;
     int rc = uv_fs_stat(g_loop, &ctx->req, path, on_fs_stat);
     if (rc < 0) {
         goc_io_fs_stat_t* res = (goc_io_fs_stat_t*)goc_malloc(sizeof(goc_io_fs_stat_t));
         res->ok = GOC_IO_ERR;
         goc_put_cb(ch, res, close_on_put, ch);
-        free(ctx);
         return ch;
     }
-    uv_handle_chan_register(ch);
+    gc_handle_register(ctx);
     return ch;
 }
 
@@ -311,24 +295,21 @@ static void on_fs_rename(uv_fs_t* req)
     goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)req;
     int result = (int)req->result;
     uv_fs_req_cleanup(req);
-    uv_handle_chan_unregister(ctx->ch);
+    gc_handle_unregister(ctx);
     goc_put_cb(ctx->ch, SCALAR(result), close_on_put, ctx->ch);
-    free(ctx);
 }
 
 goc_chan* goc_io_fs_rename(const char* path, const char* new_path)
 {
     goc_chan*     ch  = goc_chan_make(1);
-    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)malloc(sizeof(goc_fs_ctx_t));
-    assert(ctx);
+    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)goc_malloc(sizeof(goc_fs_ctx_t));
     ctx->ch = ch;
     int rc = uv_fs_rename(g_loop, &ctx->req, path, new_path, on_fs_rename);
     if (rc < 0) {
         goc_put_cb(ch, SCALAR(rc), close_on_put, ch);
-        free(ctx);
         return ch;
     }
-    uv_handle_chan_register(ch);
+    gc_handle_register(ctx);
     return ch;
 }
 
@@ -342,26 +323,23 @@ static void on_fs_sendfile(uv_fs_t* req)
     goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)req;
     ssize_t result = (ssize_t)req->result;
     uv_fs_req_cleanup(req);
-    uv_handle_chan_unregister(ctx->ch);
+    gc_handle_unregister(ctx);
     goc_put_cb(ctx->ch, SCALAR(result), close_on_put, ctx->ch);
-    free(ctx);
 }
 
 goc_chan* goc_io_fs_sendfile(uv_file out_fd, uv_file in_fd,
                                 int64_t in_offset, size_t length)
 {
     goc_chan*     ch  = goc_chan_make(1);
-    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)malloc(sizeof(goc_fs_ctx_t));
-    assert(ctx);
+    goc_fs_ctx_t* ctx = (goc_fs_ctx_t*)goc_malloc(sizeof(goc_fs_ctx_t));
     ctx->ch = ch;
     int rc = uv_fs_sendfile(g_loop, &ctx->req, out_fd, in_fd, in_offset,
                             length, on_fs_sendfile);
     if (rc < 0) {
         goc_put_cb(ch, SCALAR(rc), close_on_put, ch);
-        free(ctx);
         return ch;
     }
-    uv_handle_chan_register(ch);
+    gc_handle_register(ctx);
     return ch;
 }
 
@@ -389,18 +367,16 @@ static void on_getaddrinfo(uv_getaddrinfo_t* req, int status,
                                      sizeof(goc_io_getaddrinfo_t));
     r->ok  = (status == 0) ? GOC_IO_OK : GOC_IO_ERR;
     r->res = res;
-    uv_handle_chan_unregister(ctx->ch);
+    gc_handle_unregister(ctx);
     goc_put_cb(ctx->ch, r, close_on_put, ctx->ch);
-    free(ctx);
 }
 
 goc_chan* goc_io_getaddrinfo(const char* node, const char* service,
                                 const struct addrinfo* hints)
 {
     goc_chan*              ch  = goc_chan_make(1);
-    goc_getaddrinfo_ctx_t* ctx = (goc_getaddrinfo_ctx_t*)malloc(
+    goc_getaddrinfo_ctx_t* ctx = (goc_getaddrinfo_ctx_t*)goc_malloc(
                                      sizeof(goc_getaddrinfo_ctx_t));
-    assert(ctx);
     ctx->ch = ch;
     int rc = uv_getaddrinfo(g_loop, &ctx->req, on_getaddrinfo,
                             node, service, hints);
@@ -410,10 +386,9 @@ goc_chan* goc_io_getaddrinfo(const char* node, const char* service,
         r->ok  = GOC_IO_ERR;
         r->res = NULL;
         goc_put_cb(ch, r, close_on_put, ch);
-        free(ctx);
         return ch;
     }
-    uv_handle_chan_register(ch);
+    gc_handle_register(ctx);
     return ch;
 }
 
@@ -444,17 +419,15 @@ static void on_getnameinfo(uv_getnameinfo_t* req, int status,
         r->service[0] = '\0';
     r->hostname[sizeof(r->hostname) - 1] = '\0';
     r->service[sizeof(r->service)  - 1] = '\0';
-    uv_handle_chan_unregister(ctx->ch);
+    gc_handle_unregister(ctx);
     goc_put_cb(ctx->ch, r, close_on_put, ctx->ch);
-    free(ctx);
 }
 
 goc_chan* goc_io_getnameinfo(const struct sockaddr* addr, int flags)
 {
     goc_chan*              ch  = goc_chan_make(1);
-    goc_getnameinfo_ctx_t* ctx = (goc_getnameinfo_ctx_t*)malloc(
+    goc_getnameinfo_ctx_t* ctx = (goc_getnameinfo_ctx_t*)goc_malloc(
                                      sizeof(goc_getnameinfo_ctx_t));
-    assert(ctx);
     ctx->ch = ch;
     int rc = uv_getnameinfo(g_loop, &ctx->req, on_getnameinfo, addr, flags);
     if (rc < 0) {
@@ -464,10 +437,9 @@ goc_chan* goc_io_getnameinfo(const struct sockaddr* addr, int flags)
         r->hostname[0] = '\0';
         r->service[0]  = '\0';
         goc_put_cb(ch, r, close_on_put, ch);
-        free(ctx);
         return ch;
     }
-    uv_handle_chan_register(ch);
+    gc_handle_register(ctx);
     return ch;
 }
 
@@ -540,10 +512,8 @@ static void on_read_cb(uv_stream_t* stream, ssize_t nread,
      * final result, close channel. */
     free(buf->base);
     res->buf = NULL;
-    uv_handle_chan_unregister(ctx->ch);
     goc_put_cb(ctx->ch, res, NULL, NULL);
     goc_close(ctx->ch);
-    free(ctx);
     stream->data = NULL;
 }
 
@@ -557,8 +527,7 @@ static void on_read_start_dispatch(uv_async_t* h)
 {
     goc_read_start_dispatch_t* d = (goc_read_start_dispatch_t*)h;
 
-    goc_stream_ctx_t* ctx = (goc_stream_ctx_t*)malloc(sizeof(goc_stream_ctx_t));
-    assert(ctx);
+    goc_stream_ctx_t* ctx = (goc_stream_ctx_t*)goc_malloc(sizeof(goc_stream_ctx_t));
     ctx->ch        = d->ch;
     d->stream->data = ctx;
 
@@ -568,25 +537,22 @@ static void on_read_start_dispatch(uv_async_t* h)
         goc_io_read_t* res = (goc_io_read_t*)goc_malloc(sizeof(goc_io_read_t));
         res->nread = rc;
         res->buf   = NULL;
-        uv_handle_chan_unregister(d->ch);
         goc_put_cb(d->ch, res, NULL, NULL);
         goc_close(d->ch);
-        free(ctx);
         d->stream->data = NULL;
     }
 
-    uv_close((uv_handle_t*)h, free_io_handle);
+    uv_close((uv_handle_t*)h, unregister_io_handle);
 }
 
 goc_chan* goc_io_read_start(uv_stream_t* stream)
 {
     goc_chan*                   ch = goc_chan_make(16);
-    goc_read_start_dispatch_t*  d  = (goc_read_start_dispatch_t*)malloc(
+    goc_read_start_dispatch_t*  d  = (goc_read_start_dispatch_t*)goc_malloc(
                                          sizeof(goc_read_start_dispatch_t));
-    assert(d);
     d->stream = stream;
     d->ch     = ch;
-    uv_handle_chan_register(ch);
+    gc_handle_register(d);
     dispatch_async_or_abort(&d->async, on_read_start_dispatch, "goc_io_read_start");
     return ch;
 }
@@ -608,21 +574,19 @@ static void on_read_stop_dispatch(uv_async_t* h)
 
     if (d->stream->data) {
         goc_stream_ctx_t* ctx = (goc_stream_ctx_t*)d->stream->data;
-        uv_handle_chan_unregister(ctx->ch);
         goc_close(ctx->ch);
-        free(ctx);
         d->stream->data = NULL;
     }
 
-    uv_close((uv_handle_t*)h, free_io_handle);
+    uv_close((uv_handle_t*)h, unregister_io_handle);
 }
 
 int goc_io_read_stop(uv_stream_t* stream)
 {
-    goc_read_stop_dispatch_t* d = (goc_read_stop_dispatch_t*)malloc(
+    goc_read_stop_dispatch_t* d = (goc_read_stop_dispatch_t*)goc_malloc(
                                       sizeof(goc_read_stop_dispatch_t));
-    assert(d);
     d->stream = stream;
+    gc_handle_register(d);
     dispatch_async_or_abort(&d->async, on_read_stop_dispatch, "goc_io_read_stop");
     return 0;
 }
@@ -639,10 +603,9 @@ typedef struct {
 static void on_write_cb(uv_write_t* req, int status)
 {
     goc_write_ctx_t* ctx = (goc_write_ctx_t*)req;
-    uv_handle_chan_unregister(ctx->ch);
+    gc_handle_unregister(ctx);
     goc_put_cb(ctx->ch, SCALAR(status), NULL, NULL);
     goc_close(ctx->ch);
-    free(ctx);
 }
 
 typedef struct {
@@ -656,31 +619,29 @@ typedef struct {
 static void on_write_dispatch(uv_async_t* h)
 {
     goc_write_dispatch_t* d   = (goc_write_dispatch_t*)h;
-    goc_write_ctx_t*      ctx = (goc_write_ctx_t*)malloc(sizeof(goc_write_ctx_t));
-    assert(ctx);
+    goc_write_ctx_t*      ctx = (goc_write_ctx_t*)goc_malloc(sizeof(goc_write_ctx_t));
     ctx->ch = d->ch;
     int rc = uv_write(&ctx->req, d->handle, d->bufs, d->nbufs, on_write_cb);
     if (rc < 0) {
-        uv_handle_chan_unregister(ctx->ch);
         goc_put_cb(ctx->ch, SCALAR(rc), NULL, NULL);
         goc_close(ctx->ch);
-        free(ctx);
+    } else {
+        gc_handle_register(ctx);
     }
-    uv_close((uv_handle_t*)h, free_io_handle);
+    uv_close((uv_handle_t*)h, unregister_io_handle);
 }
 
 goc_chan* goc_io_write(uv_stream_t* handle,
                           const uv_buf_t bufs[], unsigned int nbufs)
 {
     goc_chan*             ch = goc_chan_make(1);
-    goc_write_dispatch_t* d  = (goc_write_dispatch_t*)malloc(
+    goc_write_dispatch_t* d  = (goc_write_dispatch_t*)goc_malloc(
                                     sizeof(goc_write_dispatch_t));
-    assert(d);
     d->handle = handle;
     d->bufs   = bufs;
     d->nbufs  = nbufs;
     d->ch     = ch;
-    uv_handle_chan_register(ch);
+    gc_handle_register(d);
     dispatch_async_or_abort(&d->async, on_write_dispatch, "goc_io_write");
     return ch;
 }
@@ -699,10 +660,9 @@ typedef struct {
 static void on_write2_cb(uv_write_t* req, int status)
 {
     goc_write2_ctx_t* ctx = (goc_write2_ctx_t*)req;
-    uv_handle_chan_unregister(ctx->ch);
+    gc_handle_unregister(ctx);
     goc_put_cb(ctx->ch, SCALAR(status), NULL, NULL);
     goc_close(ctx->ch);
-    free(ctx);
 }
 
 typedef struct {
@@ -717,19 +677,18 @@ typedef struct {
 static void on_write2_dispatch(uv_async_t* h)
 {
     goc_write2_dispatch_t* d   = (goc_write2_dispatch_t*)h;
-    goc_write2_ctx_t*      ctx = (goc_write2_ctx_t*)malloc(
+    goc_write2_ctx_t*      ctx = (goc_write2_ctx_t*)goc_malloc(
                                      sizeof(goc_write2_ctx_t));
-    assert(ctx);
     ctx->ch = d->ch;
     int rc = uv_write2(&ctx->req, d->handle, d->bufs, d->nbufs,
                        d->send_handle, on_write2_cb);
     if (rc < 0) {
-        uv_handle_chan_unregister(ctx->ch);
         goc_put_cb(ctx->ch, SCALAR(rc), NULL, NULL);
         goc_close(ctx->ch);
-        free(ctx);
+    } else {
+        gc_handle_register(ctx);
     }
-    uv_close((uv_handle_t*)h, free_io_handle);
+    uv_close((uv_handle_t*)h, unregister_io_handle);
 }
 
 goc_chan* goc_io_write2(uv_stream_t* handle,
@@ -737,15 +696,14 @@ goc_chan* goc_io_write2(uv_stream_t* handle,
                            uv_stream_t* send_handle)
 {
     goc_chan*              ch = goc_chan_make(1);
-    goc_write2_dispatch_t* d  = (goc_write2_dispatch_t*)malloc(
+    goc_write2_dispatch_t* d  = (goc_write2_dispatch_t*)goc_malloc(
                                      sizeof(goc_write2_dispatch_t));
-    assert(d);
     d->handle      = handle;
     d->bufs        = bufs;
     d->nbufs       = nbufs;
     d->send_handle = send_handle;
     d->ch          = ch;
-    uv_handle_chan_register(ch);
+    gc_handle_register(d);
     dispatch_async_or_abort(&d->async, on_write2_dispatch, "goc_io_write2");
     return ch;
 }
@@ -763,10 +721,9 @@ typedef struct {
 static void on_shutdown_cb(uv_shutdown_t* req, int status)
 {
     goc_shutdown_ctx_t* ctx = (goc_shutdown_ctx_t*)req;
-    uv_handle_chan_unregister(ctx->ch);
+    gc_handle_unregister(ctx);
     goc_put_cb(ctx->ch, SCALAR(status), NULL, NULL);
     goc_close(ctx->ch);
-    free(ctx);
 }
 
 typedef struct {
@@ -778,29 +735,27 @@ typedef struct {
 static void on_shutdown_dispatch(uv_async_t* h)
 {
     goc_shutdown_dispatch_t* d   = (goc_shutdown_dispatch_t*)h;
-    goc_shutdown_ctx_t*      ctx = (goc_shutdown_ctx_t*)malloc(
+    goc_shutdown_ctx_t*      ctx = (goc_shutdown_ctx_t*)goc_malloc(
                                        sizeof(goc_shutdown_ctx_t));
-    assert(ctx);
     ctx->ch = d->ch;
     int rc = uv_shutdown(&ctx->req, d->handle, on_shutdown_cb);
     if (rc < 0) {
-        uv_handle_chan_unregister(ctx->ch);
         goc_put_cb(ctx->ch, SCALAR(rc), NULL, NULL);
         goc_close(ctx->ch);
-        free(ctx);
+    } else {
+        gc_handle_register(ctx);
     }
-    uv_close((uv_handle_t*)h, free_io_handle);
+    uv_close((uv_handle_t*)h, unregister_io_handle);
 }
 
 goc_chan* goc_io_shutdown_stream(uv_stream_t* handle)
 {
     goc_chan*                ch = goc_chan_make(1);
-    goc_shutdown_dispatch_t* d  = (goc_shutdown_dispatch_t*)malloc(
+    goc_shutdown_dispatch_t* d  = (goc_shutdown_dispatch_t*)goc_malloc(
                                       sizeof(goc_shutdown_dispatch_t));
-    assert(d);
     d->handle = handle;
     d->ch     = ch;
-    uv_handle_chan_register(ch);
+    gc_handle_register(d);
     dispatch_async_or_abort(&d->async, on_shutdown_dispatch, "goc_io_shutdown_stream");
     return ch;
 }
@@ -818,10 +773,9 @@ typedef struct {
 static void on_connect_cb(uv_connect_t* req, int status)
 {
     goc_connect_ctx_t* ctx = (goc_connect_ctx_t*)req;
-    uv_handle_chan_unregister(ctx->ch);
+    gc_handle_unregister(ctx);
     goc_put_cb(ctx->ch, SCALAR(status), NULL, NULL);
     goc_close(ctx->ch);
-    free(ctx);
 }
 
 typedef struct {
@@ -834,28 +788,26 @@ typedef struct {
 static void on_tcp_connect_dispatch(uv_async_t* h)
 {
     goc_tcp_connect_dispatch_t* d   = (goc_tcp_connect_dispatch_t*)h;
-    goc_connect_ctx_t*          ctx = (goc_connect_ctx_t*)malloc(
+    goc_connect_ctx_t*          ctx = (goc_connect_ctx_t*)goc_malloc(
                                           sizeof(goc_connect_ctx_t));
-    assert(ctx);
     ctx->ch = d->ch;
     int rc = uv_tcp_connect(&ctx->req, d->handle,
                             (const struct sockaddr*)&d->addr,
                             on_connect_cb);
     if (rc < 0) {
-        uv_handle_chan_unregister(ctx->ch);
         goc_put_cb(ctx->ch, SCALAR(rc), NULL, NULL);
         goc_close(ctx->ch);
-        free(ctx);
+    } else {
+        gc_handle_register(ctx);
     }
-    uv_close((uv_handle_t*)h, free_io_handle);
+    uv_close((uv_handle_t*)h, unregister_io_handle);
 }
 
 goc_chan* goc_io_tcp_connect(uv_tcp_t* handle, const struct sockaddr* addr)
 {
     goc_chan*                   ch = goc_chan_make(1);
-    goc_tcp_connect_dispatch_t* d  = (goc_tcp_connect_dispatch_t*)malloc(
+    goc_tcp_connect_dispatch_t* d  = (goc_tcp_connect_dispatch_t*)goc_malloc(
                                          sizeof(goc_tcp_connect_dispatch_t));
-    assert(d);
     d->handle = handle;
     /* Copy the address to avoid dangling-pointer issues if the caller's
      * address lives on a stack frame that may be reused before the async
@@ -865,7 +817,7 @@ goc_chan* goc_io_tcp_connect(uv_tcp_t* handle, const struct sockaddr* addr)
                ? sizeof(struct sockaddr_in6)
                : sizeof(struct sockaddr_in));
     d->ch = ch;
-    uv_handle_chan_register(ch);
+    gc_handle_register(d);
     dispatch_async_or_abort(&d->async, on_tcp_connect_dispatch, "goc_io_tcp_connect");
     return ch;
 }
@@ -887,26 +839,25 @@ typedef struct {
 static void on_pipe_connect_dispatch(uv_async_t* h)
 {
     goc_pipe_connect_dispatch_t* d   = (goc_pipe_connect_dispatch_t*)h;
-    goc_connect_ctx_t*           ctx = (goc_connect_ctx_t*)malloc(
+    goc_connect_ctx_t*           ctx = (goc_connect_ctx_t*)goc_malloc(
                                            sizeof(goc_connect_ctx_t));
-    assert(ctx);
     ctx->ch = d->ch;
     uv_pipe_connect(&ctx->req, d->handle, d->name, on_connect_cb);
-    free(d->name);
-    uv_close((uv_handle_t*)h, free_io_handle);
+    gc_handle_register(ctx);
+    uv_close((uv_handle_t*)h, unregister_io_handle);
 }
 
 goc_chan* goc_io_pipe_connect(uv_pipe_t* handle, const char* name)
 {
     goc_chan*                    ch = goc_chan_make(1);
-    goc_pipe_connect_dispatch_t* d  = (goc_pipe_connect_dispatch_t*)malloc(
+    goc_pipe_connect_dispatch_t* d  = (goc_pipe_connect_dispatch_t*)goc_malloc(
                                           sizeof(goc_pipe_connect_dispatch_t));
-    assert(d);
     d->handle = handle;
-    d->name   = strdup(name);   /* copied so the caller's string can be freed */
-    assert(d->name);
+    size_t name_len = strlen(name);
+    d->name   = (char*)goc_malloc(name_len + 1);   /* copied so the caller's string can be freed */
+    strcpy(d->name, name);
     d->ch = ch;
-    uv_handle_chan_register(ch);
+    gc_handle_register(d);
     dispatch_async_or_abort(&d->async, on_pipe_connect_dispatch, "goc_io_pipe_connect");
     return ch;
 }
@@ -928,10 +879,9 @@ typedef struct {
 static void on_udp_send_cb(uv_udp_send_t* req, int status)
 {
     goc_udp_send_ctx_t* ctx = (goc_udp_send_ctx_t*)req;
-    uv_handle_chan_unregister(ctx->ch);
+    gc_handle_unregister(ctx);
     goc_put_cb(ctx->ch, SCALAR(status), NULL, NULL);
     goc_close(ctx->ch);
-    free(ctx);
 }
 
 typedef struct {
@@ -946,19 +896,18 @@ typedef struct {
 static void on_udp_send_dispatch(uv_async_t* h)
 {
     goc_udp_send_dispatch_t* d   = (goc_udp_send_dispatch_t*)h;
-    goc_udp_send_ctx_t*      ctx = (goc_udp_send_ctx_t*)malloc(
+    goc_udp_send_ctx_t*      ctx = (goc_udp_send_ctx_t*)goc_malloc(
                                        sizeof(goc_udp_send_ctx_t));
-    assert(ctx);
     ctx->ch = d->ch;
     int rc = uv_udp_send(&ctx->req, d->handle, d->bufs, d->nbufs,
                          (const struct sockaddr*)&d->addr, on_udp_send_cb);
     if (rc < 0) {
-        uv_handle_chan_unregister(ctx->ch);
         goc_put_cb(ctx->ch, SCALAR(rc), NULL, NULL);
         goc_close(ctx->ch);
-        free(ctx);
+    } else {
+        gc_handle_register(ctx);
     }
-    uv_close((uv_handle_t*)h, free_io_handle);
+    uv_close((uv_handle_t*)h, unregister_io_handle);
 }
 
 goc_chan* goc_io_udp_send(uv_udp_t* handle,
@@ -966,9 +915,8 @@ goc_chan* goc_io_udp_send(uv_udp_t* handle,
                              const struct sockaddr* addr)
 {
     goc_chan*                ch = goc_chan_make(1);
-    goc_udp_send_dispatch_t* d  = (goc_udp_send_dispatch_t*)malloc(
+    goc_udp_send_dispatch_t* d  = (goc_udp_send_dispatch_t*)goc_malloc(
                                       sizeof(goc_udp_send_dispatch_t));
-    assert(d);
     d->handle = handle;
     d->bufs   = bufs;
     d->nbufs  = nbufs;
@@ -977,7 +925,7 @@ goc_chan* goc_io_udp_send(uv_udp_t* handle,
                ? sizeof(struct sockaddr_in6)
                : sizeof(struct sockaddr_in));
     d->ch = ch;
-    uv_handle_chan_register(ch);
+    gc_handle_register(d);
     dispatch_async_or_abort(&d->async, on_udp_send_dispatch, "goc_io_udp_send");
     return ch;
 }
@@ -1035,10 +983,8 @@ static void on_udp_recv_cb(uv_udp_t* handle, ssize_t nread,
     res->buf  = NULL;
     res->addr = NULL;
     res->flags = 0;
-    uv_handle_chan_unregister(ctx->ch);
     goc_put_cb(ctx->ch, res, NULL, NULL);
     goc_close(ctx->ch);
-    free(ctx);
     handle->data = NULL;
 }
 
@@ -1052,9 +998,8 @@ static void on_udp_recv_start_dispatch(uv_async_t* h)
 {
     goc_udp_recv_start_dispatch_t* d = (goc_udp_recv_start_dispatch_t*)h;
 
-    goc_udp_recv_ctx_t* ctx = (goc_udp_recv_ctx_t*)malloc(
+    goc_udp_recv_ctx_t* ctx = (goc_udp_recv_ctx_t*)goc_malloc(
                                   sizeof(goc_udp_recv_ctx_t));
-    assert(ctx);
     ctx->ch        = d->ch;
     d->handle->data = ctx;
 
@@ -1065,25 +1010,22 @@ static void on_udp_recv_start_dispatch(uv_async_t* h)
         res->buf   = NULL;
         res->addr  = NULL;
         res->flags = 0;
-        uv_handle_chan_unregister(d->ch);
         goc_put_cb(d->ch, res, NULL, NULL);
         goc_close(d->ch);
-        free(ctx);
         d->handle->data = NULL;
     }
 
-    uv_close((uv_handle_t*)h, free_io_handle);
+    uv_close((uv_handle_t*)h, unregister_io_handle);
 }
 
 goc_chan* goc_io_udp_recv_start(uv_udp_t* handle)
 {
     goc_chan*                      ch = goc_chan_make(16);
-    goc_udp_recv_start_dispatch_t* d  = (goc_udp_recv_start_dispatch_t*)malloc(
+    goc_udp_recv_start_dispatch_t* d  = (goc_udp_recv_start_dispatch_t*)goc_malloc(
                                             sizeof(goc_udp_recv_start_dispatch_t));
-    assert(d);
     d->handle = handle;
     d->ch     = ch;
-    uv_handle_chan_register(ch);
+    gc_handle_register(d);
     dispatch_async_or_abort(&d->async, on_udp_recv_start_dispatch, "goc_io_udp_recv_start");
     return ch;
 }
@@ -1101,21 +1043,55 @@ static void on_udp_recv_stop_dispatch(uv_async_t* h)
 
     if (d->handle->data) {
         goc_udp_recv_ctx_t* ctx = (goc_udp_recv_ctx_t*)d->handle->data;
-        uv_handle_chan_unregister(ctx->ch);
         goc_close(ctx->ch);
-        free(ctx);
         d->handle->data = NULL;
     }
 
-    uv_close((uv_handle_t*)h, free_io_handle);
+    uv_close((uv_handle_t*)h, unregister_io_handle);
 }
 
 int goc_io_udp_recv_stop(uv_udp_t* handle)
 {
-    goc_udp_recv_stop_dispatch_t* d = (goc_udp_recv_stop_dispatch_t*)malloc(
+    goc_udp_recv_stop_dispatch_t* d = (goc_udp_recv_stop_dispatch_t*)goc_malloc(
                                           sizeof(goc_udp_recv_stop_dispatch_t));
-    assert(d);
     d->handle = handle;
+    gc_handle_register(d);
     dispatch_async_or_abort(&d->async, on_udp_recv_stop_dispatch, "goc_io_udp_recv_stop");
     return 0;
+}
+
+/* =========================================================================
+ * 5. GC handle lifetime management
+ * ====================================================================== */
+
+void goc_io_handle_register(uv_handle_t* handle)
+{
+    gc_handle_register(handle);
+}
+
+void goc_io_handle_unregister(uv_handle_t* handle)
+{
+    gc_handle_unregister(handle);
+}
+
+typedef struct {
+    uv_close_cb user_cb;
+} goc_handle_close_ctx_t;
+
+static void on_goc_handle_close(uv_handle_t* handle)
+{
+    goc_handle_close_ctx_t* ctx = (goc_handle_close_ctx_t*)handle->data;
+    uv_close_cb user_cb = ctx ? ctx->user_cb : NULL;
+    handle->data = NULL;
+    gc_handle_unregister(handle);
+    if (user_cb)
+        user_cb(handle);
+}
+
+void goc_io_handle_close(uv_handle_t* handle, uv_close_cb cb)
+{
+    goc_handle_close_ctx_t* ctx = (goc_handle_close_ctx_t*)goc_malloc(sizeof(goc_handle_close_ctx_t));
+    ctx->user_cb  = cb;
+    handle->data  = ctx;
+    uv_close(handle, on_goc_handle_close);
 }
