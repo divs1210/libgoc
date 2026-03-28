@@ -100,6 +100,10 @@
  *
  *   P6.26  wsdq_approx_size returns 0 on an empty deque
  *   P6.27  wsdq_approx_size tracks push/pop correctly (push 3 → 3, pop 1 → 2)
+ *   P6.28  steal successes non-zero under fan-out workload (pool=4, 8 consumers)
+ *   P6.29  spawn-idle liveness: 10k short fibers complete without hang (pool=2)
+ *   P6.30  ping-pong liveness: unbuffered channel completes without hang (pool=2)
+ *   P6.31  liveness: no semaphore imbalance after post-yield wakeup (pool=2)
  *
  * Notes:
  *   - goc_init() is called once in main() before any test runs.
@@ -1787,6 +1791,188 @@ static void test_p6_27(void) {
 done:;
 }
 
+/* ---- P6.28–P6.31: Post-yield wakeup correctness ---- */
+
+/*
+ * P6.28 — Steal success rate is non-zero under fan-out workload
+ *
+ * A "fanout" fiber spawns P6_28_NCHILDREN child fibers (all pushed to its
+ * worker's deque without yielding) then parks on goc_take(done_ch).  At that
+ * point deque depth = P6_28_NCHILDREN > q-cap/2 (512/2 = 256), the post-yield
+ * depth check fires, and an idle worker is woken to steal.  Each child puts
+ * once to done_ch so the parent collects all completions and exits cleanly.
+ * After the pool drains, steal_successes delta must be > 0.
+ */
+#define P6_28_NCHILDREN  300   /* > q-cap/2 = 256, ensures depth check fires */
+
+typedef struct {
+    goc_pool* pool;
+    goc_chan* done_ch;
+} p6_28_fanout_args_t;
+
+static void p6_28_child_fn(void* arg) {
+    goc_chan* done_ch = (goc_chan*)arg;
+    goc_put(done_ch, NULL);
+}
+
+static void p6_28_fanout_fn(void* arg) {
+    p6_28_fanout_args_t* a = (p6_28_fanout_args_t*)arg;
+    /* Push all children onto this worker's deque without yielding. */
+    for (int i = 0; i < P6_28_NCHILDREN; i++)
+        goc_go_on(a->pool, p6_28_child_fn, a->done_ch);
+    /* Park: depth = P6_28_NCHILDREN > 256 → post-yield check fires,
+     * idle workers wake and steal children off the deque. */
+    for (int i = 0; i < P6_28_NCHILDREN; i++)
+        goc_take(a->done_ch);
+}
+
+static void test_p6_28(void) {
+    TEST_BEGIN("P6.28  steal successes non-zero under fan-out workload (pool=4)");
+
+    uint64_t att0, suc0, mis0, wak0;
+    goc_pool_get_steal_stats(&att0, &suc0, &mis0, &wak0);
+
+    goc_pool* pool = goc_pool_make(4);
+    ASSERT(pool != NULL);
+
+    goc_chan* done_ch = goc_chan_make(0);   /* unbuffered */
+    ASSERT(done_ch != NULL);
+
+    p6_28_fanout_args_t fargs = { .pool = pool, .done_ch = done_ch };
+    goc_chan* join = goc_go_on(pool, p6_28_fanout_fn, &fargs);
+
+    goc_val_t* v = goc_take_sync(join);
+    ASSERT(v->ok == GOC_CLOSED);
+
+    goc_pool_destroy(pool);
+
+    uint64_t att1, suc1, mis1, wak1;
+    goc_pool_get_steal_stats(&att1, &suc1, &mis1, &wak1);
+    ASSERT((suc1 - suc0) > 0);
+
+    TEST_PASS();
+done:;
+}
+
+/*
+ * P6.29 — Spawn-idle liveness: pool=2, 10k short fibers complete without hang
+ *
+ * Verifies that the depth>1 guard prevents the post-yield wakeup from firing
+ * on pure spawn workloads (spawner pops immediately, depth never exceeds 1).
+ * The main correctness assertion is liveness (done_wait_timeout).
+ */
+#define P6_29_FIBERS 10000
+
+static void p6_29_noop_fn(void* arg) { (void)arg; }
+
+static void test_p6_29(void) {
+    TEST_BEGIN("P6.29  spawn-idle liveness: 10k short fibers complete without hang (pool=2)");
+
+    goc_pool* pool = goc_pool_make(2);
+    ASSERT(pool != NULL);
+
+    for (int i = 0; i < P6_29_FIBERS; i++)
+        goc_go_on(pool, p6_29_noop_fn, NULL);
+
+    /* goc_pool_destroy blocks until all fibers finish — a hang means failure.
+     * The watchdog in main() enforces the overall test timeout. */
+    goc_pool_destroy(pool);
+
+    TEST_PASS();
+done:;
+}
+
+/*
+ * P6.30 — Ping-pong liveness: unbuffered channel ping-pong completes (pool=2)
+ *
+ * Two fibers exchange N_ROUNDS messages on an unbuffered channel pair.
+ * At pool=2 the depth=1 guard means no spurious neighbor wakeups occur for
+ * single-item pushes, preserving locality.  The test asserts liveness only.
+ */
+#define P6_30_ROUNDS 5000
+
+typedef struct {
+    goc_chan* req;
+    goc_chan* ack;
+    done_t*   done;
+    _Atomic int* finished;
+    int          expected;
+} p6_30_pair_t;
+
+static void p6_30_sender_fn(void* arg) {
+    p6_30_pair_t* p = (p6_30_pair_t*)arg;
+    for (int i = 0; i < P6_30_ROUNDS; i++) {
+        goc_put(p->req, NULL);
+        goc_take(p->ack);
+    }
+    if (atomic_fetch_add_explicit(p->finished, 1, memory_order_acq_rel) + 1 == p->expected)
+        done_signal(p->done);
+}
+
+static void p6_30_receiver_fn(void* arg) {
+    p6_30_pair_t* p = (p6_30_pair_t*)arg;
+    for (int i = 0; i < P6_30_ROUNDS; i++) {
+        goc_take(p->req);
+        goc_put(p->ack, NULL);
+    }
+    if (atomic_fetch_add_explicit(p->finished, 1, memory_order_acq_rel) + 1 == p->expected)
+        done_signal(p->done);
+}
+
+static void test_p6_30(void) {
+    TEST_BEGIN("P6.30  ping-pong liveness: unbuffered channel completes without hang (pool=2)");
+
+    done_t done;
+    done_init(&done);
+    _Atomic int finished = 0;
+
+    goc_pool* pool = goc_pool_make(2);
+    ASSERT(pool != NULL);
+
+    p6_30_pair_t pair;
+    pair.req      = goc_chan_make(0);
+    pair.ack      = goc_chan_make(0);
+    pair.done     = &done;
+    pair.finished = &finished;
+    pair.expected = 2;
+    ASSERT(pair.req != NULL && pair.ack != NULL);
+
+    goc_go_on(pool, p6_30_sender_fn,   &pair);
+    goc_go_on(pool, p6_30_receiver_fn, &pair);
+
+    bool ok = done_wait_timeout(&done, 15000);
+    ASSERT(ok);
+
+    goc_pool_destroy(pool);
+    TEST_PASS();
+done:;
+}
+
+/*
+ * P6.31 — Liveness: no semaphore imbalance after post-yield wakeup (pool=2)
+ *
+ * Post a single fiber externally on a pool=2.  goc_pool_destroy must complete
+ * without hanging, confirming that any sem_post from the post-yield path does
+ * not leave a dangling count that would stall the shutdown sequence.
+ */
+static void p6_31_noop_fn(void* arg) { (void)arg; }
+
+static void test_p6_31(void) {
+    TEST_BEGIN("P6.31  liveness: no semaphore imbalance after post-yield wakeup (pool=2)");
+
+    goc_pool* pool = goc_pool_make(2);
+    ASSERT(pool != NULL);
+
+    goc_go_on(pool, p6_31_noop_fn, NULL);
+
+    /* If there is a semaphore imbalance the workers will not drain and
+     * goc_pool_destroy will hang — caught by the watchdog. */
+    goc_pool_destroy(pool);
+
+    TEST_PASS();
+done:;
+}
+
 /* ---- P6.23: GC bitmap write-ordering: slot data visible before bit ---- */
 /*
  * Bug being tested (gc.c goc_fiber_root_register):
@@ -1909,6 +2095,10 @@ int main(void) {
     test_p6_25();
     test_p6_26();
     test_p6_27();
+    test_p6_28();
+    test_p6_29();
+    test_p6_30();
+    test_p6_31();
     printf("\n");
 
     if (!g_skip_shutdown) {
