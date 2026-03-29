@@ -111,6 +111,16 @@ static void close_on_put(goc_status_t ok, void* ud)
 /* -------------------------------------------------------------------------
  * goc_io_fs_open
  * ---------------------------------------------------------------------- */
+/**
+ * goc_io_fs_open — Initiate an async file open; return result channel.
+ *
+ * path  : path of the file to open.
+ * flags : open flags.
+ * mode  : file mode.
+ *
+ * Returns a channel delivering the file descriptor on success.
+ * On error, the channel delivers a scalar error code.
+ */
 
 static void on_fs_open(uv_fs_t* req)
 {
@@ -254,6 +264,14 @@ goc_chan* goc_io_fs_write(uv_file file, const char* data, size_t len)
 /* -------------------------------------------------------------------------
  * goc_io_fs_unlink
  * ---------------------------------------------------------------------- */
+/**
+ * goc_io_fs_unlink — Initiate an async file deletion; return result channel.
+ *
+ * path : path of the file to delete.
+ *
+ * Returns a channel delivering 0 on success, or a negative libuv error code on failure.
+ * On error, the channel delivers a scalar error code.
+ */
 
 static void on_fs_unlink(uv_fs_t* req)
 {
@@ -2927,3 +2945,28 @@ goc_chan* goc_io_random(size_t n, unsigned flags)
     gc_handle_register(ctx);
     return ch;
 }
+/* -------------------------------------------------------------------------
+ * goc_io_fs_open
+ * ---------------------------------------------------------------------- */
+
+/**
+ * Opens a file asynchronously.
+ *
+ * @param path Path to the file to open.
+ * @param flags File open flags.
+ * @param mode File mode.
+ * @return A channel delivering the result of the operation.
+ *         On error, the channel delivers a scalar error code.
+ */
+
+/* -------------------------------------------------------------------------
+ * goc_io_fs_unlink
+ * ---------------------------------------------------------------------- */
+
+/**
+ * Deletes a file asynchronously.
+ *
+ * @param path Path to the file to delete.
+ * @return A channel delivering the result of the operation.
+ *         On error, the channel delivers a scalar error code.
+ */

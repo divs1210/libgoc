@@ -122,7 +122,7 @@ typedef struct {
  * goc_io_fs_stat_t — result of goc_io_fs_stat / lstat / fstat.
  *
  * ok      : GOC_IO_OK on success, GOC_IO_ERR on failure.
- * statbuf : populated when ok == GOC_IO_OK.
+ * statbuf : populated only when ok == GOC_IO_OK.
  */
 typedef struct {
     goc_io_status_t ok;
@@ -137,7 +137,7 @@ typedef struct goc_io_fs_write_stream goc_io_fs_write_stream_t;
 /**
  * goc_io_fs_read_t — result of goc_io_fs_read.
  * nread < 0 signals a libuv error.
- * buf is a GC-managed char* containing the bytes read; valid when nread > 0.
+ * buf is a GC-managed char* containing the bytes read; valid when nread > 0; otherwise, buf is NULL.
  */
 typedef struct {
     ssize_t  nread;
@@ -268,9 +268,7 @@ typedef struct {
  * goc_io_getaddrinfo_t — result of goc_io_getaddrinfo.
  *
  * ok  : GOC_IO_OK on success, GOC_IO_ERR on failure.
- * res : linked list of addrinfo results allocated by libuv.  The caller
- *       must release it with uv_freeaddrinfo(res) when done.
- *       NULL when ok != GOC_IO_OK.
+ * res : linked list of addrinfo results allocated by libuv. The caller must release res with uv_freeaddrinfo(res) when done. NULL when ok != GOC_IO_OK.
  */
 typedef struct {
     goc_io_status_t  ok;
@@ -450,7 +448,7 @@ goc_chan* goc_io_fs_open(const char* path, int flags, int mode);
  * file : file descriptor returned by goc_io_fs_open.
  *
  * Returns a channel delivering (void*)(intptr_t)result; 0 on success,
- * a negative libuv error code on failure.
+ * a negative libuv error code on failure. On error, the channel delivers a scalar error code.
  */
 goc_chan* goc_io_fs_close(uv_file file);
 
@@ -504,7 +502,7 @@ goc_chan* goc_io_fs_stat(const char* path);
  * new_path : new file path.
  *
  * Returns a channel delivering (void*)(intptr_t)result; 0 on success,
- * a negative libuv error code on failure.
+ * a negative libuv error code on failure. On error, the channel delivers a scalar error code.
  */
 goc_chan* goc_io_fs_rename(const char* path, const char* new_path);
 
