@@ -231,21 +231,17 @@ static void on_fs_write(uv_fs_t* req)
     goc_put_cb(ctx->ch, SCALAR(result), close_on_put, ctx->ch);
 }
 
-goc_chan* goc_io_fs_write(uv_file file, goc_array* data, int64_t offset)
+goc_chan* goc_io_fs_write(uv_file file, const char* data, size_t len)
 {
     goc_chan*            ch  = goc_chan_make(1);
-    size_t               n   = goc_array_len(data);
-    goc_fs_write_ctx_t*  ctx = (goc_fs_write_ctx_t*)goc_malloc(sizeof(goc_fs_write_ctx_t));
+    goc_fs_write_ctx_t*  ctx = (goc_fs_write_ctx_t*)goc_malloc(
+                                   sizeof(goc_fs_write_ctx_t));
     ctx->ch  = ch;
-    ctx->raw = (char*)goc_malloc(n + 1);
+    ctx->raw = (char*)goc_malloc(len + 1);
+    memcpy(ctx->raw, data, len);
 
-    /* Unbox each byte from the goc_array. */
-    size_t i;
-    for (i = 0; i < n; i++)
-        ctx->raw[i] = (char)(unsigned char)goc_unbox_int(goc_array_get(data, i));
-
-    uv_buf_t uvbuf = uv_buf_init(ctx->raw, (unsigned int)n);
-    int rc = uv_fs_write(g_loop, &ctx->req, file, &uvbuf, 1, offset, on_fs_write);
+    uv_buf_t uvbuf = uv_buf_init(ctx->raw, (unsigned int)len);
+    int rc = uv_fs_write(g_loop, &ctx->req, file, &uvbuf, 1, -1, on_fs_write);
     if (rc < 0) {
         goc_put_cb(ch, SCALAR(rc), close_on_put, ch);
         return ch;
