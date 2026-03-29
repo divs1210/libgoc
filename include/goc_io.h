@@ -119,7 +119,7 @@ typedef struct {
  * ---------------------------------------------------------------------- */
 
 /**
- * goc_io_fs_stat_t — result of goc_io_fs_stat.
+ * goc_io_fs_stat_t — result of goc_io_fs_stat / lstat / fstat.
  *
  * ok      : GOC_IO_OK on success, GOC_IO_ERR on failure.
  * statbuf : populated when ok == GOC_IO_OK.
@@ -128,6 +128,133 @@ typedef struct {
     goc_io_status_t ok;
     uv_stat_t    statbuf;
 } goc_io_fs_stat_t;
+
+/* Forward declaration — definition is opaque (lives in goc_io.c). */
+typedef struct goc_io_fs_write_stream goc_io_fs_write_stream_t;
+
+#include "goc_array.h"
+
+/**
+ * goc_io_fs_read_t — result of goc_io_fs_read.
+ * nread < 0 signals a libuv error; buf is the caller-provided goc_array.
+ */
+typedef struct {
+    ssize_t     nread;
+    goc_array*  buf;
+} goc_io_fs_read_t;
+
+/**
+ * goc_io_fs_event_t — result delivered by goc_io_fs_event_start on each change.
+ */
+typedef struct {
+    goc_io_status_t  ok;
+    const char*      filename;
+    int              events;
+} goc_io_fs_event_t;
+
+/**
+ * goc_io_fs_poll_t — result delivered by goc_io_fs_poll_start on each change.
+ */
+typedef struct {
+    goc_io_status_t  ok;
+    uv_stat_t        prev;
+    uv_stat_t        curr;
+} goc_io_fs_poll_t;
+
+/**
+ * goc_io_fs_dirent_t — one directory entry delivered inside goc_io_fs_readdir_t.
+ */
+typedef struct {
+    const char*      name;
+    uv_dirent_type_t type;
+} goc_io_fs_dirent_t;
+
+/**
+ * goc_io_fs_readdir_t — result of goc_io_fs_readdir.
+ * entries is a goc_array of goc_io_fs_dirent_t*.
+ */
+typedef struct {
+    goc_io_status_t  ok;
+    goc_array*       entries;
+} goc_io_fs_readdir_t;
+
+/**
+ * goc_io_fs_path_t — result of goc_io_fs_mkdtemp, readlink, realpath.
+ */
+typedef struct {
+    goc_io_status_t  ok;
+    const char*      path;
+} goc_io_fs_path_t;
+
+/**
+ * goc_io_fs_mkstemp_t — result of goc_io_fs_mkstemp.
+ */
+typedef struct {
+    goc_io_status_t  ok;
+    uv_file          fd;
+    const char*      path;
+} goc_io_fs_mkstemp_t;
+
+/**
+ * goc_io_fs_statfs_t — result of goc_io_fs_statfs.
+ */
+typedef struct {
+    goc_io_status_t  ok;
+    uv_statfs_t      statbuf;
+} goc_io_fs_statfs_t;
+
+/**
+ * goc_io_fs_read_file_t — result of goc_io_fs_read_file.
+ * data is a goc_array of bytes (each element is goc_box_int(byte)).
+ */
+typedef struct {
+    goc_io_status_t  ok;
+    goc_array*       data;
+} goc_io_fs_read_file_t;
+
+/**
+ * goc_io_fs_read_chunk_t — one chunk delivered by goc_io_fs_read_stream_make.
+ * status < 0 on error; data NULL on error/EOF.
+ */
+typedef struct {
+    int        status;
+    goc_array* data;
+} goc_io_fs_read_chunk_t;
+
+/**
+ * goc_io_fs_write_stream_open_t — delivered by goc_io_fs_write_stream_make.
+ * ws is NULL on failure.
+ */
+typedef struct {
+    goc_io_status_t           ok;
+    goc_io_fs_write_stream_t* ws;
+} goc_io_fs_write_stream_open_t;
+
+/**
+ * goc_io_process_exit_t — delivered by the exit channel from goc_io_process_spawn.
+ */
+typedef struct {
+    int64_t  exit_status;
+    int      term_signal;
+} goc_io_process_exit_t;
+
+/**
+ * goc_io_tty_winsize_t — result of goc_io_tty_get_winsize.
+ */
+typedef struct {
+    goc_io_status_t  ok;
+    int              width;
+    int              height;
+} goc_io_tty_winsize_t;
+
+/**
+ * goc_io_random_t — result of goc_io_random.
+ * data is a goc_array of n bytes (each element is goc_box_int(byte)).
+ */
+typedef struct {
+    goc_io_status_t  ok;
+    goc_array*       data;
+} goc_io_random_t;
 
 /* -------------------------------------------------------------------------
  * DNS & resolution
@@ -327,31 +454,25 @@ goc_chan* goc_io_fs_close(uv_file file);
  * goc_io_fs_read() — Initiate an async file read; return result channel.
  *
  * file   : open file descriptor.
- * bufs   : array of nbufs buffers to read into.
- * nbufs  : number of buffers.
+ * buf    : caller-allocated goc_array; elements are byte slots (each stores
+ *          one byte as goc_box_int(byte)).  The array length determines how
+ *          many bytes are read.
  * offset : file offset (-1 to use current position).
  *
- * Returns a channel delivering (void*)(intptr_t)result; bytes read (>= 0)
- * on success, a negative libuv error code on failure.
+ * Returns a channel delivering goc_io_fs_read_t*; nread < 0 on error.
  */
-goc_chan* goc_io_fs_read(uv_file file,
-                         const uv_buf_t bufs[], unsigned int nbufs,
-                         int64_t offset);
+goc_chan* goc_io_fs_read(uv_file file, goc_array* buf, int64_t offset);
 
 /**
  * goc_io_fs_write() — Initiate an async file write; return result channel.
  *
  * file   : open file descriptor.
- * bufs   : array of nbufs buffers to write.
- * nbufs  : number of buffers.
+ * data   : goc_array of bytes (each element is goc_box_int(byte)).
  * offset : file offset (-1 to use current position).
  *
- * Returns a channel delivering (void*)(intptr_t)result; bytes written (>= 0)
- * on success, a negative libuv error code on failure.
+ * Returns a channel delivering goc_box_int(nwritten); negative on error.
  */
-goc_chan* goc_io_fs_write(uv_file file,
-                          const uv_buf_t bufs[], unsigned int nbufs,
-                          int64_t offset);
+goc_chan* goc_io_fs_write(uv_file file, goc_array* data, int64_t offset);
 
 /**
  * goc_io_fs_unlink() — Initiate an async file deletion; return result channel.
@@ -557,9 +678,13 @@ goc_chan* goc_io_fs_poll_init(uv_fs_poll_t* handle);
 /**
  * goc_io_process_spawn() — Spawn a child process from any thread.
  *
- * handle : GC-allocated uv_process_t (via goc_malloc).
- * opts   : spawn options; pointer must remain valid until the channel delivers
- *          its value (i.e. until the caller takes from the returned channel).
+ * handle  : GC-allocated uv_process_t (via goc_malloc).
+ * opts    : spawn options; pointer must remain valid until the channel
+ *           delivers its value (i.e. until the caller takes from the
+ *           returned channel).
+ * exit_ch : if non-NULL, *exit_ch is set to a channel that delivers
+ *           goc_io_process_exit_t* when the child exits.  Pass NULL to
+ *           opt out of exit tracking (backward-compatible).
  *
  * Dispatches uv_spawn() to the event loop thread.  On success (rc == 0) the
  * handle is registered as a GC root and the child process is running.
@@ -569,7 +694,307 @@ goc_chan* goc_io_fs_poll_init(uv_fs_poll_t* handle);
  * Safe to call from any context.
  */
 goc_chan* goc_io_process_spawn(uv_process_t* handle,
-                               const uv_process_options_t* opts);
+                               const uv_process_options_t* opts,
+                               goc_chan** exit_ch);
+
+/* =========================================================================
+ * TCP server / socket options
+ * ====================================================================== */
+
+/** Dispatch uv_tcp_bind; delivers goc_box_int(status). */
+goc_chan* goc_io_tcp_bind(uv_tcp_t* handle, const struct sockaddr* addr);
+
+/**
+ * goc_io_tcp_server_make() — Start listening on a bound TCP handle.
+ *
+ * Calls uv_listen; channel delivers a new goc_malloc-allocated + registered
+ * uv_tcp_t* for each incoming connection.  Channel stays open until the
+ * server handle is closed.
+ */
+goc_chan* goc_io_tcp_server_make(uv_tcp_t* handle, int backlog);
+
+/** Dispatch uv_tcp_keepalive; delivers goc_box_int(status). */
+goc_chan* goc_io_tcp_keepalive(uv_tcp_t* handle, int enable, unsigned int delay);
+
+/** Dispatch uv_tcp_nodelay; delivers goc_box_int(status). */
+goc_chan* goc_io_tcp_nodelay(uv_tcp_t* handle, int enable);
+
+/** Dispatch uv_tcp_simultaneous_accepts; delivers goc_box_int(status). */
+goc_chan* goc_io_tcp_simultaneous_accepts(uv_tcp_t* handle, int enable);
+
+/* =========================================================================
+ * Pipe server / bind
+ * ====================================================================== */
+
+/** Dispatch uv_pipe_bind; delivers goc_box_int(status). */
+goc_chan* goc_io_pipe_bind(uv_pipe_t* handle, const char* name);
+
+/**
+ * goc_io_pipe_server_make() — Start listening on a bound pipe handle.
+ *
+ * Mirror of goc_io_tcp_server_make; delivers accepted uv_pipe_t* per
+ * connection.  Channel stays open until the server handle is closed.
+ */
+goc_chan* goc_io_pipe_server_make(uv_pipe_t* handle, int backlog);
+
+/* =========================================================================
+ * UDP socket options
+ * ====================================================================== */
+
+/** Dispatch uv_udp_bind; delivers goc_box_int(status). */
+goc_chan* goc_io_udp_bind(uv_udp_t* handle, const struct sockaddr* addr,
+                          unsigned flags);
+
+/** Dispatch uv_udp_connect; delivers goc_box_int(status). */
+goc_chan* goc_io_udp_connect(uv_udp_t* handle, const struct sockaddr* addr);
+
+/** Dispatch uv_udp_set_broadcast; delivers goc_box_int(status). */
+goc_chan* goc_io_udp_set_broadcast(uv_udp_t* handle, int on);
+
+/** Dispatch uv_udp_set_ttl; delivers goc_box_int(status). */
+goc_chan* goc_io_udp_set_ttl(uv_udp_t* handle, int ttl);
+
+/** Dispatch uv_udp_set_multicast_ttl; delivers goc_box_int(status). */
+goc_chan* goc_io_udp_set_multicast_ttl(uv_udp_t* handle, int ttl);
+
+/** Dispatch uv_udp_set_multicast_loop; delivers goc_box_int(status). */
+goc_chan* goc_io_udp_set_multicast_loop(uv_udp_t* handle, int on);
+
+/** Dispatch uv_udp_set_multicast_interface; delivers goc_box_int(status). */
+goc_chan* goc_io_udp_set_multicast_interface(uv_udp_t* handle,
+                                             const char* iface_addr);
+
+/** Dispatch uv_udp_set_membership; delivers goc_box_int(status). */
+goc_chan* goc_io_udp_set_membership(uv_udp_t* handle,
+                                    const char* mcast_addr,
+                                    const char* iface_addr,
+                                    uv_membership_t membership);
+
+/** Dispatch uv_udp_set_source_membership; delivers goc_box_int(status). */
+goc_chan* goc_io_udp_set_source_membership(uv_udp_t* handle,
+                                           const char* mcast_addr,
+                                           const char* iface_addr,
+                                           const char* source_addr,
+                                           uv_membership_t membership);
+
+/* =========================================================================
+ * Extended File System Operations
+ * ====================================================================== */
+
+/** Dispatch uv_fs_lstat; delivers goc_io_fs_stat_t*. */
+goc_chan* goc_io_fs_lstat(const char* path);
+
+/** Dispatch uv_fs_fstat; delivers goc_io_fs_stat_t*. */
+goc_chan* goc_io_fs_fstat(uv_file file);
+
+/** Dispatch uv_fs_ftruncate; delivers goc_box_int(status). */
+goc_chan* goc_io_fs_ftruncate(uv_file file, int64_t offset);
+
+/** Open + ftruncate + close; delivers goc_box_int(status). */
+goc_chan* goc_io_fs_truncate(const char* path, int64_t offset);
+
+/** Dispatch uv_fs_copyfile; delivers goc_box_int(status). */
+goc_chan* goc_io_fs_copyfile(const char* src, const char* dst, int flags);
+
+/** Dispatch uv_fs_access; delivers goc_box_int(status). */
+goc_chan* goc_io_fs_access(const char* path, int mode);
+
+/** Dispatch uv_fs_chmod; delivers goc_box_int(status). */
+goc_chan* goc_io_fs_chmod(const char* path, int mode);
+
+/** Dispatch uv_fs_fchmod; delivers goc_box_int(status). */
+goc_chan* goc_io_fs_fchmod(uv_file file, int mode);
+
+/** Dispatch uv_fs_chown; delivers goc_box_int(status). */
+goc_chan* goc_io_fs_chown(const char* path, uv_uid_t uid, uv_gid_t gid);
+
+/** Dispatch uv_fs_fchown; delivers goc_box_int(status). */
+goc_chan* goc_io_fs_fchown(uv_file file, uv_uid_t uid, uv_gid_t gid);
+
+/** Dispatch uv_fs_utime; delivers goc_box_int(status). */
+goc_chan* goc_io_fs_utime(const char* path, double atime, double mtime);
+
+/** Dispatch uv_fs_futime; delivers goc_box_int(status). */
+goc_chan* goc_io_fs_futime(uv_file file, double atime, double mtime);
+
+/** Dispatch uv_fs_lutime; delivers goc_box_int(status). */
+goc_chan* goc_io_fs_lutime(const char* path, double atime, double mtime);
+
+/** Dispatch uv_fs_mkdir; delivers goc_box_int(status). */
+goc_chan* goc_io_fs_mkdir(const char* path, int mode);
+
+/** Dispatch uv_fs_rmdir; delivers goc_box_int(status). */
+goc_chan* goc_io_fs_rmdir(const char* path);
+
+/** Dispatch uv_fs_scandir + iterate; delivers goc_io_fs_readdir_t*. */
+goc_chan* goc_io_fs_readdir(const char* path);
+
+/** Dispatch uv_fs_mkdtemp; delivers goc_io_fs_path_t*. */
+goc_chan* goc_io_fs_mkdtemp(const char* tpl);
+
+/** Dispatch uv_fs_mkstemp; delivers goc_io_fs_mkstemp_t*. */
+goc_chan* goc_io_fs_mkstemp(const char* tpl);
+
+/** Dispatch uv_fs_link; delivers goc_box_int(status). */
+goc_chan* goc_io_fs_link(const char* path, const char* new_path);
+
+/** Dispatch uv_fs_symlink; delivers goc_box_int(status). */
+goc_chan* goc_io_fs_symlink(const char* path, const char* new_path, int flags);
+
+/** Dispatch uv_fs_readlink; delivers goc_io_fs_path_t*. */
+goc_chan* goc_io_fs_readlink(const char* path);
+
+/** Dispatch uv_fs_realpath; delivers goc_io_fs_path_t*. */
+goc_chan* goc_io_fs_realpath(const char* path);
+
+/** Dispatch uv_fs_fsync; delivers goc_box_int(status). */
+goc_chan* goc_io_fs_fsync(uv_file file);
+
+/** Dispatch uv_fs_fdatasync; delivers goc_box_int(status). */
+goc_chan* goc_io_fs_fdatasync(uv_file file);
+
+/** Dispatch uv_fs_statfs; delivers goc_io_fs_statfs_t*. */
+goc_chan* goc_io_fs_statfs(const char* path);
+
+/* =========================================================================
+ * High-level file helpers (Node.js fs convenience API)
+ * ====================================================================== */
+
+/**
+ * goc_io_fs_read_file() — Read entire file; delivers goc_io_fs_read_file_t*.
+ * data is a goc_array of bytes (each element is goc_box_int(byte)).
+ */
+goc_chan* goc_io_fs_read_file(const char* path);
+
+/**
+ * goc_io_fs_write_file() — Open + write + close; delivers goc_box_int(status).
+ * flags : open flags, e.g. UV_FS_O_WRONLY|UV_FS_O_CREAT|UV_FS_O_TRUNC.
+ */
+goc_chan* goc_io_fs_write_file(const char* path, const char* data, int flags);
+
+/**
+ * goc_io_fs_append_file() — Open (O_APPEND) + write + close;
+ * delivers goc_box_int(status).
+ */
+goc_chan* goc_io_fs_append_file(const char* path, const char* data);
+
+/**
+ * goc_io_fs_read_stream_make() — Open file and stream chunks.
+ *
+ * Delivers successive goc_io_fs_read_chunk_t* values (one per chunk).
+ * Channel closed after EOF or error.
+ */
+goc_chan* goc_io_fs_read_stream_make(const char* path, size_t chunk_size);
+
+/**
+ * goc_io_fs_write_stream_make() — Open file for streaming writes.
+ *
+ * Delivers goc_io_fs_write_stream_open_t*; ws is non-NULL on success.
+ * Use goc_io_fs_write_stream_write / goc_io_fs_write_stream_end to write.
+ */
+goc_chan* goc_io_fs_write_stream_make(const char* path, int flags);
+
+/**
+ * goc_io_fs_write_stream_write() — Write a chunk to an open write stream.
+ * Delivers goc_box_int(nwritten); negative on error.
+ */
+goc_chan* goc_io_fs_write_stream_write(goc_io_fs_write_stream_t* ws,
+                                       const char* data, size_t len);
+
+/**
+ * goc_io_fs_write_stream_end() — Flush and close write stream.
+ * Delivers goc_box_int(status).
+ */
+goc_chan* goc_io_fs_write_stream_end(goc_io_fs_write_stream_t* ws);
+
+/* =========================================================================
+ * Signal watch
+ * ====================================================================== */
+
+/**
+ * goc_io_signal_start() — Begin watching for a signal.
+ *
+ * Channel delivers goc_box_int(signum) on each delivery.
+ * Channel stays open until goc_io_signal_stop().
+ *
+ * Constraint: stores context in handle->data.
+ */
+goc_chan* goc_io_signal_start(uv_signal_t* handle, int signum);
+
+/**
+ * goc_io_signal_stop() — Stop watching for a signal and close the channel.
+ * Returns 0; stop takes effect asynchronously.
+ */
+int goc_io_signal_stop(uv_signal_t* handle);
+
+/* =========================================================================
+ * FS event / FS poll watches
+ * ====================================================================== */
+
+/**
+ * goc_io_fs_event_start() — Begin watching a path for filesystem changes.
+ *
+ * Calls uv_fs_event_start; channel delivers goc_io_fs_event_t* on each change.
+ * Channel stays open until goc_io_fs_event_stop().
+ *
+ * Constraint: stores context in handle->data.
+ */
+goc_chan* goc_io_fs_event_start(uv_fs_event_t* handle, const char* path,
+                                unsigned flags);
+
+/**
+ * goc_io_fs_event_stop() — Stop watching and close the channel.
+ * Returns 0; stop takes effect asynchronously.
+ */
+int goc_io_fs_event_stop(uv_fs_event_t* handle);
+
+/**
+ * goc_io_fs_poll_start() — Begin polling a path for stat changes.
+ *
+ * Calls uv_fs_poll_start; channel delivers goc_io_fs_poll_t* on each change.
+ * Channel stays open until goc_io_fs_poll_stop().
+ *
+ * Constraint: stores context in handle->data.
+ */
+goc_chan* goc_io_fs_poll_start(uv_fs_poll_t* handle, const char* path,
+                               unsigned interval_ms);
+
+/**
+ * goc_io_fs_poll_stop() — Stop polling and close the channel.
+ * Returns 0; stop takes effect asynchronously.
+ */
+int goc_io_fs_poll_stop(uv_fs_poll_t* handle);
+
+/* =========================================================================
+ * TTY mode / window size
+ * ====================================================================== */
+
+/** Dispatch uv_tty_set_mode to loop thread; delivers goc_box_int(status). */
+goc_chan* goc_io_tty_set_mode(uv_tty_t* handle, uv_tty_mode_t mode);
+
+/** Dispatch uv_tty_get_winsize to loop thread; delivers goc_io_tty_winsize_t*. */
+goc_chan* goc_io_tty_get_winsize(uv_tty_t* handle);
+
+/* =========================================================================
+ * Process signals
+ * ====================================================================== */
+
+/** Dispatch uv_process_kill; delivers goc_box_int(status). */
+goc_chan* goc_io_process_kill(uv_process_t* handle, int signum);
+
+/** Dispatch uv_kill(pid, signum); delivers goc_box_int(status). */
+goc_chan* goc_io_kill(int pid, int signum);
+
+/* =========================================================================
+ * Random bytes
+ * ====================================================================== */
+
+/**
+ * goc_io_random() — Fill n bytes with cryptographically strong random data.
+ *
+ * Delivers goc_io_random_t*; data is a goc_array of n bytes.
+ */
+goc_chan* goc_io_random(size_t n, unsigned flags);
 
 /**
  * goc_io_handle_register() — Pin a GC-allocated libuv handle as a GC root.
