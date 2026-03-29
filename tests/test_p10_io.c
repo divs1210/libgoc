@@ -185,7 +185,7 @@ static void fiber_p10_3(void* arg)
     goc_val_t* vrd = goc_take(goc_io_fs_read(fd, CONTENT_LEN, 0));
     goc_take(goc_io_fs_close(fd));
 
-    goc_io_fs_read_t* rres = (goc_io_fs_read_t*)vrd->val;
+    goc_io_fs_read_t* rres = vrd->val;
     if (!rres || rres->nread != CONTENT_LEN) goto done;
     if (memcmp(rres->buf, CONTENT, CONTENT_LEN) != 0) goto done;
     ok = 1;
@@ -283,7 +283,7 @@ static void fiber_p10_6(void* arg)
 
     /* File should no longer exist */
     goc_val_t* vstat = goc_take(goc_io_fs_stat(TMP_PATH2));
-    goc_io_fs_stat_t* st = (goc_io_fs_stat_t*)vstat->val;
+    goc_io_fs_stat_t* st = vstat->val;
     if (!st || st->ok == GOC_IO_OK) goto done;  /* still exists = fail */
 
     ok = 1;
@@ -465,7 +465,7 @@ static void fiber_p10_11(void* arg)
     if (verify_fd < 0) goto done;
     goc_val_t* vrd = goc_take(goc_io_fs_read(verify_fd, CONTENT_LEN, 0));
     goc_take(goc_io_fs_close(verify_fd));
-    goc_io_fs_read_t* rres = (goc_io_fs_read_t*)vrd->val;
+    goc_io_fs_read_t* rres = vrd->val;
     if (!rres || rres->nread != CONTENT_LEN) goto done;
     if (memcmp(rres->buf, CONTENT, CONTENT_LEN) != 0) goto done;
 
