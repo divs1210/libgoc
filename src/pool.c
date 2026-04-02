@@ -550,62 +550,6 @@ void post_to_run_queue(goc_pool* pool, goc_entry* entry) {
 }
 
 /* -------------------------------------------------------------------------
- * post_list_to_run_queue — batch variant of post_to_run_queue
- *
- * Takes a singly-linked list of goc_entry* (linked via ->next, last->next==NULL,
- * count entries total) and distributes them across worker injectors round-robin,
- * using one injector_push_list call per worker — a single lock acquisition per
- * worker instead of one per entry.
- *
- * Always uses the external (injector) path regardless of caller context, so
- * that a large burst of entries is spread across all workers rather than
- * piling onto the calling worker's deque.
- * ---------------------------------------------------------------------- */
-
-void post_list_to_run_queue(goc_pool* pool, goc_entry** entries, size_t count) {
-    if (count == 0)
-        return;
-
-    size_t n = pool->thread_count;
-
-    /* Per-worker list heads and tails, stack-allocated for small thread counts.
-     * For large counts this is still just n pointers. */
-    goc_entry** w_head = alloca(n * sizeof(goc_entry*));
-    goc_entry** w_tail = alloca(n * sizeof(goc_entry*));
-    size_t*     w_cnt  = alloca(n * sizeof(size_t));
-    for (size_t i = 0; i < n; i++) {
-        w_head[i] = NULL;
-        w_tail[i] = NULL;
-        w_cnt[i]  = 0;
-    }
-
-    /* Assign each entry to a worker round-robin, building per-worker lists. */
-    size_t base = atomic_fetch_add_explicit(&pool->next_push_idx, count,
-                                            memory_order_relaxed);
-    for (size_t i = 0; i < count; i++) {
-        size_t idx = (base + i) % n;
-        goc_entry* e = entries[i];
-        e->next = NULL;
-        if (w_tail[idx] != NULL)
-            w_tail[idx]->next = e;
-        else
-            w_head[idx] = e;
-        w_tail[idx] = e;
-        w_cnt[idx]++;
-    }
-
-    /* Batch-push each worker's list and wake if idle. */
-    for (size_t i = 0; i < n; i++) {
-        if (w_cnt[i] == 0)
-            continue;
-        injector_push_list(&pool->workers[i].injector,
-                           w_head[i], w_tail[i], w_cnt[i]);
-        if (atomic_load_explicit(&pool->idle_count, memory_order_seq_cst) > 0)
-            uv_sem_post(&pool->workers[i].idle_sem);
-    }
-}
-
-/* -------------------------------------------------------------------------
  * pool_abort_if_called_from_worker
  *
  * Destroying a pool from one of its own worker threads is invalid: the
