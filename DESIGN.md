@@ -145,6 +145,7 @@ Dependencies are resolved via `pkg-config` (libuv as `libuv`, Boehm GC as `bdw-g
 Named constants defined in `config.h`:
 - `GOC_DEAD_COUNT_THRESHOLD 8`
 - `GOC_ALTS_STACK_THRESHOLD 8` (maximum number of `goc_alts` arms for which the channel-pointer scratch buffer is stack-allocated rather than `malloc`-allocated; avoids a heap allocation for the common case of a small select)
+- `GOC_DEFAULT_LIVE_FIBER_MEMORY_FACTOR 0.6` (safety/throughput factor in the default live-fiber admission cap formula `floor(factor × available_memory / fiber_stack_size)`; the 0.6 value reserves ~40% memory headroom for GC and runtime overhead; overridable at runtime via `GOC_MAX_LIVE_FIBERS`)
 
 Optional opt-in flags, each requiring a **separate build directory**:
 

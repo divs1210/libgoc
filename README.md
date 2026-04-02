@@ -61,7 +61,7 @@ The library provides stackful coroutines ("fibers"), channels, a select primitiv
   - [RW mutexes](#rw-mutexes)
   - [Thread pool](#thread-pool)
   - [Scheduler loop access](#scheduler-loop-access)
-  - [Async I/O](#async-io)
+  - [Async I/O →](./IO.md)
 - [Best Practices](#best-practices)
 - [Benchmarks](#benchmarks)
 - [Building and Testing](#building-and-testing)
@@ -254,30 +254,26 @@ typedef struct node_t {
     struct node_t* next;
 } node_t;
 
-static void build_list() {
-    goc_chan* result_ch = arg;
-
-    /* Build a linked list entirely on the GC heap — no free() required. */
+static node_t* build_list(int n) {
     node_t* head = NULL;
-    for (int i = 9; i >= 0; i--) {
-        node_t* n = goc_malloc(sizeof(node_t));
-        n->value = i;
-        n->next  = head;
-        head     = n;
+    for (int i = n - 1; i >= 0; i--) {
+        node_t* node = goc_malloc(sizeof(node_t));
+        node->value = i;
+        node->next  = head;
+        head        = node;
     }
-
     return head;
 }
 
 int main(void) {
     goc_init();
 
-    node_t* node = build_list(result_ch);
+    node_t* node = build_list(10);
     while (node != NULL) {
         printf("%d ", node->value);
-        printf("\n");
         node = node->next;
     }
+    printf("\n");
 
     goc_shutdown();
     return 0;
@@ -287,7 +283,6 @@ int main(void) {
 **A few things to keep in mind:**
 
 - `goc_malloc` is a thin wrapper around `GC_malloc`. Memory is zero-initialised.
-- **libuv handles** must be GC-allocated with `goc_malloc` and registered via `goc_io_handle_register`. See [Async I/O](#async-io).
 
 ---
 
@@ -297,8 +292,8 @@ int main(void) {
 
 | Function | Signature | Description |
 |---|---|---|
-| `goc_init` | `void goc_init(void)` | Initialise the runtime. Must be called **exactly once**, as the **first call in `main()`**, before any other library or application code that could trigger GC allocation. Must be called from the process main thread; calling from any non-main thread prints an error to `stderr` and aborts. Calls `GC_INIT()` and `GC_allow_register_threads()` unconditionally — do not call these yourself. Initialises the live-channel, pool, and mutex registries; creates the libuv loop infrastructure; starts the libuv loop thread; and creates the default thread pool. |
-| `goc_shutdown` | `void goc_shutdown(void)` | Shut down the runtime. Blocks until all in-flight fibers on every pool have completed naturally, then tears down all pools (the default pool and any user-created pools not yet destroyed), destroys channel and RW-mutex internal locks, signals the loop thread to close all handles, joins the loop thread, and frees the event loop. Must be called from the process main thread (the same thread that called `goc_init`); calling from any non-main thread prints an error to `stderr` and aborts. Will block forever if any fiber is waiting on a channel event that will never arrive. No `goc_*` call is valid after it returns. |
+| `goc_init` | `void goc_init(void)` | Initialise the runtime. Must be called exactly once as the first call in `main()`, from the process main thread. |
+| `goc_shutdown` | `void goc_shutdown(void)` | Shut down the runtime. Blocks until all in-flight fibers finish, then tears down all pools, channels, and the event loop. Must be called from the process main thread. |
 
 ---
 
@@ -414,13 +409,11 @@ goc_take_sync(done);
 
 ### minicoro limitations
 
-libgoc uses [minicoro](https://github.com/edubart/minicoro) for fiber switching. Three hard constraints apply to all fiber entry functions:
+libgoc uses [minicoro](https://github.com/edubart/minicoro) for fiber switching. Three constraints apply:
 
-**C++ exceptions are not supported.** Throwing a C++ exception that unwinds across a `mco_yield` / `mco_resume` boundary is undefined behaviour — the exception mechanism's internal state is not preserved across a coroutine switch. In mixed C/C++ codebases, all fiber entry functions must be declared `extern "C"` and must not allow any C++ exception to propagate out of them.
-
-**Stack management.** By default, libgoc uses canary-protected stacks with overflow detection. This is the portable default: canary stacks work on all platforms including restricted environments where virtual memory is unavailable, and encourage library authors to develop with a portability mindset. libgoc provides a GC heap (`goc_malloc`) for off-stack data, so fixed-size stacks are practical for most use cases. If stack overflow is detected, the runtime calls `abort()` immediately with a diagnostic message. For use cases that need large or variable stacks, the virtual memory allocator can be enabled with `-DLIBGOC_VMEM=ON`. Avoid large stack-allocated buffers and deep recursion inside fibers regardless of stack mode; use `goc_malloc`-allocated buffers on the GC heap for large data instead.
-
-**`src/minicoro.c` uses isolated compile flags.** The build system enforces `-UGC_THREADS -UGC_PTHREADS -DMCO_ZERO_MEMORY` on that translation unit (and additionally `-DMCO_USE_VMEM_ALLOCATOR` when `-DLIBGOC_VMEM=ON`). This avoids GC thread-wrapper/TLS startup interaction and enables minicoro's zeroing of pop storage for conservative-GC friendliness.
+- **C++ exceptions** must not propagate across fiber boundaries (across `mco_yield`/`mco_resume`). Declare fiber entry functions `extern "C"` in mixed C/C++ codebases.
+- **Fixed stacks** — default canary-protected stacks are portable and overflow-safe (abort on overwrite). Use `goc_malloc` for large data instead of stack allocation. Enable dynamic stacks with `-DLIBGOC_VMEM=ON` if needed.
+- **`src/minicoro.c`** is compiled with isolated flags that prevent GC/TLS conflicts and enable conservative-GC-friendly memory zeroing.
 
 ---
 
@@ -470,25 +463,6 @@ These functions may suspend the calling fiber. **Call only from inside a fiber**
 | `goc_put` | `goc_status_t goc_put(goc_chan* ch, void* val)` | Send `val` into `ch`. Blocks until a receiver accepts or the channel is closed. Returns `GOC_OK` on success, `GOC_CLOSED` on close. Asserts that the caller is running inside a fiber — calling from a bare OS thread aborts with a clear message. |
 | `goc_take_all` | `goc_val_t** goc_take_all(goc_chan** chs, size_t n)` | Receive from every channel in `chs[0..n-1]` in order, suspending on each one in turn. Returns a GC-managed array of `n` `goc_val_t*` results in the same order as `chs[]`. Each element follows `goc_take` semantics: `{val, GOC_OK}` on success, `{NULL, GOC_CLOSED}` on close. Must only be called from a fiber. |
 
-```c
-static void consumer(void* arg) {
-    goc_chan* ch = arg;
-    goc_val_t* v;
-    while ((v = goc_take(ch))->ok == GOC_OK)
-        printf("got %ld\n", (long)goc_unbox_int(v->val));
-    // channel closed
-}
-```
-
-```c
-// Wait for results from multiple channels at once (fiber context):
-goc_val_t** results = goc_take_all(chs, n);
-for (size_t i = 0; i < n; i++) {
-    if (results[i]->ok == GOC_OK)
-        process(results[i]->val);
-}
-```
-
 ---
 
 ### Channel I/O — blocking OS threads
@@ -500,22 +474,6 @@ Blocks the calling OS thread (not a fiber). Calling these from a fiber is a runt
 | `goc_take_sync` | `goc_val_t* goc_take_sync(goc_chan* ch)` | Receive a value, blocking the OS thread. Returns a GC-managed pointer to `{val, GOC_OK}` on success, `{NULL, GOC_CLOSED}` on close. |
 | `goc_put_sync` | `goc_status_t goc_put_sync(goc_chan* ch, void* val)` | Send `val`, blocking the OS thread. Returns `GOC_OK` on success, `GOC_CLOSED` on close. |
 | `goc_take_all_sync` | `goc_val_t** goc_take_all_sync(goc_chan** chs, size_t n)` | Receive from every channel in `chs[0..n-1]` in order, blocking the OS thread on each one in turn. Returns a GC-managed array of `n` `goc_val_t*` results in the same order as `chs[]`. Each element follows `goc_take_sync` semantics: `{val, GOC_OK}` on success, `{NULL, GOC_CLOSED}` on close. Must not be called from a fiber. |
-
-```c
-// From a plain OS thread (e.g. the application's main thread):
-goc_val_t* result = goc_take_sync(result_ch);
-if (result->ok == GOC_OK)
-    process(result->val);
-```
-
-```c
-// Collect results from multiple channels (OS thread context):
-goc_val_t** results = goc_take_all_sync(join_channels, n);
-for (size_t i = 0; i < n; i++) {
-    if (results[i]->ok == GOC_CLOSED)
-        printf("fiber %zu finished\n", i);
-}
-```
 
 ---
 
@@ -634,14 +592,6 @@ goc_close(w);          /* release */
 
 The default pool is created by `goc_init` with `max(4, hardware_concurrency)` worker threads. This can be overridden by setting the `GOC_POOL_THREADS` environment variable to a positive integer before calling `goc_init`. Invalid values (non-numeric, zero, or negative) are silently ignored and the default is used.
 
-Pools also apply a live-fiber admission cap by default so bursty spawn patterns do not materialise an unbounded number of fibers at once. This helps both canary and vmem builds stay bounded under mass-spawn workloads, while still keeping `goc_go` / `goc_go_on` non-blocking. When the cap is reached, new external spawn calls are accepted immediately but their actual fiber creation is deferred until earlier fibers finish. Same-pool spawns originating from a currently running fiber bypass the cap to preserve liveness for parent→child dependency patterns. Override the cap with `GOC_MAX_LIVE_FIBERS`:
-
-- unset: use the built-in default in all builds:
-    `floor(0.6 × (available_hardware_memory / fiber_stack_size))`
-    (the `0.6` factor intentionally reserves ~40% memory headroom for GC and runtime overhead)
-- `0`: disable throttling entirely
-- positive integer: explicit per-pool live-fiber cap
-
 ```c
 typedef enum {
     GOC_DRAIN_OK      = 0,  /* all fibers finished within the deadline */
@@ -675,26 +625,13 @@ if (goc_pool_destroy_timeout(io_pool, 2000) == GOC_DRAIN_TIMEOUT) {
 
 | Function | Signature | Description |
 |---|---|---|
-| `goc_scheduler` | `uv_loop_t* goc_scheduler(void)` | Return the `uv_loop_t*` owned by the runtime. Safe to call from any thread after `goc_init` returns. **Do not call `uv_run` or `uv_loop_close` on the returned pointer.** |
-
-Use `goc_scheduler` to register user-owned libuv handles on the same event loop as the runtime. See [IO.md](IO.md) for handle allocation and lifetime requirements.
+| `goc_scheduler` | `uv_loop_t* goc_scheduler(void)` | Return the `uv_loop_t*` owned by the runtime. Safe to call from any thread after `goc_init`. **Do not call `uv_run` or `uv_loop_close` on it.** |
 
 ---
 
 ### Async I/O
 
-libgoc provides channel-based async I/O wrappers for libuv operations via a separate header:
-
-```c
-#include "goc.h"
-#include "goc_io.h"
-```
-
-Each function is prefixed `goc_io_` and returns a `goc_chan*` that delivers the result when the I/O completes. Safe from any context; composable with `goc_alts()`.
-
-Covered operations: stream read/write/connect/shutdown, UDP send/recv, file-system (open/close/read/write/stat/rename/unlink/sendfile), and DNS (getaddrinfo/getnameinfo).
-
-> **Full API reference:** [IO.md](./IO.md)
+See [IO.md](./IO.md) for the full `goc_io` API reference.
 
 ---
 
@@ -748,14 +685,6 @@ libgoc ships with a comprehensive, phased test suite covering the full public AP
 | minicoro | vendored (submodule); instantiated via `src/minicoro.c` |
 
 A C11 compiler is required: GCC or Clang on Linux/macOS; MinGW-w64 GCC via MSYS2 UCRT64 on Windows.
-
-**Build configuration constants** (`src/config.h`):
-
-| Constant | Default | Description |
-|---|---|---|
-| `GOC_DEAD_COUNT_THRESHOLD` | `8` | Dead-entry compaction threshold for channel waiter lists |
-| `GOC_ALTS_STACK_THRESHOLD` | `8` | Max `goc_alts` arms before scratch buffer moves to heap |
-| `GOC_DEFAULT_LIVE_FIBER_MEMORY_FACTOR` | `0.6` | Default safety/throughput factor in `floor(factor × memory / stack_size)` for live-fiber admission |
 
 ---
 
@@ -872,8 +801,6 @@ cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 
 ### Stack allocator
 
-By default, libgoc uses canary-protected fixed-size stacks. Canary stacks are portable across all supported platforms (Linux, macOS, Windows, and restricted environments), lighter in both time and space than virtual memory stacks, and encourage a portability-first development mindset. libgoc's GC heap (`goc_malloc`) handles off-stack data, making fixed-size stacks practical for the vast majority of use cases.
-
 ```sh
 # Default: canary-protected stacks (recommended, portable)
 cmake -B build
@@ -882,13 +809,7 @@ cmake -B build
 cmake -B build -DLIBGOC_VMEM=ON
 ```
 
-With canary stacks (default), fibers use a fixed-size stack with a sentinel word written at the lowest address. If the canary is overwritten (stack overflow), the runtime calls `abort()` with a diagnostic message — turning silent heap corruption into a deterministic crash.
-
-With virtual memory enabled (`-DLIBGOC_VMEM=ON`), fibers can grow their stacks dynamically. This eliminates stack overflow concerns but is heavier in space and time, and is not supported on all platforms.
-
-#### Configurable stack size
-
-The default fiber stack size can be set at build time via the `LIBGOC_STACK_SIZE` CMake option (in bytes). The default is `0`, which lets minicoro choose (56 KB for canary, ~2 MB for vmem):
+The default fiber stack size can be set at build time:
 
 ```sh
 cmake -B build -DLIBGOC_STACK_SIZE=131072   # 128 KB
