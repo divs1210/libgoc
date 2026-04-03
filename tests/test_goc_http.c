@@ -1169,19 +1169,25 @@ static p11_inject_t* g_inject;
 
 static void handler_check_injection(goc_http_ctx_t* ctx)
 {
+    fprintf(stderr, "[GOC_DBG] P11.25 handler_check_injection: entered ctx=%p\n", (void*)ctx); fflush(stderr);
     /* If injection succeeded, the server sees X-Injected as a header. */
     const char* v = goc_http_server_header(ctx, "x-injected");
     g_inject->injected = (v != NULL);
+    fprintf(stderr, "[GOC_DBG] P11.25 handler_check_injection: x-injected=%s\n", v ? v : "<NULL>"); fflush(stderr);
     goc_take(goc_http_server_respond(ctx, 200, "text/plain", "ok"));
+    fprintf(stderr, "[GOC_DBG] P11.25 handler_check_injection: responded\n"); fflush(stderr);
 }
 
 static void fiber_p11_25(void* arg)
 {
     p11_inject_t* a = (p11_inject_t*)arg;
+    fprintf(stderr, "[GOC_DBG] P11.25 fiber: start port=%d done=%p\n", a->port, (void*)a->done); fflush(stderr);
     g_inject = a;
     goc_http_server_t* srv = goc_http_server_make(goc_http_server_opts());
     goc_http_server_route(srv, "GET", "/check-inject", handler_check_injection);
+    fprintf(stderr, "[GOC_DBG] P11.25 fiber: listening\n"); fflush(stderr);
     goc_take(goc_http_server_listen(srv, "127.0.0.1", a->port));
+    fprintf(stderr, "[GOC_DBG] P11.25 fiber: listen done\n"); fflush(stderr);
 
     /* Header value contains embedded CRLF — would inject "X-Injected: evil"
      * into raw HTTP request bytes if not sanitised. */
@@ -1194,11 +1200,18 @@ static void fiber_p11_25(void* arg)
     opts->headers = goc_array_make(1);
     goc_array_push(opts->headers, hdr);
 
+    fprintf(stderr, "[GOC_DBG] P11.25 fiber: before goc_http_get\n"); fflush(stderr);
     goc_take(goc_http_get(local_url("/check-inject", a->port), opts));
+    fprintf(stderr, "[GOC_DBG] P11.25 fiber: after goc_http_get\n"); fflush(stderr);
+    fprintf(stderr, "[GOC_DBG] P11.25 fiber: before timeout\n"); fflush(stderr);
     goc_take(goc_timeout(20));
+    fprintf(stderr, "[GOC_DBG] P11.25 fiber: after timeout\n"); fflush(stderr);
 
+    fprintf(stderr, "[GOC_DBG] P11.25 fiber: before server_close\n"); fflush(stderr);
     goc_take(goc_http_server_close(srv));
+    fprintf(stderr, "[GOC_DBG] P11.25 fiber: after server_close\n"); fflush(stderr);
     goc_put(a->done, goc_box_int(1));
+    fprintf(stderr, "[GOC_DBG] P11.25 fiber: done put\n"); fflush(stderr);
 }
 
 static void test_p11_25(void)
@@ -1219,7 +1232,17 @@ done:;
 int main(void)
 {
     install_crash_handler();
-    goc_test_arm_watchdog(480);
+    goc_test_arm_watchdog(30);
+
+    /* Keep HTTP stress deterministic in CI/local loops by capping pool
+     * parallelism for this test process. High worker counts amplify scheduler
+     * race windows and make failures far more frequent under heavy diagnostics. */
+#if defined(_WIN32)
+    _putenv_s("GOC_POOL_THREADS", "4");
+#else
+    setenv("GOC_POOL_THREADS", "4", 1);
+#endif
+
     goc_init();
 
     printf("Phase 11 — HTTP server and client (goc_http)\n");

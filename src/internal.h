@@ -13,11 +13,45 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <uv.h>
 #include <gc.h>
 #include "minicoro.h"
 #include "../include/goc.h"
 #include "config.h"
+
+/* ---------------------------------------------------------------------------
+ * Debug log filter
+ *
+ * The codebase currently emits extensive "[GOC_DBG]" diagnostics in hot
+ * paths. Keep the callsites intact, but suppress those lines by default so
+ * stress runs remain representative. Set GOC_DEBUG_LOGS=1 to re-enable them.
+ * --------------------------------------------------------------------------- */
+
+static inline int goc_debug_logs_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* env = getenv("GOC_DEBUG_LOGS");
+        cached = (env != NULL && env[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
+static inline int goc_fprintf_filtered(FILE* stream, const char* fmt, ...) {
+    if (!goc_debug_logs_enabled() && fmt != NULL && strncmp(fmt, "[GOC_DBG]", 9) == 0)
+        return 0;
+
+    va_list ap;
+    va_start(ap, fmt);
+    int rc = vfprintf(stream, fmt, ap);
+    va_end(ap);
+    return rc;
+}
+
+#define fprintf goc_fprintf_filtered
 
 /* ---------------------------------------------------------------------------
  * goc_sync_t — portable binary semaphore (mutex + condvar)
@@ -273,6 +307,7 @@ static inline bool try_claim_wake(goc_entry* e) {
 void loop_init(void);
 void loop_shutdown(void);
 void post_callback(goc_entry* entry, void* value);
+void post_on_loop(void (*fn)(void*), void* arg);
 
 /* gc.c → used by pool.c, loop.c */
 void live_channels_init(void);
