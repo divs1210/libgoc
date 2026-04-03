@@ -36,6 +36,7 @@
  *   P11.23 Correctness: goc_http_response_t->body_len matches respond_buf len
  *   P11.24 Correctness: custom request headers via opts->headers received
  *   P11.25 Security: CRLF in header value blocked (header-injection)
+ *   P11.26 Integration: ping-pong — two servers bounce a counter 500 round trips
  */
 
 #if !defined(_WIN32) && !defined(__APPLE__)
@@ -1226,13 +1227,102 @@ done:;
 }
 
 /* =========================================================================
+ * P11.26 — Ping-pong: two servers bounce a counter for 500 round trips
+ *
+ * Mirrors the ping-pong example from HTTP.md.  Two servers on separate
+ * loopback ports exchange a counter via POST requests until the counter
+ * reaches P11_26_ROUNDS, at which point server A closes pp_done and both
+ * servers are shut down cleanly.
+ * ====================================================================== */
+
+#define P11_26_ROUNDS 500
+
+typedef struct {
+    goc_chan* test_done;  /* put(1) when fiber_p11_26 finishes        */
+    int       port_a;
+    int       port_b;
+    goc_chan* pp_done;    /* closed by pp_handler_a when n >= ROUNDS  */
+} p11_pingpong_t;
+
+static p11_pingpong_t* g_pp;
+static char g_pp_addr_a[64];
+static char g_pp_addr_b[64];
+
+/* Server A: receive counter, respond, then forward to B (or stop). */
+static void pp_handler_a(goc_http_ctx_t* ctx)
+{
+    int n = atoi(goc_http_server_body_str(ctx));
+    goc_take(goc_http_server_respond(ctx, 200, "text/plain", "ok"));
+    if (n >= P11_26_ROUNDS) {
+        goc_close(g_pp->pp_done);
+        return;
+    }
+    char* msg = goc_sprintf("%d", n + 1);
+    goc_http_post(g_pp_addr_b, "text/plain", msg, goc_http_request_opts());
+}
+
+/* Server B: receive counter, respond, then forward to A. */
+static void pp_handler_b(goc_http_ctx_t* ctx)
+{
+    int n = atoi(goc_http_server_body_str(ctx));
+    goc_take(goc_http_server_respond(ctx, 200, "text/plain", "ok"));
+    char* msg = goc_sprintf("%d", n + 1);
+    goc_http_post(g_pp_addr_a, "text/plain", msg, goc_http_request_opts());
+}
+
+static void fiber_p11_26(void* arg)
+{
+    p11_pingpong_t* a = (p11_pingpong_t*)arg;
+    g_pp = a;
+    snprintf(g_pp_addr_a, sizeof(g_pp_addr_a),
+             "http://127.0.0.1:%d/ping", a->port_a);
+    snprintf(g_pp_addr_b, sizeof(g_pp_addr_b),
+             "http://127.0.0.1:%d/ping", a->port_b);
+
+    goc_http_server_t* srv_a = goc_http_server_make(goc_http_server_opts());
+    goc_http_server_t* srv_b = goc_http_server_make(goc_http_server_opts());
+    goc_http_server_route(srv_a, "POST", "/ping", pp_handler_a);
+    goc_http_server_route(srv_b, "POST", "/ping", pp_handler_b);
+
+    goc_chan* ready_a = goc_http_server_listen(srv_a, "127.0.0.1", a->port_a);
+    goc_chan* ready_b = goc_http_server_listen(srv_b, "127.0.0.1", a->port_b);
+    goc_take(ready_a);
+    goc_take(ready_b);
+
+    /* Fire the first request; the two handlers bounce it back and forth. */
+    goc_http_post(g_pp_addr_a, "text/plain", "0", goc_http_request_opts());
+
+    /* Wait until server A closes pp_done (counter reached ROUNDS). */
+    goc_take(a->pp_done);
+
+    goc_take(goc_http_server_close(srv_a));
+    goc_take(goc_http_server_close(srv_b));
+    goc_put(a->test_done, goc_box_int(1));
+}
+
+static void test_p11_26(void)
+{
+    TEST_BEGIN("P11.26 Ping-pong: 500 round trips between two servers");
+    p11_pingpong_t args = {
+        goc_chan_make(1),   /* test_done */
+        next_port(),        /* port_a */
+        next_port(),        /* port_b */
+        goc_chan_make(0),   /* pp_done (unbuffered; closed on completion) */
+    };
+    goc_go(fiber_p11_26, &args);
+    goc_take_sync(args.test_done);
+    TEST_PASS();
+done:;
+}
+
+/* =========================================================================
  * main
  * ====================================================================== */
 
 int main(void)
 {
     install_crash_handler();
-    goc_test_arm_watchdog(30);
+    goc_test_arm_watchdog(60);
 
     /* Keep HTTP stress deterministic in CI/local loops by capping pool
      * parallelism for this test process. High worker counts amplify scheduler
@@ -1272,6 +1362,8 @@ int main(void)
     test_p11_23();
     test_p11_24();
     test_p11_25();
+    test_p11_26();
+
 
     printf("\n%d/%d tests passed", g_tests_passed, g_tests_run);
     if (g_tests_failed)

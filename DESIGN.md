@@ -143,7 +143,7 @@ The project uses CMake (≥ 3.20). `CMakeLists.txt` defines the following primar
 | `test_p01_foundation` … `test_p10_io` | executables | One per phase, discovered via `file(GLOB tests/test_p*.c)`; each linked against the active `goc` variant + libuv + Boehm GC |
 | `test_goc_array` | executable | Component test for `goc_array`; discovered via `file(GLOB tests/test_goc_*.c)` |
 | `test_goc_stats` | executable | Component test for `goc_stats`; always compiled with `GOC_ENABLE_STATS` and `src/goc_stats.c` added directly, regardless of the `GOC_ENABLE_STATS` CMake option |
-| `test_p11_http` | executable | Phase 11 test for `goc_http`; compiled only when `LIBGOC_SERVER=ON` (default) |
+| `test_p11_http` | executable | Phase 11 tests for `goc_http` (server lifecycle, routing, handlers, middleware, HTTP client, security, ping-pong integration); compiled only when `LIBGOC_SERVER=ON` (default) |
 
 A CMake function `goc_configure_target(<target>)` centralises the options shared by every library variant: `PUBLIC` include path `include/`, `PRIVATE` paths `src/`, `vendor/minicoro/`, and (when `LIBGOC_SERVER` is ON) `vendor/picohttpparser/`, compile definition `GC_THREADS`, and link libraries `PkgConfig::LIBUV` and `PkgConfig::BDWGC`. All library targets (`goc`, `goc_shared`, `goc_asan`, `goc_tsan`) are configured through this function.
 
