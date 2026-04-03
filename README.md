@@ -29,9 +29,9 @@ The library provides stackful coroutines ("fibers"), channels, a select primitiv
 
 **Helper libraries:**
 - [Async I/O API](./IO.md)
+- [HTTP Client/Server](./HTTP.md)
 - [Dynamic Array](./ARRAY.md)
 - [Telemetry](./TELEMETRY.md)
-- [HTTP Server](./HTTP.md)
 
 **Also see:**
 - [Design Doc](./DESIGN.md)
@@ -65,7 +65,7 @@ The library provides stackful coroutines ("fibers"), channels, a select primitiv
   - [Thread pool](#thread-pool)
   - [Scheduler loop access](#scheduler-loop-access)
   - [Async I/O →](./IO.md)
-  - [HTTP Server →](./HTTP.md)
+  - [HTTP Client/Server →](./HTTP.md)
 - [Best Practices](#best-practices)
 - [Benchmarks](#benchmarks)
 - [Building and Testing](#building-and-testing)
