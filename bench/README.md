@@ -208,6 +208,8 @@ Geometric mean of the ×Go multipliers across pool sizes 1, 2, 4, 8.
 - **Prime sieve**: libgoc (canary) leads at pool=1 (1.43× Go), but Go quickly overtakes as pool size increases.
 - **Overall**: The new results confirm that libgoc’s improvements are real but incremental.
 
+HTTP throughput is I/O bound due to the current single-global-event-loop architecture, and should start scaling once multi-loop is implemented.
+
 For root-cause analysis of these results, proposed fixes, and the prioritized optimization roadmap, see [OPTIMIZATION.md](../OPTIMIZATION.md).
 
 <!-- END AUTO BENCH REPORT -->
