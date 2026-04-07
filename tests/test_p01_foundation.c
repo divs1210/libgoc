@@ -159,10 +159,6 @@ static void test_p1_5(void) {
 done:;
 }
 
-/* =========================================================================
- * Phase 1 — String helpers
- * ====================================================================== */
-
 /*
  * P1.6 — goc_sprintf() returns a non-NULL GC-managed string
  */
@@ -233,12 +229,7 @@ int main(void) {
 
     goc_shutdown();
 
-    printf("=========================================\n");
-    printf("Results: %d/%d passed", g_tests_passed, g_tests_run);
-    if (g_tests_failed > 0) {
-        printf(", %d FAILED", g_tests_failed);
-    }
-    printf("\n");
+    REPORT(g_tests_run, g_tests_passed, g_tests_failed);
 
     return (g_tests_failed == 0) ? 0 : 1;
 }

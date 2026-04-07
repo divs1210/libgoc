@@ -47,21 +47,21 @@ run fails.
 ### Go
 
 ```sh
-# Single run (uses current GOMAXPROCS)
+# Single run (uses default threads = nproc)
 make -C go run
 
 # Multi-pool testing (runs with GOMAXPROCS = 1, 2, 4, 8)
-make -C go run-all
+make -C go run all=1
 ```
 
 ### libgoc
 
 ```sh
-# Single run (uses current GOC_POOL_THREADS)
+# Single run (uses default threads = nproc)
 make -C libgoc run
 
 # Multi-pool testing (runs with GOC_POOL_THREADS = 1, 2, 4, 8)
-make -C libgoc run-all
+make -C libgoc run all=1
 ```
 
 ### Clojure
@@ -69,11 +69,11 @@ make -C libgoc run-all
 Requires [Clojure CLI tools](https://clojure.org/guides/install_clojure).
 
 ```sh
-# Single run (uses default pool size = 8)
+# Single run (uses default threads = nproc)
 make -C clojure run
 
-# Multi-pool testing (runs with CLOJURE_POOL_THREADS = 1, 2, 4, 8)
-make -C clojure run-all
+# Multi-pool testing (runs with threads = 1, 2, 4, 8)
+make -C clojure run all=1
 ```
 
 ## Benchmark Status

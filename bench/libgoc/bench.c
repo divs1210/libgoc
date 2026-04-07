@@ -38,13 +38,14 @@
  * Building
  * --------
  *   make -C bench/libgoc build          # single build
- *   make -C bench/libgoc run            # build + run (current GOC_POOL_THREADS)
- *   make -C bench/libgoc run-all        # build + run with pool sizes 1/2/4/8
+ *   make -C bench/libgoc run            # build + run
+ *   make -C bench/libgoc run all=1      # build + run with pool sizes 1/2/4/8
  *
  * Environment variables
  * ---------------------
- *   GOC_POOL_THREADS   Number of worker threads in the default pool (default:
- *                      max(4, nproc)).  Set by the Makefile run-all target.
+ *   GOC_POOL_THREADS   Number of worker threads in the default pool.
+ *                      `make run` uses threads=nproc by default; `make run all=1`
+ *                      iterates over 1, 2, 4, 8.
  *   GOC_MAX_LIVE_FIBERS
  *                      Pool live-fiber cap. Defaults to
  *                      floor(0.6 × (memory / stack_size));
@@ -863,8 +864,6 @@ static void main_fiber(void* _) {
     size_t select_tasks   = 200000;
     size_t spawn_count    = 200000;
     size_t prime_max      = 20000;
-    /* Lower count than CSP benchmarks: each HTTP request opens a new TCP
-     * connection.  See bench_http_ping_pong comment for context. */
     size_t http_rounds    = 2000;
     size_t http_tp_concurrency = 32;
     int http_tp_warmup_ms = 1000;
