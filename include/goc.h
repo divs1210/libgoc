@@ -268,7 +268,7 @@ goc_chan* goc_chan_make(size_t buf_size);
 /**
  * goc_close() — Close a channel.
  *
- * Idempotent: a second call on an already-closed channel is a no-op.
+ * Idempotent. Dispatches a close signal to the channel.
  * After closing:
  *   - All parked takers are woken with GOC_CLOSED.
  *   - All parked putters are woken with GOC_CLOSED.
@@ -277,6 +277,13 @@ goc_chan* goc_chan_make(size_t buf_size);
  *     returning GOC_CLOSED.
  */
 void goc_close(goc_chan* ch);
+
+/**
+ * goc_close_cb() — Close channel on completion.
+ *
+ * Convenience helper: use with goc_take_cb / goc_put_cb.
+ */
+void goc_close_cb(goc_chan* ch, void* val, goc_status_t ok, void* arg);
 
 /* -------------------------------------------------------------------------
  * Channel I/O — Fiber context
@@ -393,12 +400,13 @@ goc_status_t goc_put_sync(goc_chan* ch, void* val);
  * goc_take_cb() — Asynchronous receive with callback.
  *
  * ch  : channel to receive from.
- * cb  : called on the loop thread with (val, ok, ud) when a value arrives or
+ * val : value received.
+ * cb  : called on the loop thread with (ch, val, ok, ud) when a value arrives or
  *       the channel closes. Must not be NULL.
  * ud  : opaque user data forwarded to cb.
  */
 void goc_take_cb(goc_chan* ch,
-                 void (*cb)(void* val, goc_status_t ok, void* ud),
+                 void (*cb)(goc_chan* ch, void* val, goc_status_t ok, void* ud),
                  void* ud);
 
 /**
@@ -406,12 +414,13 @@ void goc_take_cb(goc_chan* ch,
  *
  * ch  : channel to send to.
  * val : value to send.
- * cb  : called on the loop thread with (ok, ud) when the send completes.
+ * cb  : called on the loop thread with (ch, val, ok, ud) when the send completes.
  *       May be NULL if the caller does not need notification.
  * ud  : opaque user data forwarded to cb.
  */
-void goc_put_cb(goc_chan* ch, void* val,
-                void (*cb)(goc_status_t ok, void* ud),
+void goc_put_cb(goc_chan* ch, 
+                void* val,
+                void (*cb)(goc_chan* ch, void* val, goc_status_t ok, void* ud),
                 void* ud);
 
 /* -------------------------------------------------------------------------
@@ -522,6 +531,11 @@ goc_pool* goc_pool_make(size_t threads);
  * explicitly target the default pool.
  */
 goc_pool* goc_default_pool(void);
+
+/**
+ * goc_pool_thread_count() — Return the number of worker threads in pool.
+ */
+size_t goc_pool_thread_count(goc_pool* pool);
 
 /**
  * goc_pool_destroy() — Drain and destroy pool.

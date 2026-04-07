@@ -115,7 +115,6 @@ libgoc/
 ├── TELEMETRY.md           # goc_stats async telemetry system
 ├── HTTP.md                # HTTP server API and design reference
 ├── OPTIMIZATION.md        # Prioritized optimization roadmap and benchmark signals
-├── TODO.md                # Planned future work
 └── LICENSE
 ```
 
@@ -190,6 +189,7 @@ ASAN and TSAN each compile a separate instrumented copy of the `goc` static libr
    fibers run here
    goc_take / goc_put
    channel wakeup
+   per-worker uv_loop_t (I/O callbacks)
 ```
 
 Pool threads execute fibers. The uv loop thread never resumes fibers directly. Instead:
@@ -200,17 +200,21 @@ Pool threads execute fibers. The uv loop thread never resumes fibers directly. I
 
 The pool threads and the event loop thread are **separate**. Fibers run on pool threads. The event loop thread only drives timers and dispatches wakeups — it never runs fiber code.
 
+Each pool worker also owns a **per-worker `uv_loop_t`** used for stream/TCP/UDP handle operations when the handle was initialised on that worker's loop. After every `mco_resume`, the worker calls `uv_run(&worker.loop, UV_RUN_NOWAIT)` to drain any pending I/O callbacks on its own loop. This eliminates the cross-thread dispatch round-trip for the common case where the fiber that performs I/O runs on the same worker that owns the handle.
+
 ---
 
 ## libuv Role
 
-libuv owns **one thing**: the event loop thread.
+libuv provides a **global event loop** (`g_loop`, runs on its own dedicated thread) and **per-worker event loops** (one `uv_loop_t` per pool worker).
 
 | libuv primitive | used for |
 |---|---|
-| `uv_loop_t` | single event loop, runs on its own thread |
-| `uv_async_t` | wake the loop from other threads so it can drain callback/shutdown work |
-| `uv_timer_t` | `goc_timeout` central timer manager (one per loop) |
+| `g_loop` (`uv_loop_t*`) | global event loop; runs on its own thread; owns timers, shutdown signalling, FS event/poll handles |
+| `worker.loop` (`uv_loop_t`) | per-worker event loop; TCP/pipe/UDP/signal handles init'd from worker fiber context are owned here; drained with `UV_RUN_NOWAIT` after each fiber resume |
+| `uv_async_t` (global) | wake `g_loop` from other threads so it can drain callback/shutdown work |
+| `uv_async_t` (per-worker) | wake a worker's own loop when a cross-thread task is posted via `post_on_handle_loop` |
+| `uv_timer_t` | `goc_timeout` central timer manager (one per `g_loop`) |
 
 **All libuv handles and internal context structs must be GC-allocated (`goc_malloc`) and pinned in the `live_uv_handles` root array** before being handed to libuv. libuv holds internal references to handles until `uv_close` completes; those references are not visible to the GC. Without pinning the GC would collect the object prematurely, causing use-after-free inside the event loop. Internal code uses `gc_handle_register`/`gc_handle_unregister` directly; user code uses the public wrappers `goc_io_handle_register` / `goc_io_handle_unregister` / `goc_io_handle_close`.
 
@@ -738,6 +742,10 @@ typedef struct {
     uint32_t         miss_streak;     /* consecutive steal misses; resets on any successful dequeue or wakeup */
     uint64_t         steal_misses;    /* steal misses accumulated this scheduling quantum */
     uint64_t         idle_wakeups;    /* times this worker returned from uv_run(UV_RUN_ONCE) */
+    /* Per-worker I/O task queue: cross-thread handle ops post tasks here via
+     * post_on_handle_loop(); drain_worker_tasks() processes them on the
+     * worker's own thread when the wakeup async handle fires. */
+    _Atomic(goc_worker_task_t*) task_queue;
 } goc_worker;
 
 /* Pool-wide steal aggregates (file-scope globals in pool.c): */
@@ -870,6 +878,7 @@ run:
 
     GC_set_stackbottom(NULL, &orig_sb) /* restore OS thread stack bottom */
     GC_collect_a_little()              /* scheduler-controlled incremental GC safe point */
+    uv_run(&tl_worker->loop, UV_RUN_NOWAIT)  /* drain worker-owned I/O callbacks (epoll_wait timeout=0) */
 
     fe = mco_get_user_data(coro)
     st = mco_status(coro)
@@ -898,7 +907,13 @@ run:
        wake() → post_to_run_queue() will re-enqueue it without touching live_count.
        drain_cond is not broadcast here: live_count > 0 still holds, so
        goc_pool_destroy / goc_pool_destroy_timeout will not see a spurious drain-complete. */
+
+/* --- post-loop final drain (outside the while) --- */
+drain_worker_tasks(tl_worker)   /* process any tasks posted in the shutdown race window */
+uv_run(&tl_worker->loop, UV_RUN_NOWAIT)  /* fire uv_close callbacks initiated by the drain */
 ```
+
+> **Final drain on worker exit.** After the `while not shutdown` loop exits there is a race window: a cross-thread close dispatch (e.g. `goc_http_server_close` posting `goc_io_handle_close(srv->tcp)` to this worker) can arrive *between* the last `uv_run(UV_RUN_ONCE)` and the `shutdown=1` check that causes the worker to leave the loop. If that task is not processed, `uv_close` is never called on the handle. Once `goc_pool_destroy` reaches Step 5 it closes the per-worker `uv_async_t` wakeup handle, which prevents `worker_wakeup_cb` / `drain_worker_tasks` from ever running again, so the TCP handle stays active and `uv_run(UV_RUN_DEFAULT)` in `pool_destroy` blocks forever. The fix is a final `drain_worker_tasks(tl_worker)` after the loop, followed by `uv_run(UV_RUN_NOWAIT)` to fire any resulting `uv_close` callbacks (e.g. `on_goc_handle_close`) before the worker joins. Both calls are safe because the worker thread and its loop are still alive at that point.
 
 > **Sleep-miss race closure.** A poster calling `post_to_run_queue` must not miss a sleeping worker. Protocol: (1) worker increments `idle_count` with `seq_cst` *before* its double-check; (2) poster completes its write (deque push or injector mutex-unlock, both full-barrier), then reads `idle_count` with `seq_cst`. The C11 total order on seq_cst operations guarantees that if the poster sees `idle_count == 0`, the worker's double-check will see the posted entry; if the poster sees `idle_count > 0`, it calls `uv_async_send(worker->wakeup)` to wake the worker.
 
@@ -1358,7 +1373,15 @@ libgoc provides channel-based wrappers for libuv I/O operations in a separate he
 
 **Single-form API.** Each operation is exposed as a single function that returns `goc_chan*`; the channel delivers the result when the I/O completes. Safe from any context; composable with `goc_alts()`.
 
-**Thread-safety bridge.** Stream and UDP operations (`uv_write`, `uv_read_start`, etc.) touch handle internals that must run on the libuv loop thread. All stream/UDP wrappers (read_start/stop, write, write2, connect, shutdown, UDP send/recv, signals, TTY, FS events/polls) use `post_on_loop()`: a `GOC_CALLBACK` entry is enqueued directly into the MPSC callback queue with no per-call `uv_async_t` handle. File-system and DNS operations are submitted directly (libuv routes them through its internal thread pool).
+**Thread-safety bridge.** Stream and UDP operations (`uv_write`, `uv_read_start`, etc.) must run on the loop thread that owns the handle. All wrappers use `dispatch_on_handle_loop(handle->loop, fn, arg)`, which selects one of three paths:
+
+1. **Same-worker fast path** — if the calling fiber is on the worker that owns the handle's loop (`tl_worker->loop == handle->loop`), the dispatch function is called directly (zero cross-thread hops).
+2. **Cross-worker path** — if the handle's loop is a different worker's loop, the task is pushed onto that worker's MPSC `task_queue` via `post_on_handle_loop` and `uv_async_send` wakes that worker.
+3. **Global loop path** — if the handle lives on `g_loop` (handles initialised from outside a worker fiber, or FS-event/FS-poll handles), the existing `post_on_loop()` MPSC callback queue is used.
+
+Handle initialisation (`uv_tcp_init`, `uv_pipe_init`, etc.) uses a `worker_affine` flag: when called from a pool-worker fiber, the handle is initialised directly on the calling worker's own loop without dispatching; `goc_io_fs_event_init` and `goc_io_fs_poll_init` always dispatch to `g_loop`.
+
+File-system and DNS operations are submitted directly (libuv routes them through its internal thread pool).
 
 **GC safety.** All `goc_chan*` pointers passed to async context structs (which are `malloc`-allocated) are registered in the `live_uv_handles` array (see `gc.c`) for the duration of the pending I/O, preventing premature collection.
 

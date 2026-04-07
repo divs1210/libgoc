@@ -112,6 +112,7 @@ static bool stats_drain(void) {
 }
 
 static void stats_on_close(uv_handle_t *h) {
+    goc_uv_handle_log("stats_on_close", h);
     free(h);
     g_stats_async = NULL;
     sq_destroy();
@@ -134,7 +135,8 @@ static void stats_on_async(uv_async_t *h) {
 
     if (atomic_load_explicit(&g_stats_closing, memory_order_acquire)) {
         stats_drain(); /* catch anything pushed just before the flag was set */
-        uv_close((uv_handle_t *)h, stats_on_close);
+        goc_uv_close_log("stats_on_async closing stats_async", (uv_handle_t *)h);
+        goc_uv_close_internal((uv_handle_t *)h, stats_on_close);
     }
 }
 
@@ -242,7 +244,8 @@ void goc_stats_init(void) {
     atomic_store_explicit(&g_stats_closing, 0, memory_order_release);
 
     g_stats_async = (uv_async_t *)malloc(sizeof(uv_async_t));
-    uv_async_init(g_loop, g_stats_async, stats_on_async);
+    int rc = uv_async_init(g_loop, g_stats_async, stats_on_async);
+    goc_uv_init_log("uv_async_init stats_async", rc, g_loop, (uv_handle_t*)g_stats_async);
 
     atomic_store_explicit(&stats_enabled, 1, memory_order_release);
 }

@@ -545,7 +545,7 @@ static void test_s3_4(void) {
     drain_pending_events();
     
     goc_chan* join = goc_go(s3_4_fiber, ch);
-    goc_nanosleep(1000000); // 1ms to ensure fiber parks
+    goc_nanosleep(10000000); // 10ms to ensure fiber parks
     goc_close(ch); // triggers close event
     goc_take_sync(join); // cleanup
     
@@ -687,8 +687,7 @@ typedef struct {
     uv_cond_t   cond;
 } s6_1_state_t;
 
-static void s6_1_take_cb(void* val, goc_status_t ok, void* vud) {
-    (void)val; (void)ok;
+static void s6_1_take_cb(goc_chan* _ch, void* _val, goc_status_t ok, void* vud) {
     s6_1_state_t* s = vud;
     uv_mutex_lock(&s->mtx);
     if (atomic_fetch_sub_explicit(&s->rem, 1, memory_order_relaxed) == 1)
@@ -951,11 +950,7 @@ int main(void) {
     uv_cond_destroy(&g_event_cond);
     uv_mutex_destroy(&g_event_mutex);
 
-    printf("=======================================\n");
-    printf("Results: %d/%d passed", g_tests_passed, g_tests_run);
-    if (g_tests_failed > 0)
-        printf(", %d FAILED", g_tests_failed);
-    printf("\n");
+    REPORT(g_tests_run, g_tests_passed, g_tests_failed);
 
     return (g_tests_failed == 0) ? 0 : 1;
 }

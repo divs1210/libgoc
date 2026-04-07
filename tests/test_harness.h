@@ -83,6 +83,15 @@ extern int g_tests_run;
 extern int g_tests_passed;
 extern int g_tests_failed;
 
+#define REPORT(run, passed, failed)                            \
+    do {                                                     \
+        printf("\n==============================\n");           \
+        printf("%d/%d tests passed", (passed), (run));       \
+        if ((failed) > 0)                                     \
+            printf(", %d FAILED", (failed));               \
+        printf("\n");                                     \
+    } while (0)
+
 #if !defined(_WIN32)
 #  define GOC_TEST_WATCHDOG_REARM() alarm(30)
 #else

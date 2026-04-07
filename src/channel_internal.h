@@ -20,6 +20,12 @@ bool wake_claim(goc_chan* ch, goc_entry* e, void* value, goc_entry** fe_out);
 void compact_dead_entries(goc_chan* ch);
 void chan_set_on_close(goc_chan* ch, void (*on_close)(void*), void* ud);
 
+/* Internal debug helpers. */
+void goc_chan_set_debug_tag(goc_chan* ch, const char* tag);
+const char* goc_chan_get_debug_tag(goc_chan* ch);
+void goc_debug_set_close_phase(const char* phase);
+const char* goc_debug_get_close_phase(void);
+
 /* --------------------------------------------------------------------------
  * chan_list_append — O(1) tail append.
  *

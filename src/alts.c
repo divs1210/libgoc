@@ -216,6 +216,8 @@ goc_alts_result_t* goc_alts(goc_alt_op_t *ops, size_t n) {
 
     goc_entry *self = (goc_entry *)mco_get_user_data(running);
     goc_pool  *pool = self->pool;
+    GOC_DBG("goc_alts: start n=%zu pool=%p self=%p coro=%p\n",
+            n, (void*)pool, (void*)self, (void*)running);
 
     /* ------------------------------------------------------------------ */
     /* Phase 1 — Shuffle                                                    */
@@ -412,6 +414,8 @@ goc_alts_result_t* goc_alts(goc_alt_op_t *ops, size_t n) {
     if (n > GOC_ALTS_STACK_THRESHOLD) free(sorted_chans);
 
     /* Suspend this fiber; the pool worker will resume us when a channel fires. */
+    GOC_DBG("goc_alts: parking fiber coro=%p pool=%p ops=%p n=%zu\n",
+            (void*)running, (void*)pool, (void*)ops, n);
     mco_yield(running);
     /* pool_worker_fn has set self->parked = 1 by this point */
 
@@ -439,6 +443,10 @@ goc_alts_result_t* goc_alts(goc_alt_op_t *ops, size_t n) {
     }
 
     /* winner must not be NULL — the runtime guarantees exactly one wake */
+    GOC_DBG("goc_alts: resume winner arm=%zu ch=%p ok=%d\n",
+            winner->arm_idx,
+            (void*)ops[winner->arm_idx].ch,
+            (int)winner->ok);
     void *result_val = (winner->result_slot) ? *winner->result_slot : NULL;
     goc_alts_result_t* res = goc_malloc(sizeof(goc_alts_result_t));
     res->ch    = ops[winner->arm_idx].ch;

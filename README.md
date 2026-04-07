@@ -316,8 +316,6 @@ my_obj_t* obj = goc_malloc(sizeof(my_obj_t));
 // obj is automatically collected when no longer reachable
 ```
 
-> **Note:** libuv handles (`uv_timer_t`, `uv_async_t`, etc.) must be allocated with `goc_malloc` and registered via `goc_io_handle_register`. This pins them in a GC-visible root array so they are not collected while libuv holds an internal reference.
-
 ---
 
 ### String helpers

@@ -27,6 +27,243 @@
 #include "channel_internal.h"
 
 /* --------------------------------------------------------------------------
+ * goc_close
+ * -------------------------------------------------------------------------- */
+#define GOC_CLOSE_TRACE() \
+    GOC_DBG("goc_close caller: %s:%d (%s)\n", __FILE__, __LINE__, __func__)
+
+static const char* goc_close_phase = "normal";
+
+void goc_chan_set_debug_tag(goc_chan* ch, const char* tag) {
+    ch->dbg_tag = tag;
+}
+
+const char* goc_chan_get_debug_tag(goc_chan* ch) {
+    return ch->dbg_tag ? ch->dbg_tag : "(none)";
+}
+
+void goc_debug_set_close_phase(const char* phase) {
+    goc_close_phase = phase ? phase : "normal";
+}
+
+const char* goc_debug_get_close_phase(void) {
+    return goc_close_phase;
+}
+
+int goc_chan_is_closing(goc_chan* ch)
+{
+    return atomic_load_explicit(&ch->close_guard, memory_order_acquire);
+}
+
+void goc_close_internal(goc_chan* ch)
+{
+    void (*on_close)(void*) = NULL;
+    void* on_close_ud = NULL;
+
+    GOC_CLOSE_TRACE();
+    GOC_DBG("goc_close_internal: called on ch=%p tag=%s phase=%s\n",
+            (void*)ch, goc_chan_get_debug_tag(ch), goc_debug_get_close_phase());
+
+    /* Serialise: only one caller wins the CAS 0→1 */
+    int expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(
+            &ch->close_guard, &expected, 1,
+            memory_order_acq_rel, memory_order_acquire)) {
+        int closing = goc_chan_is_closing(ch);
+        const char* phase = goc_debug_get_close_phase();
+        GOC_DBG("goc_close_internal: ch=%p tag=%s phase=%s CAS failed actual=%d closing=%d\n",
+                (void*)ch, goc_chan_get_debug_tag(ch), phase,
+                expected,
+                closing);
+        if (closing || phase[0] != 'n' || strcmp(phase, "normal") != 0) {
+            GOC_DBG("goc_close_internal: LATE OR DUPLICATE CLOSE ch=%p tag=%s phase=%s actual=%d closing=%d\n",
+                    (void*)ch, goc_chan_get_debug_tag(ch), phase,
+                    expected, closing);
+        }
+        GOC_DBG("goc_close_internal: duplicate close caller detected, no-op ch=%p tag=%s phase=%s\n",
+                (void*)ch, goc_chan_get_debug_tag(ch), phase);
+        return;
+    }
+    GOC_DBG("goc_close_internal: FIRST CLOSE ch=%p tag=%s phase=%s\n",
+            (void*)ch, goc_chan_get_debug_tag(ch), goc_debug_get_close_phase());
+
+    uv_mutex_lock(ch->lock);
+    ch->closed = 1;
+    GOC_DBG("goc_close_internal: ch=%p locked, takers=%p putters=%p item_count=%zu\n",
+            (void*)ch, (void*)ch->takers, (void*)ch->putters, ch->item_count);
+
+    /* Count non-cancelled waiters: used for the to_post heap allocation and
+     * (when GOC_ENABLE_STATS) for the close telemetry counter.  Entries may
+     * be stack-allocated (GOC_SYNC) and freed the moment we post them, so we
+     * must not read them after the wake loop. */
+    size_t waiter_count = 0;
+    for (goc_entry* e = ch->takers; e != NULL; e = e->next)
+        if (!atomic_load_explicit(&e->cancelled, memory_order_acquire))
+            waiter_count++;
+    for (goc_entry* e = ch->putters; e != NULL; e = e->next)
+        if (!atomic_load_explicit(&e->cancelled, memory_order_acquire))
+            waiter_count++;
+#ifdef GOC_ENABLE_STATS
+    uint64_t close_removed = (uint64_t)waiter_count;
+#endif
+
+    /* Collect GOC_FIBER entries to post after lock release.
+     * Use plain malloc (not goc_malloc/GC_malloc) to avoid triggering a GC
+     * stop-the-world while ch->lock is held, which can deadlock if another
+     * thread is blocked waiting on the same lock. */
+    goc_entry** to_post = waiter_count ? malloc(sizeof(goc_entry*) * waiter_count) : NULL;
+    size_t to_post_count = 0;
+    int cancelled_found = 0;
+    for (int _pass = 0; _pass < 2; _pass++) {
+        goc_entry* e = (_pass == 0) ? ch->takers : ch->putters;
+        while (e != NULL) {
+            goc_entry* next = e->next;
+            if (atomic_load_explicit(&e->cancelled, memory_order_acquire)) {
+                cancelled_found = 1;
+            } else if (try_claim_wake(e)) {
+                GOC_DBG("goc_close_internal: claimed waiter ch=%p e=%p kind=%d arm_pass=%d coro=%p\n",
+                        (void*)ch, (void*)e, (int)e->kind, _pass,
+                        (e->kind == GOC_FIBER ? (void*)e->coro : NULL));
+                e->ok = GOC_CLOSED;
+                if (e->kind == GOC_FIBER) {
+                    to_post[to_post_count++] = (goc_entry*)mco_get_user_data(e->coro);
+                } else if (e->kind == GOC_CALLBACK) {
+                    /* This callback entry is parked on the channel wait list and
+                     * needs to be reposted to the loop queue so it fires. For
+                     * goc_alts callback arms we use the shared fired flag to
+                     * avoid posting an already-fired arm again. Non-alts callback
+                     * entries have no fired flag and can be reposted safely once
+                     * try_claim_wake() succeeds. */
+                    if (e->fired == NULL ||
+                        atomic_exchange_explicit(e->fired, 1, memory_order_acq_rel) == 0) {
+                        /* The callback hasn't fired yet, so we can post it safely.
+                         * If it has already fired, it means the loop thread is in
+                         * the process of delivering it or has already delivered it,
+                         * so we must not post it again. */
+                        post_callback(e, NULL);
+                        GOC_DBG("post_callback: e=%p fired=%d\n",
+                                (void*)e,
+                                e->fired ? atomic_load_explicit(e->fired, memory_order_acquire) : 1);
+                    }
+                } else if (e->kind == GOC_SYNC) {
+                    goc_sync_post(e->sync_sem_ptr);
+                }
+            } else {
+                GOC_DBG("goc_close_internal: try_claim_wake failed ch=%p e=%p kind=%d arm_pass=%d cancelled=%d woken=%d fired=%p\n",
+                        (void*)ch, (void*)e, (int)e->kind, _pass,
+                        (int)atomic_load_explicit(&e->cancelled, memory_order_acquire),
+                        (int)atomic_load_explicit(&e->woken, memory_order_acquire),
+                        (void*)e->fired);
+            }
+            e = next;
+        }
+    }
+
+    /* If any cancelled entries remain, compact them before releasing the lock */
+    if (cancelled_found)
+        compact_dead_entries(ch);
+
+    /* Clearing the waiter lists prevents future goc_take/goc_take_sync calls on
+     * a closed channel from walking stale waiter entries that have already
+     * been claimed and may be freed by callback delivery. */
+    ch->takers = NULL;
+    ch->takers_tail = NULL;
+    ch->putters = NULL;
+    ch->putters_tail = NULL;
+    ch->dead_count = 0;
+
+    /* Release lock before posting */
+    uv_mutex_unlock(ch->lock);
+
+    /* Spin and post for all collected GOC_FIBER entries */
+    GOC_DBG("goc_close_internal: posting %zu fiber waiters for ch=%p\n",
+            to_post_count, (void*)ch);
+    for (size_t i = 0; i < to_post_count; i++) {
+        goc_entry* fe = to_post[i];
+        long _spin = 0;
+        while (atomic_load_explicit(&fe->parked, memory_order_acquire) == 0) {
+            sched_yield();
+            if (++_spin == 10000000L) {
+                GOC_DBG("goc_close_internal: SPIN STALL >10M iters ch=%p fe=%p\n",
+                        (void*)ch, (void*)fe);
+            }
+        }
+        if (_spin > 100) { GOC_DBG("goc_close_internal: spin resolved after %ld iters ch=%p\n", _spin, (void*)ch); }
+        post_to_run_queue(fe->pool, fe);
+        GOC_DBG("goc_close_internal: posted wake for ch=%p fe=%p coro=%p pool=%p\n",
+                (void*)ch, (void*)fe,
+                (void*)fe->coro, (void*)fe->pool);
+    }
+    free(to_post);
+
+    /* Telemetry: update counters for entries woken by close, then emit event */
+#ifdef GOC_ENABLE_STATS
+    if (close_removed > 0) {
+        atomic_fetch_add_explicit(&ch->entries_removed, close_removed, memory_order_relaxed);
+        atomic_fetch_add_explicit(&ch->compaction_runs, 1,             memory_order_relaxed);
+    }
+#endif
+    GOC_STATS_CHANNEL_STATUS((int)(intptr_t)ch, /*status=*/0, (int)ch->buf_size, (int)ch->item_count,
+                             atomic_load_explicit(&ch->taker_scans,     memory_order_relaxed),
+                             atomic_load_explicit(&ch->putter_scans,    memory_order_relaxed),
+                             atomic_load_explicit(&ch->compaction_runs, memory_order_relaxed),
+                             atomic_load_explicit(&ch->entries_removed, memory_order_relaxed));
+
+    on_close = ch->on_close;
+    on_close_ud = ch->on_close_ud;
+
+    chan_unregister(ch);
+
+    if (on_close != NULL) {
+        GOC_DBG("calling on_close for ch=%p\n", ch);
+        on_close(on_close_ud);
+        GOC_DBG("returned from on_close for ch=%p\n", ch);
+    }
+}
+
+static void on_close_dispatch(void *arg)
+{
+    goc_chan *ch = (goc_chan *)arg;
+    if (!ch)
+        return;
+    goc_close_internal(ch);
+}
+
+void goc_close(goc_chan *ch)
+{
+    GOC_DBG("goc_close: entry ch=%p\n", (void *)ch);
+    if (!ch || goc_chan_is_closing(ch))
+    {
+        GOC_DBG("goc_close: skipping ch=%p closing=%d\n",
+                (void *)ch,
+                ch ? goc_chan_is_closing(ch) : -1);
+        return;
+    }
+
+    if (goc_on_loop_thread())
+    {
+        GOC_DBG("goc_close: on g_loop thread, closing ch directly ch=%p\n",
+                (void *)ch);
+        goc_close_internal(ch);
+        return;
+    }
+
+    int rc = post_on_loop_checked(on_close_dispatch, ch);
+    if (rc < 0)
+    {
+        fprintf(stderr, "libgoc: goc_close: failed to dispatch on loop\n");
+        abort();
+    }
+}
+
+void goc_close_cb(goc_chan* ch, void* _, goc_status_t __, void* ___)
+{
+    GOC_DBG("goc_close_cb: closing ch=%p\n", (void*)ch);
+    goc_close(ch);
+    GOC_DBG("goc_close_cb: done ch=%p\n", (void*)ch);
+}
+
+/* --------------------------------------------------------------------------
  * wake
  *
  * Called under ch->lock. Unified wakeup path for a single parked entry.
@@ -222,6 +459,7 @@ goc_chan* goc_chan_make(size_t buf_size)
 
     ch->buf_size = buf_size;
     ch->item_count = 0;
+    ch->dbg_tag = NULL;
 
     ch->lock = malloc(sizeof(uv_mutex_t));        /* plain malloc — libuv constraint */
     uv_mutex_init(ch->lock);
@@ -254,138 +492,6 @@ void chan_set_on_close(goc_chan* ch, void (*on_close)(void*), void* ud)
 
     if (call_now && on_close != NULL)
         on_close(ud);
-}
-
-/* -------------------------------------------------------------------------
-/* --------------------------------------------------------------------------
- * goc_close
- *
- * Idempotent. CAS on close_guard ensures exactly one caller proceeds.
- * Does NOT destroy the mutex — ownership transfers to goc_shutdown (gc.c).
- * -------------------------------------------------------------------------- */
-
-int goc_chan_is_closing(goc_chan* ch)
-{
-    return atomic_load_explicit(&ch->close_guard, memory_order_acquire);
-}
-
-void goc_close(goc_chan* ch)
-{
-    void (*on_close)(void*) = NULL;
-    void* on_close_ud = NULL;
-
-    GOC_DBG("goc_close: called on ch=%p\n", (void*)ch);
-
-    /* Serialise: only one caller wins the CAS 0→1 */
-    int expected = 0;
-    if (!atomic_compare_exchange_strong_explicit(
-            &ch->close_guard, &expected, 1,
-            memory_order_acq_rel, memory_order_acquire)) {
-        GOC_DBG("goc_close: ch=%p CAS lost expected=%d now=%d\n",
-                (void*)ch, expected,
-                atomic_load_explicit(&ch->close_guard, memory_order_acquire));
-        return;
-    }
-    GOC_DBG("goc_close: ch=%p CAS won\n", (void*)ch);
-
-    uv_mutex_lock(ch->lock);
-    ch->closed = 1;
-    GOC_DBG("goc_close: ch=%p locked, takers=%p putters=%p item_count=%zu\n",
-            (void*)ch, (void*)ch->takers, (void*)ch->putters, ch->item_count);
-
-    /* Count non-cancelled waiters: used for the to_post heap allocation and
-     * (when GOC_ENABLE_STATS) for the close telemetry counter.  Entries may
-     * be stack-allocated (GOC_SYNC) and freed the moment we post them, so we
-     * must not read them after the wake loop. */
-    size_t waiter_count = 0;
-    for (goc_entry* e = ch->takers; e != NULL; e = e->next)
-        if (!atomic_load_explicit(&e->cancelled, memory_order_acquire))
-            waiter_count++;
-    for (goc_entry* e = ch->putters; e != NULL; e = e->next)
-        if (!atomic_load_explicit(&e->cancelled, memory_order_acquire))
-            waiter_count++;
-#ifdef GOC_ENABLE_STATS
-    uint64_t close_removed = (uint64_t)waiter_count;
-#endif
-
-    /* Collect GOC_FIBER entries to post after lock release.
-     * Use plain malloc (not goc_malloc/GC_malloc) to avoid triggering a GC
-     * stop-the-world while ch->lock is held, which can deadlock if another
-     * thread is blocked waiting on the same lock. */
-    goc_entry** to_post = waiter_count ? malloc(sizeof(goc_entry*) * waiter_count) : NULL;
-    size_t to_post_count = 0;
-    int cancelled_found = 0;
-    for (int _pass = 0; _pass < 2; _pass++) {
-        goc_entry* e = (_pass == 0) ? ch->takers : ch->putters;
-        while (e != NULL) {
-            goc_entry* next = e->next;
-            if (atomic_load_explicit(&e->cancelled, memory_order_acquire)) {
-                cancelled_found = 1;
-            } else if (try_claim_wake(e)) {
-                GOC_DBG("goc_close: claimed waiter ch=%p e=%p kind=%d arm_pass=%d coro=%p\n",
-                        (void*)ch, (void*)e, (int)e->kind, _pass,
-                        (e->kind == GOC_FIBER ? (void*)e->coro : NULL));
-                e->ok = GOC_CLOSED;
-                if (e->kind == GOC_FIBER)
-                    to_post[to_post_count++] = (goc_entry*)mco_get_user_data(e->coro);
-                else if (e->kind == GOC_CALLBACK)
-                    post_callback(e, NULL);
-                else if (e->kind == GOC_SYNC)
-                    goc_sync_post(e->sync_sem_ptr);
-            } else {
-                GOC_DBG("goc_close: try_claim_wake failed ch=%p e=%p kind=%d arm_pass=%d cancelled=%d woken=%d fired=%p\n",
-                        (void*)ch, (void*)e, (int)e->kind, _pass,
-                        (int)atomic_load_explicit(&e->cancelled, memory_order_acquire),
-                        (int)atomic_load_explicit(&e->woken, memory_order_acquire),
-                        (void*)e->fired);
-            }
-            e = next;
-        }
-    }
-
-    /* If any cancelled entries remain, compact them before releasing the lock */
-    if (cancelled_found)
-        compact_dead_entries(ch);
-
-    /* Release lock before posting */
-    uv_mutex_unlock(ch->lock);
-
-    /* Spin and post for all collected GOC_FIBER entries */
-    for (size_t i = 0; i < to_post_count; i++) {
-        goc_entry* fe = to_post[i];
-        long _spin = 0;
-        while (atomic_load_explicit(&fe->parked, memory_order_acquire) == 0) {
-            sched_yield();
-            if (++_spin == 10000000L) {
-                GOC_DBG("goc_close(): SPIN STALL >10M iters ch=%p fe=%p\n",
-                        (void*)ch, (void*)fe);
-            }
-        }
-        if (_spin > 100) { GOC_DBG("goc_close(): spin resolved after %ld iters ch=%p\n", _spin, (void*)ch); }
-        post_to_run_queue(fe->pool, fe);
-    }
-    free(to_post);
-
-    /* Telemetry: update counters for entries woken by close, then emit event */
-#ifdef GOC_ENABLE_STATS
-    if (close_removed > 0) {
-        atomic_fetch_add_explicit(&ch->entries_removed, close_removed, memory_order_relaxed);
-        atomic_fetch_add_explicit(&ch->compaction_runs, 1,             memory_order_relaxed);
-    }
-#endif
-    GOC_STATS_CHANNEL_STATUS((int)(intptr_t)ch, /*status=*/0, (int)ch->buf_size, (int)ch->item_count,
-                             atomic_load_explicit(&ch->taker_scans,     memory_order_relaxed),
-                             atomic_load_explicit(&ch->putter_scans,    memory_order_relaxed),
-                             atomic_load_explicit(&ch->compaction_runs, memory_order_relaxed),
-                             atomic_load_explicit(&ch->entries_removed, memory_order_relaxed));
-
-    on_close = ch->on_close;
-    on_close_ud = ch->on_close_ud;
-
-    chan_unregister(ch);
-
-    if (on_close != NULL)
-        on_close(on_close_ud);
 }
 
 /* --------------------------------------------------------------------------
@@ -425,11 +531,10 @@ goc_val_t* goc_take(goc_chan* ch)
             long _spin = 0;
             while (atomic_load_explicit(&fe_putter->parked, memory_order_acquire) == 0) {
                 sched_yield();
-                if (++_spin == 10000000L) { GOC_DBG("goc_take fast-path: SPIN STALL >10M iters ch=%p fe_putter=%p\n", (void*)ch, (void*)fe_putter); }
+                if (++_spin == 10000000L) { }
             }
             post_to_run_queue(fe_putter->pool, fe_putter);
         }
-        GOC_DBG("goc_take: fast-path PUTTER ch=%p val=%p\n", (void*)ch, val);
         goc_val_t* r = goc_malloc(sizeof(goc_val_t));
         r->val = val; r->ok = GOC_OK;
         return r;
@@ -437,8 +542,6 @@ goc_val_t* goc_take(goc_chan* ch)
 
     /* Fast path: closed and empty */
     if (ch->closed) {
-        GOC_DBG("goc_take: fast-path CLOSED ch=%p item_count=%zu putters=%p\n",
-                (void*)ch, ch->item_count, (void*)ch->putters);
         uv_mutex_unlock(ch->lock);
         goc_val_t* r = goc_malloc(sizeof(goc_val_t));
         r->val = NULL; r->ok = GOC_CLOSED;
@@ -457,11 +560,15 @@ goc_val_t* goc_take(goc_chan* ch)
     e->ok               = GOC_CLOSED;   /* default; overwritten by wake on success */
     goc_stack_canary_init(e);
 
-    GOC_DBG("goc_take: parking coro=%p on ch=%p\n", (void*)mco_running(), (void*)ch);
+    GOC_DBG("goc_take: slow-path park ch=%p buf_size=%zu closed=%d takers=%p putters=%p coro=%p\n",
+            (void*)ch,
+            ch->buf_size,
+            ch->closed,
+            (void*)ch->takers,
+            (void*)ch->putters,
+            (void*)e->coro);
 
     /* Append to takers list */
-    GOC_DBG("takers_append: ch=%p e=%p kind=%d coro=%p\n",
-            (void*)ch, (void*)e, (int)e->kind, (void*)e->coro);
     chan_list_append(&ch->takers, &ch->takers_tail, e);
 
     /* Set parked = 0 on the fiber's initial entry while ch->lock is still held.
@@ -509,6 +616,7 @@ goc_status_t goc_put(goc_chan* ch, void* val)
      * (returning GOC_CLOSED) or deliver normally — never deliver to a taker
      * on a channel that is already closed from the putter's point of view. */
     if (ch->closed) {
+        GOC_DBG("goc_put: fast-path CLOSED ch=%p val=%p\n", (void*)ch, val);
         uv_mutex_unlock(ch->lock);
         return GOC_CLOSED;
     }
@@ -516,6 +624,8 @@ goc_status_t goc_put(goc_chan* ch, void* val)
     /* Fast path: parked taker — claim under lock, spin+post outside */
     goc_entry* fe_taker = NULL;
     if (chan_put_to_taker_claim(ch, val, &fe_taker)) {
+        GOC_DBG("goc_put: fast-path delivering val=%p to parked taker fe_taker=%p ch=%p\n",
+                val, (void*)fe_taker, (void*)ch);
         uv_mutex_unlock(ch->lock);
         if (fe_taker != NULL) {
             long _spin = 0;
@@ -523,6 +633,8 @@ goc_status_t goc_put(goc_chan* ch, void* val)
                 sched_yield();
                 if (++_spin == 10000000L) { GOC_DBG("goc_put fast-path: SPIN STALL >10M iters ch=%p fe_taker=%p\n", (void*)ch, (void*)fe_taker); }
             }
+            GOC_DBG("goc_put: posting wake for taker fe_taker=%p ch=%p pool=%p\n",
+                    (void*)fe_taker, (void*)ch, (void*)fe_taker->pool);
             post_to_run_queue(fe_taker->pool, fe_taker);
         }
         return GOC_OK;
@@ -544,10 +656,13 @@ goc_status_t goc_put(goc_chan* ch, void* val)
     e->ok               = GOC_CLOSED;   /* default; overwritten by wake on success */
     goc_stack_canary_init(e);
 
-    GOC_DBG("goc_put: parking coro=%p on ch=%p\n", (void*)mco_running(), (void*)ch);
-
     /* Append to putters list */
     chan_list_append(&ch->putters, &ch->putters_tail, e);
+    GOC_DBG("goc_put: slow-path park ch=%p putters=%p takers=%p coro=%p\n",
+            (void*)ch,
+            (void*)ch->putters,
+            (void*)ch->takers,
+            (void*)e->coro);
 
     /* Same yield-gate as goc_take slow path. */
     goc_entry* fiber_entry = (goc_entry*)mco_get_user_data(mco_running());
@@ -557,10 +672,18 @@ goc_status_t goc_put(goc_chan* ch, void* val)
     mco_yield(mco_running());
     /* pool_worker_fn has set fiber_entry->parked = 1 by this point */
 
-    GOC_DBG("goc_put: resumed coro=%p ch=%p ok=%d\n", (void*)mco_running(), (void*)ch, (int)e->ok);
     goc_status_t ok = e->ok;
     free(e);
     return ok;
+}
+
+void goc_yield(void)
+{
+    if (mco_running() == NULL) {
+        fprintf(stderr, "libgoc: goc_yield: called from OS thread (not in fiber context)\n");
+        abort();
+    }
+    mco_yield(mco_running());
 }
 
 /* --------------------------------------------------------------------------
@@ -609,8 +732,6 @@ goc_val_t* goc_take_sync(goc_chan* ch)
     goc_sync_init(&e.sync_obj);
     e.sync_sem_ptr = &e.sync_obj;
 
-    GOC_DBG("takers_append: ch=%p e=%p kind=%d coro=%p\n",
-            (void*)ch, (void*)&e, (int)e.kind, NULL);
     chan_list_append(&ch->takers, &ch->takers_tail, &e);
 
     uv_mutex_unlock(ch->lock);
@@ -718,9 +839,24 @@ goc_val_t* goc_take_try(goc_chan* ch)
  * -------------------------------------------------------------------------- */
 goc_val_t** goc_take_all(goc_chan** chs, size_t n)
 {
+    GOC_DBG("goc_take_all: begin n=%zu chs=%p\n", n, (void*)chs);
     goc_val_t** results = goc_malloc(n * sizeof(goc_val_t*));
-    for (size_t i = 0; i < n; i++)
+    for (size_t i = 0; i < n; i++) {
+        GOC_DBG("goc_take_all: taking index=%zu ch=%p\n", i, (void*)chs[i]);
         results[i] = goc_take(chs[i]);
+        if (results[i]) {
+            GOC_DBG("goc_take_all: got index=%zu ch=%p ok=%d val=%p\n",
+                    i,
+                    (void*)chs[i],
+                    (int)results[i]->ok,
+                    (void*)results[i]->val);
+        } else {
+            GOC_DBG("goc_take_all: got index=%zu ch=%p result=NULL\n",
+                    i,
+                    (void*)chs[i]);
+        }
+    }
+    GOC_DBG("goc_take_all: complete n=%zu chs=%p\n", n, (void*)chs);
     return results;
 }
 
@@ -742,7 +878,7 @@ goc_val_t** goc_take_all_sync(goc_chan** chs, size_t n)
  * perform the channel operation under ch->lock and fire cb on delivery.
  * -------------------------------------------------------------------------- */
 void goc_take_cb(goc_chan* ch,
-                 void (*cb)(void* val, goc_status_t ok, void* ud),
+                 void (*cb)(goc_chan* ch, void* val, goc_status_t ok, void* ud),
                  void* ud)
 {
     assert(cb != NULL && "goc_take_cb: cb must not be NULL");
@@ -767,10 +903,11 @@ void goc_take_cb(goc_chan* ch,
  * perform the channel operation under ch->lock and fire cb on delivery.
  * -------------------------------------------------------------------------- */
 void goc_put_cb(goc_chan* ch, void* val,
-                void (*cb)(goc_status_t ok, void* ud),
+                void (*cb)(goc_chan* ch, void* val, goc_status_t ok, void* ud),
                 void* ud)
 {
-    GOC_DBG("goc_put_cb: ch=%p val=%p put_cb=%p\n", (void*)ch, val, (void*)(uintptr_t)cb);
+    GOC_DBG("goc_put_cb: ch=%p val=%p put_cb=%p ud=%p\n",
+            (void*)ch, val, (void*)(uintptr_t)cb, ud);
     goc_entry* e = malloc(sizeof(goc_entry));
     *e = (goc_entry){ 0 };
     e->kind          = GOC_CALLBACK;

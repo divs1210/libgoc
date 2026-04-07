@@ -22,6 +22,7 @@ struct goc_chan {
     int          closed;
     size_t       dead_count;
     _Atomic int  close_guard;  /* CAS 0→1 to serialise close; prevents double-close races */
+    const char*  dbg_tag;      /* optional debug tag for log correlation */
     /* Telemetry counters — incremented with memory_order_relaxed; read at close time */
     _Atomic uint64_t taker_scans;     /* times a take arm scanned this channel in alts */
     _Atomic uint64_t putter_scans;    /* times a put arm scanned this channel in alts */

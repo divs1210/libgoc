@@ -21,7 +21,135 @@
 #include <gc.h>
 #include "minicoro.h"
 #include "../include/goc.h"
+
+/* Prevent accidental direct uv_close() calls inside libgoc source files.
+ * All close paths must go through the goc handle state machine. */
+#define uv_close DO_NOT_CALL_uv_close_directly_use_goc_uv_close_internal
+
+static inline void goc_uv_close_internal(uv_handle_t* handle, uv_close_cb cb)
+{
+    #undef uv_close
+    uv_close(handle, cb);
+    #define uv_close DO_NOT_CALL_uv_close_directly_use_goc_uv_close_internal
+}
 #include "config.h"
+
+static inline unsigned long long goc_uv_thread_id(void)
+{
+    return (unsigned long long)(uintptr_t)uv_thread_self();
+}
+
+static inline void goc_uv_init_log(const char *name, int rc,
+                                   uv_loop_t *loop, uv_handle_t *handle)
+{
+    GOC_DBG("[uv_init] %s rc=%d handle=%p type=%s loop=%p alive=%d thread=%llu\n",
+            name,
+            rc,
+            (void*)handle,
+            handle ? uv_handle_type_name(uv_handle_get_type(handle)) : "<null>",
+            (void*)loop,
+            loop ? uv_loop_alive(loop) : -1,
+            goc_uv_thread_id());
+}
+
+extern _Thread_local int goc_uv_callback_depth;
+extern int goc_on_loop_thread(void);
+
+static inline void goc_uv_close_log(const char *reason, uv_handle_t *handle)
+{
+    GOC_DBG("[uv_close] %s handle=%p type=%s active=%d closing=%d has_ref=%d loop=%p callback_depth=%d thread=%llu\n",
+            reason,
+            (void*)handle,
+            handle ? uv_handle_type_name(uv_handle_get_type(handle)) : "<null>",
+            handle ? uv_is_active(handle) : -1,
+            handle ? uv_is_closing(handle) : -1,
+            handle ? uv_has_ref(handle) : -1,
+            handle ? (void*)handle->loop : NULL,
+            goc_uv_callback_depth,
+            goc_uv_thread_id());
+}
+
+static inline void goc_uv_callback_enter(const char *name)
+{
+    goc_uv_callback_depth++;
+    GOC_DBG("[uv_cb] enter %s depth=%d thread=%llu\n",
+            name,
+            goc_uv_callback_depth,
+            goc_uv_thread_id());
+}
+
+static inline void goc_uv_callback_exit(const char *name)
+{
+    GOC_DBG("[uv_cb] exit %s depth=%d thread=%llu\n",
+            name,
+            goc_uv_callback_depth,
+            goc_uv_thread_id());
+    goc_uv_callback_depth--;
+}
+
+static inline void goc_uv_handle_log(const char *prefix, uv_handle_t *handle)
+{
+    if (!handle) {
+        GOC_DBG("[uv_handle] %s handle=NULL thread=%llu\n",
+                prefix, goc_uv_thread_id());
+        return;
+    }
+    GOC_DBG("[uv_handle] %s handle=%p type=%s active=%d closing=%d has_ref=%d loop=%p data=%p thread=%llu\n",
+            prefix,
+            (void*)handle,
+            uv_handle_type_name(uv_handle_get_type(handle)),
+            uv_is_active(handle),
+            uv_is_closing(handle),
+            uv_has_ref(handle),
+            (void*)handle->loop,
+            handle->data,
+            goc_uv_thread_id());
+}
+
+typedef struct {
+    const char *context;
+    size_t      count;
+} goc_uv_walk_arg_t;
+
+static void goc_uv_walk_handle_cb(uv_handle_t *handle, void *arg)
+{
+    goc_uv_walk_arg_t *ctx = (goc_uv_walk_arg_t *)arg;
+    GOC_DBG("[uv_walk] ctx=%s handle=%p type=%s active=%d closing=%d has_ref=%d loop=%p data=%p thread=%llu\n",
+            ctx->context,
+            (void*)handle,
+            uv_handle_type_name(uv_handle_get_type(handle)),
+            uv_is_active(handle),
+            uv_is_closing(handle),
+            uv_has_ref(handle),
+            (void*)handle->loop,
+            handle->data,
+            goc_uv_thread_id());
+    ctx->count++;
+}
+
+static inline void goc_uv_walk_log(uv_loop_t *loop, const char *context)
+{
+    goc_uv_walk_arg_t arg = { context, 0 };
+    uv_walk(loop, goc_uv_walk_handle_cb, &arg);
+    GOC_DBG("[uv_walk] end context=%s loop=%p handle_count=%zu thread=%llu\n",
+            context,
+            (void*)loop,
+            arg.count,
+            goc_uv_thread_id());
+}
+
+#if !defined(GOC_THREAD_LOCAL)
+#  if defined(_MSC_VER)
+#    define GOC_THREAD_LOCAL __declspec(thread)
+#  elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#    define GOC_THREAD_LOCAL _Thread_local
+#  else
+#    define GOC_THREAD_LOCAL __thread
+#  endif
+#endif
+
+/* Internal runtime helper: yield the current fiber to the scheduler. */
+void goc_yield(void);
 
 /* ---------------------------------------------------------------------------
  * goc_sync_t — portable binary semaphore (mutex + condvar)
@@ -129,8 +257,8 @@ struct goc_entry {
     goc_chan*          join_ch;
 
     /* Callback fields (GOC_CALLBACK) */
-    void             (*cb)(void* val, goc_status_t ok, void* ud);   /* take callback */
-    void             (*put_cb)(goc_status_t ok, void* ud);          /* put callback */
+    void             (*cb)(goc_chan* ch, void* val, goc_status_t ok, void* ud);      /* take callback */
+    void             (*put_cb)(goc_chan* ch, void* val, goc_status_t ok, void* ud);  /* put callback */
     void*              ud;
     void*              cb_result;   /* value delivered to take callback; reused as result_slot target for SYNC */
     void*              put_val;     /* value the putter wants to send */
@@ -254,6 +382,12 @@ void live_uv_handles_init(void);
 /* gc.c → used by goc_io.c (goc_handle_register/unregister) */
 void gc_handle_register(void* p);
 void gc_handle_unregister(void* p);
+void goc_deferred_handle_unreg_init(void);
+void goc_deferred_handle_unreg_shutdown(void);
+void goc_deferred_handle_unreg_add(uv_handle_t* handle);
+void goc_deferred_handle_unreg_flush(void);
+void goc_deferred_close_add(uv_handle_t* handle, uv_close_cb cb, goc_chan* ch);
+void goc_deferred_close_flush(void);
 
 /* gc.c → used by fiber.c, pool.c */
 void* goc_fiber_root_register(mco_coro* coro, void* top, goc_entry* entry);
@@ -311,9 +445,16 @@ void post_callback(goc_entry* entry, void* value);
 void post_on_loop(void (*fn)(void*), void* arg);
 int  post_on_loop_checked(void (*fn)(void*), void* arg);
 
+/* goc_io.c → init / shutdown helpers */
+void goc_io_init(void);
+void goc_io_shutdown(void);
+
 /* pool.c → current worker helpers */
 uv_loop_t* goc_current_worker_loop(void);
 int        goc_current_worker_id(void);
+bool       goc_current_worker_has_pending_tasks(void);
+int  post_on_handle_loop(uv_loop_t* loop, void (*fn)(void*), void* arg);
+size_t     goc_pool_thread_count(goc_pool* pool);
 
 /* loop.c central timer manager → called from timeout.c */
 goc_timer_manager_t* goc_global_timer_mgr(void);

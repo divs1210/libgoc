@@ -1864,6 +1864,11 @@ typedef struct {
 
 static void p6_28_child_fn(void* arg) {
     goc_chan* done_ch = (goc_chan*)arg;
+    /* Sleep 1 ms before signalling so idle workers have time to steal the
+     * backlog of 300 children off the owner's deque.  Without this the
+     * owner can drain the deque itself between successive goc_take calls,
+     * leaving steal_successes at zero and producing a spurious failure. */
+    goc_take(goc_timeout(1));
     goc_put(done_ch, NULL);
 }
 
@@ -1876,6 +1881,27 @@ static void p6_28_fanout_fn(void* arg) {
      * idle workers wake and steal children off the deque. */
     for (int i = 0; i < P6_28_NCHILDREN; i++)
         goc_take(a->done_ch);
+}
+
+static void p6_28_dump_steal_stats(const char* label,
+                                   uint64_t att0,
+                                   uint64_t suc0,
+                                   uint64_t mis0,
+                                   uint64_t wak0)
+{
+    uint64_t att1, suc1, mis1, wak1;
+    goc_pool_get_steal_stats(&att1, &suc1, &mis1, &wak1);
+    printf("    [P6.28 DIAG] %s\n", label);
+    printf("    [P6.28 DIAG]   before: attempts=%llu successes=%llu misses=%llu wakeups=%llu\n",
+           (unsigned long long)att0,
+           (unsigned long long)suc0,
+           (unsigned long long)mis0,
+           (unsigned long long)wak0);
+    printf("    [P6.28 DIAG]   after:  attempts=%llu successes=%llu misses=%llu wakeups=%llu\n",
+           (unsigned long long)att1,
+           (unsigned long long)suc1,
+           (unsigned long long)mis1,
+           (unsigned long long)wak1);
 }
 
 static void test_p6_28(void) {
@@ -2100,7 +2126,7 @@ done:;
  * children are still in the deque (unbuffered, unrun) when round-2 pushes
  * another P6_33_NCHILDREN items — total would exceed q-cap (512).
  */
-#define P6_33_NCHILDREN  300
+#define P6_33_NCHILDREN  1000
 
 typedef struct {
     goc_pool* pool;
@@ -2108,6 +2134,8 @@ typedef struct {
 } p6_33_fanout_args_t;
 
 static void p6_33_child_fn(void* arg) {
+    volatile int x = 0;
+    for (int i = 0; i < 1000; i++) x++;
     goc_put((goc_chan*)arg, NULL);
 }
 
@@ -2152,7 +2180,7 @@ static void test_p6_33(void) {
 
     uint64_t att1, suc1, mis1, wak1;
     goc_pool_get_steal_stats(&att1, &suc1, &mis1, &wak1);
-    ASSERT((suc1 - suc0) > 0);
+    ASSERT((suc1 - suc0) >= P6_33_NCHILDREN / 4);
 
     TEST_PASS();
 done:;
@@ -2345,9 +2373,6 @@ int main(void) {
     test_p6_3();
     test_p6_4();
     test_p6_5();
-    printf("\n");
-
-    printf("Phase 6 (continued) — Work-stealing deque + injector\n");
     test_p6_6();
     test_p6_7();
     test_p6_8();
@@ -2388,12 +2413,7 @@ int main(void) {
                 "skipping goc_shutdown: P6.22 left an undrained pool after failure\n");
     }
 
-    printf("==========================================\n");
-    printf("Results: %d/%d passed", g_tests_passed, g_tests_run);
-    if (g_tests_failed > 0) {
-        printf(", %d FAILED", g_tests_failed);
-    }
-    printf("\n");
+    REPORT(g_tests_run, g_tests_passed, g_tests_failed);
 
     return (g_tests_failed == 0) ? 0 : 1;
 }
