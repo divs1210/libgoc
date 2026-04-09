@@ -15,6 +15,8 @@ The library provides stackful coroutines ("fibers"), channels, a select primitiv
 - **C developers** who want a Go-style concurrency runtime without switching to Go.
 - **Language implementors** targeting C/C++ as a compilation target, or writing multithreaded interpreters.
 
+> ⚠️ Experimental software! Don't use it for anything serious yet!
+
 **Dependencies:**
 
 | | |
