@@ -177,7 +177,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo ${{ matrix.cmake_flags }}
+          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGOC_WIN_DBG=ON ${{ matrix.cmake_flags }}
           cmake --build build --parallel $(nproc)
         timeout-minutes: 10
 

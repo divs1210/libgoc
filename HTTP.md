@@ -140,8 +140,7 @@ In both modes, each accepted connection is handled by a per-connection fiber spa
 
 **Client**: outbound requests return a channel that delivers a
 `goc_http_response_t*` when the response arrives. A single `http_client_fiber`
-on `opts->pool` (or `goc_current_or_default_pool()` when unset) drives the
-entire request: DNS lookup via
+on the current-or-default pool drives the entire request: DNS lookup via
 `goc_io_getaddrinfo`, TCP connect via `goc_io_tcp_connect`, write via
 `goc_io_write`, and read/parse via `goc_io_read_start`. All I/O completes
 through `goc_take` in the fiber. The event loop is never blocked; other fibers
@@ -178,7 +177,7 @@ through `goc_http_ctx_t` helpers; the context is valid only until
 Server-side functions (`goc_http_server_respond`, `goc_http_server_header`, etc.) operate
 within the per-connection fiber and do not need any cross-thread dispatch.
 Client-side functions (`goc_http_get`, `goc_http_post`, etc.) launch a fiber
-on `opts->pool` (or the current-or-default pool when unset) that drives the entire request through `goc_io` channel
+on the current-or-default pool that drives the entire request through `goc_io` channel
 operations and are safe to call from any fiber.
 
 `goc_http_ctx_t` must not be passed across independent requests or stored
@@ -235,20 +234,12 @@ typedef goc_http_status_t (*goc_http_middleware_t)(goc_http_ctx_t* ctx);
  * Obtain a heap-allocated zero-initialised default with goc_http_server_opts();
  * set only the fields you need.
  *
- * Example (all defaults):
- *   goc_http_server_t* srv = goc_http_server_make(goc_http_server_opts());
- *
- * Example (custom pool, one middleware):
+ * Example (one middleware):
  *   goc_http_server_opts_t* opts = goc_http_server_opts();
- *   opts->pool       = my_pool;
  *   opts->middleware = goc_array_of(auth_mw);
  *   goc_http_server_t* srv = goc_http_server_make(opts);
  */
 typedef struct {
-    /* Pool whose libuv loop the server runs on.
-    * Default (NULL): goc_current_or_default_pool(). */
-    goc_pool* pool;
-
     /* Middleware chain executed in order inside the per-request fiber before
      * the handler is called.  goc_array of goc_http_middleware_t function pointers.
      * Default (NULL): no middleware. */
@@ -438,7 +429,7 @@ goc_http_response_t* r2 = goc_take(c2)->val;
 
 | Function | Signature | Description |
 |---|---|---|
-| `goc_http_request_opts` | `goc_http_request_opts_t* goc_http_request_opts(void)` | Allocate and return a default request options struct. Pool defaults to `goc_current_or_default_pool()`, no headers, no timeout, keep-alive disabled. |
+| `goc_http_request_opts` | `goc_http_request_opts_t* goc_http_request_opts(void)` | Allocate and return a default request options struct. No headers, no timeout, keep-alive disabled. |
 
 ### REST helpers
 

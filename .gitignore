@@ -80,7 +80,6 @@ bench/libgoc/bench-vmem-old
 # local test files
 meta/*
 test.log
-run_test_loop.sh
 
 # Clojure cache files
 .clj-kondo/

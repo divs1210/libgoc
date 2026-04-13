@@ -52,6 +52,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <signal.h>
 #include <assert.h>
 #include <stdatomic.h>
 #include <uv.h>
@@ -71,24 +72,6 @@ struct goc_io_handle {
 static bool goc_io_handle_claim_close(goc_io_handle_t* h);
 static void drop_buffered_accept_connections(goc_chan* ch);
 static void close_chan_if_not_closing(goc_chan* ch);
-
-static void goc_loop_wakeup(void)
-{
-    uv_async_t *wake = atomic_load_explicit(&g_wakeup, memory_order_acquire);
-    if (!wake || uv_is_closing((uv_handle_t*)wake))
-        return;
-    int rc = uv_async_send(wake);
-    GOC_DBG("goc_loop_wakeup: uv_async_send rc=%d wake=%p active=%d closing=%d\n",
-            rc,
-            (void*)wake,
-            uv_is_active((uv_handle_t*)wake),
-            uv_is_closing((uv_handle_t*)wake));
-    if (rc < 0) {
-        GOC_DBG("goc_loop_wakeup: failed to wake g_loop rc=%d wake=%p\n",
-                rc,
-                (void*)wake);
-    }
-}
 
 /* =========================================================================
  * Shared helpers
@@ -833,7 +816,7 @@ goc_io_handle_t* goc_io_handle_wrap(uv_handle_t* uv, void* owner)
 
     goc_io_handle_t* h = (goc_io_handle_t*)goc_malloc(sizeof(goc_io_handle_t));
     if (!h) {
-        abort();
+        ABORT("goc_io_handle_wrap: failed to allocate handle\n");
     }
     h->magic = 0x474f4348u; /* 'GOCH' */
     h->uv = uv;
@@ -849,10 +832,8 @@ void goc_io_handle_set_owner(goc_io_handle_t* h, void* owner)
         return;
     }
     if (h->state != GOC_H_OPEN && h->state != GOC_H_CLOSING) {
-        fprintf(stderr,
-                "libgoc: goc_io_handle_set_owner: invalid state=%d owner=%p handle=%p\n",
-                (int)h->state, owner, (void*)h->uv);
-        abort();
+        ABORT("goc_io_handle_set_owner: invalid state=%d owner=%p handle=%p\n",
+              (int)h->state, owner, (void*)h->uv);
     }
     h->owner = owner;
 }
@@ -873,10 +854,8 @@ void goc_io_handle_request_close(goc_io_handle_t* h, uv_close_cb cb)
             GOC_DBG("DOUBLE CLOSE: %p\n", (void*)h->uv);
             return;
         }
-        fprintf(stderr,
-                "libgoc: goc_io_handle_request_close: invalid state=%d owner=%p handle=%p\n",
-                (int)h->state, h->owner, (void*)h->uv);
-        abort();
+        ABORT("goc_io_handle_request_close: invalid state=%d owner=%p handle=%p\n",
+              (int)h->state, h->owner, (void*)h->uv);
     }
 
     goc_io_handle_close_internal(h->uv, cb, NULL, false);
@@ -1099,6 +1078,15 @@ void goc_deferred_close_flush(void)
     }
 }
 
+size_t goc_deferred_close_len(void)
+{
+    size_t len = 0;
+    uv_mutex_lock(&g_deferred_close_lock);
+    len = g_deferred_closes_len;
+    uv_mutex_unlock(&g_deferred_close_lock);
+    return len;
+}
+
 void goc_deferred_handle_unreg_flush(void)
 {
     uv_handle_t** items = NULL;
@@ -1135,37 +1123,22 @@ void goc_deferred_handle_unreg_flush(void)
     }
 
     uv_handle_t* dummy = NULL; (void)dummy;
-    goc_io_handle_t** wrappers = NULL;
-    size_t wrapper_len = 0;
+}
 
-    uv_mutex_lock(&g_deferred_wrapper_free_lock);
-    if (g_deferred_wrapper_frees_len > 0) {
-        wrappers = g_deferred_wrapper_frees;
-        wrapper_len = g_deferred_wrapper_frees_len;
-        g_deferred_wrapper_frees = NULL;
-        g_deferred_wrapper_frees_len = 0;
-        g_deferred_wrapper_frees_cap = 0;
-    }
-    uv_mutex_unlock(&g_deferred_wrapper_free_lock);
-
-    if (wrappers) {
-        GOC_DBG("goc_deferred_handle_unreg_flush: releasing %zu wrapper(s)\n", wrapper_len);
-        for (size_t i = 0; i < wrapper_len; i++) {
-            GOC_DBG("goc_deferred_handle_unreg_flush: wrapper released pending=%p state=%d uv=%p\n",
-                    (void*)wrappers[i],
-                    (int)wrappers[i]->state,
-                    (void*)wrappers[i]->uv);
-            /* Wrappers are allocated with goc_malloc and are GC-managed, so
-             * they do not need explicit free here. */
-        }
-        free(wrappers);
-    } else {
-        GOC_DBG("goc_deferred_handle_unreg_flush: no wrappers to free\n");
-    }
+size_t goc_deferred_handle_unreg_len(void)
+{
+    size_t len = 0;
+    uv_mutex_lock(&g_deferred_handle_unreg_lock);
+    len = g_deferred_handle_unregs_len;
+    uv_mutex_unlock(&g_deferred_handle_unreg_lock);
+    return len;
 }
 
 void goc_io_init(void)
 {
+#if !defined(_WIN32)
+    signal(SIGPIPE, SIG_IGN);
+#endif
     uv_mutex_init(&g_pending_read_start_lock);
     goc_io_handle_registry_init();
     goc_deferred_handle_unreg_init();
@@ -1635,6 +1608,7 @@ typedef struct goc_write_ctx {
 } goc_write_ctx_t;
 
 static GOC_THREAD_LOCAL goc_write_ctx_t* g_pending_write_ctxs = NULL;
+static _Atomic long g_uv_active_reqs = 0;
 
 static void free_owned_bufs(uv_buf_t* bufs, unsigned nbufs)
 {
@@ -1698,14 +1672,21 @@ static void pending_write_cancel_for_handle(uv_stream_t* handle)
 static void on_write_cb(uv_write_t* req, int status)
 {
     goc_write_ctx_t* ctx = (goc_write_ctx_t*)req;
+    atomic_fetch_sub_explicit(&g_uv_active_reqs, 1, memory_order_acq_rel);
     GOC_DBG(
-            "on_write_cb: status=%d ch=%p canceled=%d req=%p\n",
-            status, (void*)ctx->ch, ctx->canceled, (void*)req);
+            "on_write_cb: req=%p status=%d ch=%p canceled=%d handle=%p active=%d closing=%d active_reqs=%ld\n",
+            (void*)req,
+            status,
+            (void*)ctx->ch,
+            ctx->canceled,
+            (void*)ctx->handle,
+            ctx->handle ? uv_is_active((uv_handle_t*)ctx->handle) : -1,
+            ctx->handle ? uv_is_closing((uv_handle_t*)ctx->handle) : -1,
+            atomic_load_explicit(&g_uv_active_reqs, memory_order_relaxed));
     if (ctx->canceled) {
         GOC_DBG("on_write_cb: write callback invoked for canceled ctx=%p handle=%p ch=%p\n",
                 (void*)ctx, (void*)ctx->handle, (void*)ctx->ch);
     }
-    GOC_DBG("on_write_cb: status=%d ch=%p canceled=%d\n", status, (void*)ctx->ch, ctx->canceled);
     pending_write_remove(ctx);
     if (!ctx->canceled) {
         goc_put_cb(ctx->ch, SCALAR(status), goc_close_cb, ctx->ch);
@@ -1778,14 +1759,23 @@ static void on_write_dispatch(void* arg)
     }
 
     GOC_DBG(
-            "on_write_dispatch: ENTER handle=%p loop=%p bufs=%p nbufs=%u ch=%p\n",
-            (void*)d->handle, (void*)d->handle->loop, (void*)ctx->bufs_copy,
-            d->nbufs, (void*)d->ch);
+            "on_write_dispatch: ENTER handle=%p loop=%p bufs=%p nbufs=%u ch=%p active=%d closing=%d shutdown=%d\n",
+            (void*)d->handle,
+            (void*)d->handle->loop,
+            (void*)ctx->bufs_copy,
+            d->nbufs,
+            (void*)d->ch,
+            uv_is_active((uv_handle_t*)d->handle),
+            uv_is_closing((uv_handle_t*)d->handle),
+            goc_loop_is_shutting_down());
     int rc = uv_write(&ctx->req, d->handle, ctx->bufs_copy, d->nbufs, on_write_cb);
+    if (rc == 0) {
+        atomic_fetch_add_explicit(&g_uv_active_reqs, 1, memory_order_acq_rel);
+    }
     GOC_DBG(
-            "on_write_dispatch: uv_write rc=%d handle=%p loop=%p ch=%p\n",
-            rc, (void*)d->handle, (void*)d->handle->loop, (void*)d->ch);
-    GOC_DBG("on_write_dispatch: uv_write rc=%d\n", rc);
+            "on_write_dispatch: uv_write rc=%d req=%p handle=%p loop=%p ch=%p active_reqs=%ld\n",
+            rc, (void*)&ctx->req, (void*)d->handle, (void*)d->handle->loop, (void*)d->ch,
+            atomic_load_explicit(&g_uv_active_reqs, memory_order_relaxed));
     if (rc < 0) {
         goc_put_cb(ctx->ch, SCALAR(rc), goc_close_cb, ctx->ch);
         free_owned_bufs(ctx->bufs_copy, ctx->nbufs);
@@ -1933,6 +1923,15 @@ typedef struct {
 static void on_shutdown_cb(uv_shutdown_t* req, int status)
 {
     goc_shutdown_ctx_t* ctx = (goc_shutdown_ctx_t*)req;
+    atomic_fetch_sub_explicit(&g_uv_active_reqs, 1, memory_order_acq_rel);
+    GOC_DBG("on_shutdown_cb: req=%p status=%d ch=%p handle=%p active=%d closing=%d active_reqs=%ld\n",
+            (void*)req,
+            status,
+            (void*)ctx->ch,
+            (void*)ctx->req.handle,
+            ctx->req.handle ? uv_is_active((uv_handle_t*)ctx->req.handle) : -1,
+            ctx->req.handle ? uv_is_closing((uv_handle_t*)ctx->req.handle) : -1,
+            atomic_load_explicit(&g_uv_active_reqs, memory_order_relaxed));
     goc_put_cb(ctx->ch, SCALAR(status), goc_close_cb, ctx->ch);
     free(ctx);
 }
@@ -1953,7 +1952,19 @@ static void on_shutdown_dispatch(void* arg)
         return;
     }
     ctx->ch = d->ch;
+    GOC_DBG("on_shutdown_dispatch: handle=%p loop=%p active=%d closing=%d shutdown=%d\n",
+            (void*)d->handle,
+            (void*)d->handle->loop,
+            d->handle ? uv_is_active((uv_handle_t*)d->handle) : -1,
+            d->handle ? uv_is_closing((uv_handle_t*)d->handle) : -1,
+            goc_loop_is_shutting_down());
     int rc = uv_shutdown(&ctx->req, d->handle, on_shutdown_cb);
+    if (rc == 0) {
+        atomic_fetch_add_explicit(&g_uv_active_reqs, 1, memory_order_acq_rel);
+    }
+    GOC_DBG("on_shutdown_dispatch: uv_shutdown rc=%d req=%p active_reqs=%ld\n",
+            rc, (void*)&ctx->req,
+            atomic_load_explicit(&g_uv_active_reqs, memory_order_relaxed));
     if (rc < 0) {
         goc_put_cb(ctx->ch, SCALAR(rc), goc_close_cb, ctx->ch);
         free(ctx);
@@ -2003,7 +2014,14 @@ static void on_connect_cb(uv_connect_t* req, int status)
                                   0,
                                   memory_order_release);
     }
-    GOC_DBG("on_connect_cb: status=%d ch=%p\n", status, (void*)ctx->ch);
+    atomic_fetch_sub_explicit(&g_uv_active_reqs, 1, memory_order_acq_rel);
+    GOC_DBG("on_connect_cb: req=%p status=%d ch=%p inflight_tracked=%d inflight=%ld active_reqs=%ld\n",
+            (void*)req,
+            status,
+            (void*)ctx->ch,
+            ctx->inflight_tracked,
+            atomic_load_explicit(&g_tcp_connect_inflight, memory_order_relaxed),
+            atomic_load_explicit(&g_uv_active_reqs, memory_order_relaxed));
     goc_put_cb(ctx->ch, SCALAR(status), goc_close_cb, ctx->ch);
     free(ctx);
 }
@@ -2080,8 +2098,12 @@ static void on_tcp_connect_dispatch(void* arg)
         atomic_fetch_add_explicit(&g_tcp_connect_inflight,
                                   1,
                                   memory_order_acq_rel);
+        atomic_fetch_add_explicit(&g_uv_active_reqs, 1, memory_order_acq_rel);
     }
-    GOC_DBG("on_tcp_connect_dispatch: uv_tcp_connect rc=%d\n", rc);
+    GOC_DBG("on_tcp_connect_dispatch: uv_tcp_connect rc=%d req=%p handle=%p inflight=%ld active_reqs=%ld\n",
+            rc, (void*)&ctx->req, (void*)d->handle,
+            atomic_load_explicit(&g_tcp_connect_inflight, memory_order_relaxed),
+            atomic_load_explicit(&g_uv_active_reqs, memory_order_relaxed));
     if (rc < 0) {
         ctx->inflight_tracked = 0;
         goc_put_cb(ctx->ch, SCALAR(rc), goc_close_cb, ctx->ch);
@@ -2599,9 +2621,10 @@ typedef struct {
     goc_chan*    ch;
 } goc_io_handle_close_reg_arg_t;
 
-/* Accessed only on the libuv loop thread (on_handle_close_dispatch and
- * on_goc_io_handle_close both run there), so no extra synchronization needed. */
-static goc_io_handle_close_reg_t* g_handle_close_regs = NULL;
+/* Accessed only on the owning libuv loop thread via register_handle_close_cb
+ * and on_goc_io_handle_close, so no extra synchronization is needed. Each
+ * loop thread keeps its own registry to avoid cross-thread corruption. */
+static _Thread_local goc_io_handle_close_reg_t* g_handle_close_regs = NULL;
 
 static void register_handle_close_cb_dispatch(void* arg)
 {
@@ -2670,7 +2693,7 @@ static void on_server_stream_close_cleanup(void* arg)
     }
     GOC_DBG("on_server_stream_close_cleanup: ctx=%p ch=%p\n",
             (void*)ctx, (void*)ctx->ch);
-    if (!goc_chan_is_closing(ctx->ch)) {
+    if (goc_chan_is_open(ctx->ch)) {
         drop_buffered_accept_connections(ctx->ch);
         GOC_DBG("on_server_stream_close_cleanup: closing accept channel ch=%p ctx=%p\n",
                 (void*)ctx->ch, (void*)ctx);
@@ -2761,6 +2784,10 @@ static void on_goc_io_handle_close(uv_handle_t* handle)
     void* close_data = NULL;
     if (handle)
         close_data = handle->data;
+    GOC_DBG("on_goc_io_handle_close: initial close_data=%p wrapper=%d handle_loop=%p\n",
+            close_data,
+            close_data ? is_goc_io_handle_wrapper(close_data) : 0,
+            handle ? (void*)handle->loop : NULL);
 
     if (handle && close_data && is_goc_io_handle_wrapper(close_data)) {
         GOC_DBG("on_goc_io_handle_close: preserving wrapper data until cleanup handle=%p data=%p type=%s\n",
@@ -2805,7 +2832,7 @@ static void on_goc_io_handle_close(uv_handle_t* handle)
             goc_server_ctx_t* ctx = (goc_server_ctx_t*)close_data;
             GOC_DBG("on_goc_io_handle_close: scheduling deferred server stream cleanup ch=%p handle=%p ctx=%p closing=%d\n",
                     (void*)ctx->ch, (void*)handle, (void*)ctx,
-                    goc_chan_is_closing(ctx->ch));
+                    (int)goc_chan_close_state(ctx->ch));
             goc_server_stream_close_cleanup_t* d =
                 (goc_server_stream_close_cleanup_t*)malloc(
                     sizeof(goc_server_stream_close_cleanup_t));
@@ -2821,7 +2848,7 @@ static void on_goc_io_handle_close(uv_handle_t* handle)
                 if (rc < 0) {
                     GOC_DBG("on_goc_io_handle_close: deferred cleanup post failed rc=%d, scheduling close ch=%p handle=%p\n",
                             rc, (void*)ctx->ch, (void*)handle);
-                    if (!goc_chan_is_closing(ctx->ch)) {
+                    if (goc_chan_is_open(ctx->ch)) {
                         drop_buffered_accept_connections(ctx->ch);
                         GOC_DBG("on_goc_io_handle_close: fallback close_chan_if_not_closing for ctx->ch=%p handle=%p\n",
                                 (void*)ctx->ch, (void*)handle);
@@ -2843,6 +2870,8 @@ static void on_goc_io_handle_close(uv_handle_t* handle)
                     (void*)removed, (void*)handle, (void*)h);
             handle->data = NULL;
             goc_deferred_wrapper_free_add(h);
+            GOC_DBG("on_goc_io_handle_close: wrapper cleanup deferred for handle=%p wrapper=%p\n",
+                    (void*)handle, (void*)h);
         } else {
             GOC_DBG("on_goc_io_handle_close: handle->data still present %p on close callback for handle=%p\n",
                     close_data, (void*)handle);
@@ -2877,21 +2906,23 @@ static void on_goc_io_handle_close(uv_handle_t* handle)
         goc_uv_walk_log(handle->loop, "on_goc_io_handle_close after unregister");
     }
 
+    GOC_DBG("on_goc_io_handle_close: queue handle unregister handle=%p close_data=%p loop=%p\n",
+            (void*)handle, close_data, handle ? (void*)handle->loop : NULL);
     goc_deferred_handle_unreg_add(handle);
     if (!goc_on_loop_thread()) {
+        GOC_DBG("on_goc_io_handle_close: waking loop from non-loop thread for handle=%p\n",
+                (void*)handle);
         goc_loop_wakeup();
     }
-    GOC_DBG("on_goc_io_handle_close: done handle=%p\n", (void*)handle);
+    GOC_DBG("on_goc_io_handle_close: exit handle=%p\n", (void*)handle);
     goc_uv_callback_exit("on_goc_io_handle_close");
 }
 
 #define SAFE_UV_CLOSE(handle, cb)                                 \
     do {                                                          \
         if (goc_uv_callback_depth > 0) {                           \
-            fprintf(stderr,                                         \
-                    "libgoc: SAFE_UV_CLOSE called during callback depth=%d handle=%p\n", \
-                    goc_uv_callback_depth, (void*)(handle));         \
-            abort();                                                \
+            ABORT("SAFE_UV_CLOSE called during callback depth=%d handle=%p\n", \
+                  goc_uv_callback_depth, (void*)(handle));         \
         }                                                         \
         uv_close((handle), (cb));                                  \
     } while (0)
@@ -2929,6 +2960,7 @@ static void on_handle_close_dispatch(void* arg)
     }
     if (!d->target) {
         GOC_DBG("on_handle_close_dispatch: NULL target, skipping uv_close\n");
+        GOC_DBG("on_handle_close_dispatch: exit target=NULL\n");
         free(d);
         goc_uv_callback_exit("on_handle_close_dispatch");
         return;
@@ -2945,6 +2977,7 @@ static void on_handle_close_dispatch(void* arg)
                 uv_has_ref(d->target));
         if (d->user_cb || d->ch)
             register_handle_close_cb_safe(d->target, d->user_cb, d->ch);
+        GOC_DBG("on_handle_close_dispatch: exit target=%p early-closing\n", (void*)d->target);
         free(d);
         goc_uv_callback_exit("on_handle_close_dispatch");
         return;
@@ -2954,15 +2987,13 @@ static void on_handle_close_dispatch(void* arg)
      * (or the handle was zeroed/freed), and passing such a handle to uv_close
      * would violate libuv's uv__has_active_reqs invariant. */
     if (d->target->type == UV_UNKNOWN_HANDLE || d->target->loop == NULL) {
-        fprintf(stderr,
-                "libgoc: on_handle_close_dispatch: invalid/uninitialized target=%p type=%s(%d) loop=%p closing=%d data=%p\n",
-                (void*)d->target,
-                d->target ? uv_handle_type_name(d->target->type) : "<null>",
-                (int)d->target->type,
-                (void*)d->target->loop,
-                d->target ? uv_is_closing(d->target) : -1,
-                d->target ? d->target->data : NULL);
-        abort();
+        ABORT("on_handle_close_dispatch: invalid/uninitialized target=%p type=%s(%d) loop=%p closing=%d data=%p\n",
+              (void*)d->target,
+              d->target ? uv_handle_type_name(d->target->type) : "<null>",
+              (int)d->target->type,
+              (void*)d->target->loop,
+              d->target ? uv_is_closing(d->target) : -1,
+              d->target ? d->target->data : NULL);
     }
 
     if (!uv_loop_alive(d->target->loop)) {
@@ -2975,6 +3006,7 @@ static void on_handle_close_dispatch(void* arg)
                 uv_handle_type_name(d->target->type),
                 uv_is_active(d->target),
                 uv_has_ref(d->target));
+        GOC_DBG("on_handle_close_dispatch: exit target=%p early-loop-dead\n", (void*)d->target);
         free(d);
         goc_uv_callback_exit("on_handle_close_dispatch");
         return;
@@ -3049,7 +3081,7 @@ static void on_handle_close_dispatch(void* arg)
             goc_server_ctx_t* ctx = (goc_server_ctx_t*)stream->data;
             GOC_DBG("on_handle_close_dispatch: server stream cleanup deferred until close callback ch=%p stream=%p ctx=%p closing=%d\n",
                     (void*)ctx->ch, (void*)stream, (void*)ctx,
-                    goc_chan_is_closing(ctx->ch));
+                    (int)goc_chan_close_state(ctx->ch));
             /* Preserve stream->data until on_goc_io_handle_close so the server
              * close callback can safely perform accept-channel teardown.
              */
@@ -3121,6 +3153,14 @@ static void on_handle_close_dispatch(void* arg)
             (void*)d->target, d->target ? d->target->data : NULL);
     GOC_DBG("on_handle_close_dispatch: uv_close scheduled target=%p closing=%d\n",
             (void*)d->target, uv_is_closing(d->target));
+    GOC_DBG("on_handle_close_dispatch: exit target=%p type=%s loop=%p closing=%d active=%d has_ref=%d data=%p\n",
+            (void*)d->target,
+            uv_handle_type_name(type),
+            (void*)d->target->loop,
+            uv_is_closing(d->target),
+            uv_is_active(d->target),
+            uv_has_ref(d->target),
+            d->target->data);
     goc_uv_close_log("on_handle_close_dispatch exit", d->target);
     goc_uv_callback_exit("on_handle_close_dispatch");
     free(d);
@@ -3152,12 +3192,14 @@ static void goc_io_handle_close_internal(uv_handle_t* handle,
             deferred);
     goc_uv_close_log("goc_io_handle_close entry", handle);
     GOC_DBG(
-            "goc_io_handle_close: dispatch close target=%p loop=%p type=%s active=%d closing=%d data=%p deferred=%d\n",
+            "goc_io_handle_close: dispatch close target=%p loop=%p type=%s active=%d closing=%d has_ref=%d loop_alive=%d data=%p deferred=%d\n",
             (void*)handle,
             (void*)handle->loop,
             uv_handle_type_name(uv_handle_get_type(handle)),
             uv_is_active(handle),
             uv_is_closing(handle),
+            uv_has_ref(handle),
+            handle->loop ? uv_loop_alive(handle->loop) : -1,
             (void*)handle->data,
             deferred);
     if (!handle->data) {
@@ -3177,14 +3219,12 @@ static void goc_io_handle_close_internal(uv_handle_t* handle,
                 (void*)handle->loop);
     }
     if (!handle->loop) {
-        fprintf(stderr,
-                "libgoc: goc_io_handle_close: handle has no loop target=%p type=%s active=%d closing=%d data=%p\n",
-                (void*)handle,
-                uv_handle_type_name(uv_handle_get_type(handle)),
-                handle ? uv_is_active(handle) : -1,
-                handle ? uv_is_closing(handle) : -1,
-                (void*)handle->data);
-        abort();
+        ABORT("goc_io_handle_close: handle has no loop target=%p type=%s active=%d closing=%d data=%p\n",
+              (void*)handle,
+              uv_handle_type_name(uv_handle_get_type(handle)),
+              handle ? uv_is_active(handle) : -1,
+              handle ? uv_is_closing(handle) : -1,
+              (void*)handle->data);
     }
 
     goc_io_handle_t* h = goc_io_handle_from_uv(handle);
@@ -3229,14 +3269,12 @@ static void goc_io_handle_close_internal(uv_handle_t* handle,
                 uv_is_active(handle),
                 uv_is_closing(handle),
                 (void*)handle->data);
-        fprintf(stderr,
-                "libgoc: goc_io_handle_close: raw uv_handle_t passed without wrapper target=%p type=%s active=%d closing=%d data=%p\n",
-                (void*)handle,
-                uv_handle_type_name(uv_handle_get_type(handle)),
-                uv_is_active(handle),
-                uv_is_closing(handle),
-                (void*)handle->data);
-        abort();
+        ABORT("goc_io_handle_close: raw uv_handle_t passed without wrapper target=%p type=%s active=%d closing=%d data=%p\n",
+              (void*)handle,
+              uv_handle_type_name(uv_handle_get_type(handle)),
+              uv_is_active(handle),
+              uv_is_closing(handle),
+              (void*)handle->data);
     }
 
     if (!retry) {
@@ -3282,13 +3320,11 @@ static void goc_io_handle_close_internal(uv_handle_t* handle,
                         (void*)ch);
                 return;
             }
-            fprintf(stderr,
-                    "libgoc: goc_io_handle_close: invalid wrapper state on duplicate close target=%p wrapper=%p state=%d cb=%p\n",
-                    (void*)handle,
-                    (void*)h,
-                    state,
-                    (void*)cb);
-            abort();
+            ABORT("goc_io_handle_close: invalid wrapper state on duplicate close target=%p wrapper=%p state=%d cb=%p\n",
+                  (void*)handle,
+                  (void*)h,
+                  state,
+                  (void*)cb);
         }
     } else {
         int state = (int)atomic_load(&h->state);
@@ -3339,7 +3375,7 @@ static void goc_io_handle_close_internal(uv_handle_t* handle,
             if (is_server_ctx(handle->data)) {
                 goc_server_ctx_t* ctx = (goc_server_ctx_t*)handle->data;
                 GOC_DBG("goc_io_handle_close: g_loop target is server ctx=%p accept_ch=%p closing=%d\n",
-                        (void*)ctx, (void*)ctx->ch, goc_chan_is_closing(ctx->ch));
+                        (void*)ctx, (void*)ctx->ch, (int)goc_chan_close_state(ctx->ch));
             } else if (is_pending_read_start_marker(handle->data, (uv_stream_t*)handle)) {
                 GOC_DBG("goc_io_handle_close: g_loop target has pending read-start marker=%p\n",
                         handle->data);
@@ -3411,11 +3447,9 @@ static void goc_io_handle_close_internal(uv_handle_t* handle,
             goc_deferred_handle_unreg_add(handle);
             return;
         }
-        fprintf(stderr,
-                "libgoc: goc_io_handle_close: handle loop %p is dead while handle %p is not closing; invalid close path\n",
-                (void*)handle->loop,
-                (void*)handle);
-        abort();
+        ABORT("goc_io_handle_close: handle loop %p is dead while handle %p is not closing; invalid close path\n",
+              (void*)handle->loop,
+              (void*)handle);
     }
     if (uv_is_closing(handle)) {
         GOC_DBG(
@@ -3434,12 +3468,14 @@ static void goc_io_handle_close_internal(uv_handle_t* handle,
     d->target  = handle;
     d->user_cb = cb;
     d->ch      = ch;
-    GOC_DBG("goc_io_handle_close: dispatching close target=%p loop=%p type=%s active=%d closing=%d data=%p\n",
+    GOC_DBG("goc_io_handle_close: dispatching close target=%p loop=%p type=%s active=%d closing=%d has_ref=%d loop_alive=%d data=%p\n",
             (void*)handle,
             (void*)handle->loop,
             uv_handle_type_name(uv_handle_get_type(handle)),
             uv_is_active(handle),
             uv_is_closing(handle),
+            uv_has_ref(handle),
+            handle->loop ? uv_loop_alive(handle->loop) : -1,
             handle->data);
     if (retry && handle->loop == g_loop && goc_on_loop_thread()) {
         GOC_DBG("goc_io_handle_close: retry dispatch to g_loop via post_on_loop target=%p\n",
@@ -3745,10 +3781,8 @@ static void drop_buffered_accept_connections(goc_chan* ch)
                 GOC_DBG("drop_buffered_accept_connections: handle=%p wrapper=%p owner=%p not owned by ch=%p or already closed\n",
                         (void*)handle, (void*)h, (void*)h->owner, (void*)ch);
             } else {
-                fprintf(stderr,
-                        "libgoc: drop_buffered_accept_connections: raw uv_handle_t %p found in accept buffer; raw-handle accept buffering is no longer supported\n",
-                        (void*)handle);
-                abort();
+                ABORT("%s: raw uv_handle_t %p found in accept buffer; raw-handle accept buffering is no longer supported\n",
+                      __func__, (void*)handle);
             }
         }
         uv_mutex_lock(ch->lock);
@@ -3803,7 +3837,7 @@ static void on_server_connection(uv_stream_t* server, int status)
         gc_handle_register(client);
         rc = uv_accept(server, (uv_stream_t*)client);
         GOC_DBG("on_server_connection: uv_accept rc=%d client=%p ch=%p ch_closing=%d\n",
-                rc, (void*)client, (void*)ctx->ch, goc_chan_is_closing(ctx->ch));
+                rc, (void*)client, (void*)ctx->ch, (int)goc_chan_close_state(ctx->ch));
         if (rc < 0) {
             goc_uv_close_log("on_server_connection accepted tcp client close", (uv_handle_t*)client);
             goc_uv_handle_log("on_server_connection accepted tcp client close", (uv_handle_t*)client);
@@ -3811,7 +3845,7 @@ static void on_server_connection(uv_stream_t* server, int status)
             goc_uv_callback_exit("on_server_connection");
             return;
         }
-        if (goc_chan_is_closing(ctx->ch)) {
+        if (!goc_chan_is_open(ctx->ch)) {
             GOC_DBG(
                     "on_server_connection: accept ch already closing, dropping accepted tcp client=%p ch=%p active=%d closing=%d reason=accept_ch_closing\n",
                     (void*)client,
@@ -3862,7 +3896,7 @@ static void on_server_connection(uv_stream_t* server, int status)
             goc_uv_callback_exit("on_server_connection");
             return;
         }
-        if (goc_chan_is_closing(ctx->ch)) {
+        if (!goc_chan_is_open(ctx->ch)) {
             GOC_DBG(
                     "on_server_connection: accept ch already closing, dropping accepted pipe client=%p ch=%p active=%d closing=%d reason=accept_ch_closing\n",
                     (void*)client,

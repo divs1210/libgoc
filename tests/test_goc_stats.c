@@ -28,9 +28,13 @@
  *   S3.1  Channel open/close events via API
  *   S3.2  Buffered channel: buf_size and item_count after put/take
  *   S3.3  Multiple fibers and channels: all events unique and present
+ *   S3.4  close event carries non-zero taker_scans/putter_scans
+ *   S3.5  close event carries non-zero compaction_runs/entries_removed
  *   S4.1  goc_stats_shutdown() disables stats delivery
  *   S5.1  Worker STOPPED event carries valid steal_attempts/steal_successes
  *   S6.1  goc_cb_queue_get_hwm() reflects peak callback-queue depth
+ *   S6.2  goc_timeout_get_stats tracks allocations and expirations
+ *   S6.3  goc_pool_get_steal_stats returns non-decreasing totals
  *   S6.4  steal counters readable; misses<=attempts invariant holds (no-work pool)
  *   S6.5  idle_wakeups increments after external injection (pool=2, 1 fiber)
  *   S6.6  goc_pool_get_steal_stats extended signature returns valid values

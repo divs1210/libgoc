@@ -114,9 +114,9 @@ static bool stats_drain(void) {
 static void stats_on_close(uv_handle_t *h) {
     goc_uv_handle_log("stats_on_close", h);
     free(h);
+    uv_mutex_lock(&g_close_mutex);
     g_stats_async = NULL;
     sq_destroy();
-    uv_mutex_lock(&g_close_mutex);
     g_close_done = 1;
     uv_cond_signal(&g_close_cond);
     uv_mutex_unlock(&g_close_mutex);
@@ -297,6 +297,7 @@ bool goc_stats_is_enabled(void) {
 
 static void goc_stats_dispatch(const goc_stats_event_t *ev) {
     if (!atomic_load_explicit(&stats_enabled, memory_order_acquire)) return;
+    if (atomic_load_explicit(&g_stats_closing, memory_order_acquire)) return;
 
     stats_node *node = (stats_node *)malloc(sizeof(stats_node));
     if (!node) return;
@@ -304,7 +305,12 @@ static void goc_stats_dispatch(const goc_stats_event_t *ev) {
     node->is_barrier = false;
 
     sq_push(node);
-    uv_async_send(g_stats_async);
+
+    uv_mutex_lock(&g_close_mutex);
+    if (!atomic_load_explicit(&g_stats_closing, memory_order_acquire) && g_stats_async) {
+        uv_async_send(g_stats_async);
+    }
+    uv_mutex_unlock(&g_close_mutex);
 }
 
 void goc_stats_submit_event_pool(int id, int status, int thread_count) {

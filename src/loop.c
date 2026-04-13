@@ -7,14 +7,31 @@
  * Exposes: goc_scheduler(), loop_init(), loop_shutdown(), post_callback().
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+
 #include <stdlib.h>
 #include <assert.h>
 #include <sched.h>
+#include <stdbool.h>
+#if !defined(_WIN32)
+#include <dlfcn.h>
+#endif
 #include <uv.h>
 #include <gc.h>
 #include "../include/goc.h"
 #include "internal.h"
 #include "channel_internal.h"
+
+#define POST_CALLBACK(entry, value) do {                                  \
+    const char *post_cb_ch_tag = (entry)->ch ? goc_chan_get_debug_tag((entry)->ch) : "<none>"; \
+    GOC_DBG("post_callback caller=%s:%d entry=%p id=%llu ch=%p tag=%s cb=%p put_cb=%p\n", \
+            __FILE__, __LINE__, (void*)(entry), (unsigned long long)(entry)->id, \
+            (void*)(entry)->ch, post_cb_ch_tag, \
+            (void*)(uintptr_t)(entry)->cb, (void*)(uintptr_t)(entry)->put_cb); \
+    post_callback((entry), (value));                                          \
+} while (0)
 
 /* --------------------------------------------------------------------------
  * MPSC queue (Vyukov-style intrusive lock-free queue)
@@ -51,13 +68,14 @@ typedef enum {
 } goc_loop_state_t;
 
 static _Atomic int g_loop_state = GOC_LOOP_STATE_STOPPED;
-static _Atomic int g_shutdown_requested = 0;
+static _Atomic int g_wakeup_pending = 0;
 
 /* Loop-thread drain reentrancy guard.
  * on_wakeup may trigger callbacks that enqueue more work; avoid recursively
  * re-entering drain_cb_queue on the same thread frame. */
 static _Thread_local int g_in_cb_drain = 0;
 _Thread_local int goc_uv_callback_depth = 0;
+static long g_wakeup_count = 0;
 
 /* Callback queue depth tracking — relaxed atomics; zero hot-path overhead */
 static _Atomic size_t g_cb_queue_depth = 0;
@@ -65,6 +83,7 @@ static _Atomic size_t g_cb_queue_hwm   = 0;
 
 /* Forward declarations used by post_callback fast-path. */
 static void drain_cb_queue(void);
+static bool wakeup_send_if_needed(void);
 
 int goc_on_loop_thread(void)
 {
@@ -78,14 +97,15 @@ static void drain_cb_queue_guarded(void)
         GOC_DBG("drain_cb_queue_guarded: reentrant skip\n");
         return;
     }
-    GOC_DBG("drain_cb_queue_guarded: enter depth=%zu state=%d g_loop=%p\n",
-            atomic_load_explicit(&g_cb_queue_depth, memory_order_relaxed),
+    size_t depth_before = atomic_load_explicit(&g_cb_queue_depth, memory_order_relaxed);
+    GOC_DBG("drain_cb_queue_guarded: enter depth_before=%zu state=%d g_loop=%p\n",
+            depth_before,
             atomic_load_explicit(&g_loop_state, memory_order_relaxed),
             (void*)g_loop);
     g_in_cb_drain = 1;
     drain_cb_queue();
     g_in_cb_drain = 0;
-    GOC_DBG("drain_cb_queue_guarded: exit depth=%zu state=%d g_loop=%p\n",
+    GOC_DBG("drain_cb_queue_guarded: exit depth_after=%zu state=%d g_loop=%p\n",
             atomic_load_explicit(&g_cb_queue_depth, memory_order_relaxed),
             atomic_load_explicit(&g_loop_state, memory_order_relaxed),
             (void*)g_loop);
@@ -163,6 +183,52 @@ size_t goc_cb_queue_get_hwm(void)
     return atomic_load_explicit(&g_cb_queue_hwm, memory_order_relaxed);
 }
 
+static bool wakeup_send_if_needed(void)
+{
+    uv_async_t *w = atomic_load_explicit(&g_wakeup, memory_order_acquire);
+    if (!w || uv_is_closing((uv_handle_t*)w)) {
+        GOC_DBG("wakeup_send_if_needed: wakeup invalid wakeup=%p active=%d closing=%d has_ref=%d => false\n",
+                (void*)w,
+                w ? uv_is_active((uv_handle_t*)w) : -1,
+                w ? uv_is_closing((uv_handle_t*)w) : -1,
+                w ? uv_has_ref((uv_handle_t*)w) : -1);
+        return false;
+    }
+    if (atomic_exchange_explicit(&g_wakeup_pending, 1, memory_order_acq_rel))
+        return true;
+
+    int rc = uv_async_send(w);
+    GOC_DBG("wakeup_send_if_needed: uv_async_send rc=%d wakeup=%p active=%d closing=%d has_ref=%d pending=%d\n",
+            rc,
+            (void*)w,
+            uv_is_active((uv_handle_t*)w),
+            uv_is_closing((uv_handle_t*)w),
+            uv_has_ref((uv_handle_t*)w),
+            atomic_load_explicit(&g_wakeup_pending, memory_order_relaxed));
+    if (rc < 0) {
+        atomic_store_explicit(&g_wakeup_pending, 0, memory_order_release);
+        GOC_DBG("wakeup_send_if_needed: uv_async_send failed rc=%d wakeup=%p\n",
+                rc,
+                (void*)w);
+        return false;
+    }
+    return true;
+}
+
+void goc_loop_wakeup(void)
+{
+    uv_async_t *w = atomic_load_explicit(&g_wakeup, memory_order_acquire);
+    GOC_DBG("goc_loop_wakeup: called g_wakeup=%p active=%d closing=%d has_ref=%d pending=%d state=%d\n",
+            (void*)w,
+            w ? uv_is_active((uv_handle_t*)w) : -1,
+            w ? uv_is_closing((uv_handle_t*)w) : -1,
+            w ? uv_has_ref((uv_handle_t*)w) : -1,
+            atomic_load_explicit(&g_wakeup_pending, memory_order_relaxed),
+            atomic_load_explicit(&g_loop_state, memory_order_relaxed));
+    if (!wakeup_send_if_needed())
+        return;
+}
+
 /* --------------------------------------------------------------------------
  * post_callback — called from any thread (pool workers, loop thread)
  * -------------------------------------------------------------------------- */
@@ -172,14 +238,40 @@ void post_callback(goc_entry *entry, void *value)
     /* For take callbacks: store the delivered value. */
     entry->cb_result = value;
 
+    const void *entry_ch = entry->ch;
+    const char *ch_tag = entry_ch ? goc_chan_get_debug_tag((goc_chan*)entry_ch) : NULL;
+    int cancelled = atomic_load_explicit(&entry->cancelled, memory_order_relaxed);
+    int woken = atomic_load_explicit(&entry->woken, memory_order_relaxed);
+    void *fired_ptr = entry->fired;
+    const char *fired_flag = "<none>";
+    if (fired_ptr) {
+        fired_flag = atomic_load_explicit((atomic_int*)fired_ptr, memory_order_relaxed) ? "1" : "0";
+    }
+    void *put_cb = (void*)(uintptr_t)entry->put_cb;
+    void *cb = (void*)(uintptr_t)entry->cb;
+
     mpsc_node *node = (mpsc_node *)malloc(sizeof(mpsc_node));
     node->entry = entry;
     size_t prev_depth = cb_queue_push(node);
 
     uv_async_t *w = atomic_load_explicit(&g_wakeup, memory_order_acquire);
-    GOC_DBG("post_callback: entry=%p ch=%p is_put=%d put_cb=%p wakeup=%p prev_depth=%zu\n",
-            (void*)entry, (void*)entry->ch, (int)entry->is_put,
-            (void*)(uintptr_t)entry->put_cb, (void*)w, prev_depth);
+    int state = atomic_load_explicit(&g_loop_state, memory_order_relaxed);
+    GOC_DBG("post_callback: entry=%p id=%llu kind=%d ch=%p tag=%s cancelled=%d woken=%d fired=%p fired_flag=%s put_cb=%p cb=%p wakeup=%p prev_depth=%zu pending=%d state=%d\n",
+            (void*)entry,
+            (unsigned long long)entry->id,
+            (int)entry->kind,
+            entry_ch,
+            ch_tag ? ch_tag : "<none>",
+            cancelled,
+            woken,
+            fired_ptr,
+            fired_flag,
+            put_cb,
+            cb,
+            (void*)w,
+            prev_depth,
+            atomic_load_explicit(&g_wakeup_pending, memory_order_relaxed),
+            state);
 
     /* Coalescing: skip uv_async_send when the queue was already non-empty.
      * A prior send is already in flight; on_wakeup will drain everything
@@ -187,8 +279,10 @@ void post_callback(goc_entry *entry, void *value)
     if (w && prev_depth == 0) {
         int w_active = uv_is_active((uv_handle_t*)w);
         int w_closing = uv_is_closing((uv_handle_t*)w);
-        GOC_DBG("post_callback: uv_async_send about to send wakeup=%p active=%d closing=%d prev_depth=%zu g_loop_state=%d\n",
-                (void*)w, w_active, w_closing, prev_depth,
+        GOC_DBG("post_callback: uv_async_send about to send wakeup=%p active=%d closing=%d has_ref=%d prev_depth=%zu g_loop_state=%d\n",
+                (void*)w, w_active, w_closing,
+                w ? uv_has_ref((uv_handle_t*)w) : -1,
+                prev_depth,
                 atomic_load_explicit(&g_loop_state, memory_order_relaxed));
         if (w_closing) {
             GOC_DBG("post_callback: wakeup closing, skipping uv_async_send wakeup=%p active=%d closing=%d prev_depth=%zu\n",
@@ -199,19 +293,17 @@ void post_callback(goc_entry *entry, void *value)
                 return;
             }
         } else {
-            int rc = uv_async_send(w);
-            GOC_DBG("post_callback: SENT rc=%d wakeup=%p active=%d closing=%d prev_depth=%zu\n",
-                    rc, (void*)w, w_active, w_closing, prev_depth);
-            if (rc < 0) {
-                GOC_DBG("post_callback: uv_async_send FAILED wakeup=%p rc=%d active=%d closing=%d prev_depth=%zu\n",
-                        (void*)w, rc, w_active, w_closing, prev_depth);
+            if (!wakeup_send_if_needed()) {
+                GOC_DBG("post_callback: wakeup_send_if_needed skipped or failed wakeup=%p prev_depth=%zu\n",
+                        (void*)w, prev_depth);
             }
         }
     } else if (!w && goc_on_loop_thread()) {
-        GOC_DBG("post_callback: wakeup missing on loop thread, deferring drain to loop teardown depth=%zu state=%d g_wakeup=%p\n",
+        GOC_DBG("post_callback: wakeup missing on loop thread, deferring drain to loop teardown depth=%zu state=%d g_wakeup=%p g_wakeup_pending=%d\n",
                 atomic_load_explicit(&g_cb_queue_depth, memory_order_relaxed),
                 atomic_load_explicit(&g_loop_state, memory_order_relaxed),
-                (void*)atomic_load_explicit(&g_wakeup, memory_order_acquire));
+                (void*)atomic_load_explicit(&g_wakeup, memory_order_acquire),
+                atomic_load_explicit(&g_wakeup_pending, memory_order_relaxed));
         /* Shutdown/teardown edge: wakeup handle may already be gone. Defer
          * remaining work to the loop shutdown path so callbacks are never
          * executed inline while the runtime is mutating internal state. */
@@ -232,13 +324,36 @@ typedef struct {
 static void on_loop_task_cb(goc_chan* _ch, void* _val, goc_status_t _ok, void* ud)
 {
     goc_loop_task_t* task = (goc_loop_task_t*)ud;
+    GOC_DBG("on_loop_task_cb: task=%p fn=%p arg=%p\n",
+            (void*)task,
+            (void*)(uintptr_t)task->fn,
+            task->arg);
+#if defined(__unix__) || defined(__APPLE__)
+    {
+        Dl_info info;
+        if (dladdr((void*)(uintptr_t)task->fn, &info) && info.dli_sname) {
+            GOC_DBG("on_loop_task_cb: task fn symbol=%s image=%s\n",
+                    info.dli_sname,
+                    info.dli_fname ? info.dli_fname : "<unknown>");
+        }
+    }
+#endif
     task->fn(task->arg);
-    free(task);
 }
 
 void post_on_loop(void (*fn)(void*), void* arg)
 {
     GOC_DBG("post_on_loop: entry fn=%p arg=%p\n", (void*)fn, arg);
+    uv_mutex_lock(&g_loop_submit_lock);
+    if (atomic_load_explicit(&g_loop_state, memory_order_acquire) !=
+        GOC_LOOP_STATE_RUNNING) {
+        GOC_DBG("post_on_loop: shutdown in progress, rejecting fn=%p arg=%p state=%d g_loop=%p\n",
+                (void*)fn, arg,
+                atomic_load_explicit(&g_loop_state, memory_order_relaxed),
+                (void*)g_loop);
+        uv_mutex_unlock(&g_loop_submit_lock);
+        return;
+    }
     goc_loop_task_t* task = (goc_loop_task_t*)malloc(sizeof(goc_loop_task_t));
     task->fn = fn;
     task->arg = arg;
@@ -246,7 +361,8 @@ void post_on_loop(void (*fn)(void*), void* arg)
     task->e.kind = GOC_CALLBACK;
     task->e.cb   = on_loop_task_cb;
     task->e.ud   = task;
-    post_callback(&task->e, NULL);
+    POST_CALLBACK(&task->e, NULL);
+    uv_mutex_unlock(&g_loop_submit_lock);
     GOC_DBG("post_on_loop: queued fn=%p arg=%p\n", (void*)fn, arg);
 }
 
@@ -267,10 +383,32 @@ int post_on_loop_checked(void (*fn)(void*), void* arg)
         task->e.kind = GOC_CALLBACK;
         task->e.cb   = on_loop_task_cb;
         task->e.ud   = task;
-        post_callback(&task->e, NULL);
+        POST_CALLBACK(&task->e, NULL);
     }
     uv_mutex_unlock(&g_loop_submit_lock);
 
+    {
+        const void* caller = __builtin_return_address(0);
+        GOC_DBG("post_on_loop_checked: fn=%p arg=%p caller=%p rc=%d state=%d g_loop=%p\n",
+                (void*)fn, arg, caller, rc,
+                atomic_load_explicit(&g_loop_state, memory_order_relaxed),
+                (void*)g_loop);
+#if !defined(_WIN32)
+        {
+            Dl_info info;
+            if (dladdr((void*)(uintptr_t)fn, &info) && info.dli_sname) {
+                GOC_DBG("post_on_loop_checked: fn symbol=%s image=%s\n",
+                        info.dli_sname,
+                        info.dli_fname ? info.dli_fname : "<unknown>");
+            }
+            if (dladdr((void*)caller, &info) && info.dli_sname) {
+                GOC_DBG("post_on_loop_checked: caller symbol=%s image=%s\n",
+                        info.dli_sname,
+                        info.dli_fname ? info.dli_fname : "<unknown>");
+            }
+        }
+#endif
+    }
     if (rc < 0) {
         GOC_DBG("post_on_loop_checked: rejected fn=%p arg=%p state=%d g_loop=%p rc=%d\n",
                 (void*)fn, arg,
@@ -285,6 +423,19 @@ int post_on_loop_checked(void (*fn)(void*), void* arg)
                 rc);
     }
     return rc;
+}
+
+int goc_loop_submit_callback_if_running(goc_entry* entry)
+{
+    uv_mutex_lock(&g_loop_submit_lock);
+    if (atomic_load_explicit(&g_loop_state, memory_order_acquire) !=
+        GOC_LOOP_STATE_RUNNING) {
+        uv_mutex_unlock(&g_loop_submit_lock);
+        return 0;
+    }
+    POST_CALLBACK(entry, NULL);
+    uv_mutex_unlock(&g_loop_submit_lock);
+    return 1;
 }
 
 int goc_loop_is_shutting_down(void)
@@ -351,16 +502,23 @@ static void dump_loop_internal_state(const char *phase, long iter)
     handle_summary_t summary = {0, 0, 0, 0};
     uv_walk(g_loop, loop_walk_handle_cb, &loop_count);
     uv_walk(g_loop, loop_handle_summary_cb, &summary);
-    GOC_DBG("loop_internal_state: %s iter=%ld g_loop=%p alive=%d handle_count=%zu cb_depth=%zu hwm=%zu g_loop_state=%d g_wakeup=%p g_wakeup_raw=%p g_shutdown_async=%p g_timer_mgr=%p timer_heap_len=%zu async_wakeup=%zu async_shutdown=%zu timer_mgr=%zu other_handles=%zu\n",
+    int wakeup_has_ref = g_wakeup_raw ? uv_has_ref((uv_handle_t*)g_wakeup_raw) : -1;
+    int shutdown_has_ref = g_shutdown_async ? uv_has_ref((uv_handle_t*)g_shutdown_async) : -1;
+    int timer_has_ref = g_timer_mgr ? uv_has_ref((uv_handle_t*)g_timer_mgr) : -1;
+    GOC_DBG("loop_internal_state: %s iter=%ld g_loop=%p alive=%d handle_count=%zu cb_depth=%zu hwm=%zu g_loop_state=%d g_wakeup=%p g_wakeup_raw=%p g_wakeup_has_ref=%d g_shutdown_async=%p g_shutdown_async_has_ref=%d g_timer_mgr=%p g_timer_mgr_has_ref=%d timer_heap_len=%zu g_wakeup_pending=%d async_wakeup=%zu async_shutdown=%zu timer_mgr=%zu other_handles=%zu\n",
             phase, iter, (void*)g_loop, uv_loop_alive(g_loop), loop_count,
             atomic_load_explicit(&g_cb_queue_depth, memory_order_relaxed),
             atomic_load_explicit(&g_cb_queue_hwm, memory_order_relaxed),
             atomic_load_explicit(&g_loop_state, memory_order_relaxed),
             (void*)atomic_load_explicit(&g_wakeup, memory_order_acquire),
             (void*)g_wakeup_raw,
+            wakeup_has_ref,
             (void*)g_shutdown_async,
+            shutdown_has_ref,
             (void*)g_timer_mgr,
+            timer_has_ref,
             g_timer_heap_len,
+            atomic_load_explicit(&g_wakeup_pending, memory_order_relaxed),
             summary.async_wakeup,
             summary.async_shutdown,
             summary.timer_mgr,
@@ -450,7 +608,13 @@ static void timer_mgr_rearm(void)
             (unsigned long long)delay_ms,
             g_timer_mgr ? uv_is_active((uv_handle_t*)g_timer_mgr) : -1,
             g_timer_mgr ? uv_is_closing((uv_handle_t*)g_timer_mgr) : -1);
-    uv_timer_start(g_timer_mgr, on_timer_mgr_fire, delay_ms, 0);
+    int rc = uv_timer_start(g_timer_mgr, on_timer_mgr_fire, delay_ms, 0);
+    GOC_DBG("timer_mgr_rearm: uv_timer_start rc=%d timer_mgr=%p active=%d closing=%d has_ref=%d\n",
+            rc,
+            (void*)g_timer_mgr,
+            g_timer_mgr ? uv_is_active((uv_handle_t*)g_timer_mgr) : -1,
+            g_timer_mgr ? uv_is_closing((uv_handle_t*)g_timer_mgr) : -1,
+            g_timer_mgr ? uv_has_ref((uv_handle_t*)g_timer_mgr) : -1);
 }
 
 /* Loop-thread callback: fires all expired entries and re-arms. */
@@ -459,16 +623,19 @@ static void on_timer_mgr_fire(uv_timer_t* h)
     (void)h;
     goc_uv_callback_enter("on_timer_mgr_fire");
     uint64_t now_ns = uv_hrtime();
-    GOC_DBG("on_timer_mgr_fire: now_ns=%llu heap_len=%zu g_timer_mgr=%p active=%d closing=%d g_loop=%p loop_alive=%d g_wakeup=%p shutdown_async=%p\n",
+    int timer_has_ref = g_timer_mgr ? uv_has_ref((uv_handle_t*)g_timer_mgr) : -1;
+    GOC_DBG("on_timer_mgr_fire: now_ns=%llu heap_len=%zu g_timer_mgr=%p active=%d closing=%d has_ref=%d g_loop=%p loop_alive=%d g_wakeup=%p shutdown_async=%p\n",
             (unsigned long long)now_ns, g_timer_heap_len,
             (void*)g_timer_mgr,
             g_timer_mgr ? uv_is_active((uv_handle_t*)g_timer_mgr) : -1,
             g_timer_mgr ? uv_is_closing((uv_handle_t*)g_timer_mgr) : -1,
+            timer_has_ref,
             (void*)g_loop,
             g_loop ? uv_loop_alive(g_loop) : -1,
             (void*)atomic_load_explicit(&g_wakeup, memory_order_acquire),
             (void*)g_shutdown_async);
 
+    size_t expired = 0;
     while (g_timer_heap_len > 0 && g_timer_heap[0].deadline_ns <= now_ns) {
         goc_timeout_timer_ctx* ctx = g_timer_heap[0].ctx;
         GOC_DBG("on_timer_mgr_fire: expiring tctx=%p ch=%p deadline=%llu\n",
@@ -487,8 +654,16 @@ static void on_timer_mgr_fire(uv_timer_t* h)
         /* Mark closed before firing so on_cancel_timer (if posted) is a no-op. */
         atomic_store_explicit(&ctx->start_state, 2, memory_order_release);
         goc_timeout_ctx_expire(ctx);
+        expired++;
     }
 
+    GOC_DBG("on_timer_mgr_fire: expired=%zu remaining_heap_len=%zu timer_mgr=%p active=%d closing=%d has_ref=%d\n",
+            expired,
+            g_timer_heap_len,
+            (void*)g_timer_mgr,
+            g_timer_mgr ? uv_is_active((uv_handle_t*)g_timer_mgr) : -1,
+            g_timer_mgr ? uv_is_closing((uv_handle_t*)g_timer_mgr) : -1,
+            timer_has_ref);
     timer_mgr_rearm();
 }
 
@@ -581,6 +756,7 @@ static void goc_timer_manager_init(void)
     assert(g_timer_mgr != NULL);
     int rc = uv_timer_init(g_loop, g_timer_mgr);
     goc_uv_init_log("uv_timer_init timer_mgr", rc, g_loop, (uv_handle_t*)g_timer_mgr);
+    uv_unref((uv_handle_t*)g_timer_mgr);
     (void)rc;
     /* Do not start the timer yet; it will be armed on the first insert. */
 }
@@ -594,7 +770,7 @@ static void goc_timer_manager_shutdown(void)
             g_timer_mgr ? uv_is_active((uv_handle_t*)g_timer_mgr) : -1,
             g_timer_mgr ? uv_is_closing((uv_handle_t*)g_timer_mgr) : -1);
 
-    if (g_timer_mgr) {
+    if (g_timer_mgr && !uv_is_closing((uv_handle_t*)g_timer_mgr)) {
         GOC_DBG("goc_timer_manager_shutdown: uv_timer_stop g_timer_mgr=%p active=%d closing=%d\n",
                 (void*)g_timer_mgr,
                 uv_is_active((uv_handle_t*)g_timer_mgr),
@@ -606,8 +782,8 @@ static void goc_timer_manager_shutdown(void)
         goc_timeout_timer_ctx* ctx = g_timer_heap[i].ctx;
         int state = atomic_load_explicit(&ctx->start_state, memory_order_acquire);
         int cancel = atomic_load_explicit(&ctx->cancel_requested, memory_order_acquire);
-        GOC_DBG("goc_timer_manager_shutdown: closing tctx=%p ch=%p start_state=%d cancel_requested=%d\n",
-                (void*)ctx, (void*)ctx->ch, state, cancel);
+        GOC_DBG("goc_timer_manager_shutdown: closing tctx=%p ch=%p heap_idx=%zu start_state=%d cancel_requested=%d\n",
+                (void*)ctx, (void*)ctx->ch, ctx->heap_idx, state, cancel);
         /* Set state=2 so any in-flight on_cancel_timer callbacks are no-ops. */
         atomic_store_explicit(&ctx->start_state, 2, memory_order_release);
         ctx->heap_idx = SIZE_MAX;
@@ -616,8 +792,21 @@ static void goc_timer_manager_shutdown(void)
     g_timer_heap_len = 0;
 
     if (g_timer_mgr) {
-        goc_uv_close_log("goc_timer_manager_shutdown", (uv_handle_t*)g_timer_mgr);
-        goc_uv_close_internal((uv_handle_t*)g_timer_mgr, free_handle_cb);
+        if (!uv_is_closing((uv_handle_t*)g_timer_mgr)) {
+            GOC_DBG("goc_timer_manager_shutdown: close timer_mgr=%p active=%d closing=%d has_ref=%d\n",
+                    (void*)g_timer_mgr,
+                    uv_is_active((uv_handle_t*)g_timer_mgr),
+                    uv_is_closing((uv_handle_t*)g_timer_mgr),
+                    uv_has_ref((uv_handle_t*)g_timer_mgr));
+            goc_uv_close_log("goc_timer_manager_shutdown", (uv_handle_t*)g_timer_mgr);
+            goc_uv_close_internal((uv_handle_t*)g_timer_mgr, free_handle_cb);
+        } else {
+            GOC_DBG("goc_timer_manager_shutdown: timer_mgr already closing=%p active=%d closing=%d has_ref=%d\n",
+                    (void*)g_timer_mgr,
+                    uv_is_active((uv_handle_t*)g_timer_mgr),
+                    uv_is_closing((uv_handle_t*)g_timer_mgr),
+                    uv_has_ref((uv_handle_t*)g_timer_mgr));
+        }
         g_timer_mgr = NULL;
     } else {
         GOC_DBG("goc_timer_manager_shutdown: no g_timer_mgr to close\n");
@@ -669,13 +858,14 @@ static void close_remaining_handle_cb(uv_handle_t *h, void *arg)
     }
 
     if (h == (uv_handle_t *)g_wakeup_raw ||
-        h == (uv_handle_t *)g_shutdown_async) {
-        GOC_DBG("shutdown uv_walk skip internal handle=%p type=%s active=%d has_ref=%d\n",
+        h == (uv_handle_t *)g_shutdown_async ||
+        h == (uv_handle_t *)g_timer_mgr) {
+        GOC_DBG("shutdown uv_walk close internal handle=%p type=%s active=%d has_ref=%d\n",
                 (void*)h,
                 uv_handle_type_name(uv_handle_get_type(h)),
                 uv_is_active(h),
                 uv_has_ref(h));
-        return;
+        /* fall through and close internal handles too */
     }
 
     GOC_DBG("shutdown uv_walk close: handle=%p type=%s active=%d has_ref=%d closing=%d loop=%p data=%p\n",
@@ -698,6 +888,7 @@ static void on_wakeup_closed(uv_handle_t *h)
     /* Set g_wakeup to NULL only once libuv guarantees no further callbacks
      * will fire for this handle, preventing a race with post_callback. */
     atomic_store_explicit(&g_wakeup, NULL, memory_order_release);
+    atomic_store_explicit(&g_wakeup_pending, 0, memory_order_release);
     free(h);
     goc_uv_callback_exit("on_wakeup_closed");
 }
@@ -716,6 +907,23 @@ static void on_wakeup_closed(uv_handle_t *h)
 static void loop_process_pending_put(goc_entry *e)
 {
     goc_chan *ch = e->ch;
+    int cancelled = atomic_load_explicit(&e->cancelled, memory_order_relaxed);
+    int woken = atomic_load_explicit(&e->woken, memory_order_relaxed);
+    const char *fired_flag = "<none>";
+    if (e->fired) {
+        fired_flag = atomic_load_explicit(e->fired, memory_order_relaxed) ? "1" : "0";
+    }
+    GOC_DBG("loop_process_pending_put: entry=%p id=%llu ch=%p tag=%s kind=%d cancelled=%d woken=%d fired=%p fired_flag=%s is_put=%d\n",
+            (void*)e,
+            (unsigned long long)e->id,
+            (void*)e->ch,
+            e->ch ? goc_chan_get_debug_tag(e->ch) : "<none>",
+            (int)e->kind,
+            cancelled,
+            woken,
+            (void*)e->fired,
+            fired_flag,
+            (int)e->is_put);
     e->ch = NULL;   /* clear so a future drain_cb_queue pass skips this entry */
 
     goc_entry *fe_taker = NULL;
@@ -745,12 +953,13 @@ static void loop_process_pending_put(goc_entry *e)
     }
 
     /* Parked taker available: deliver directly. */
-    if (chan_put_to_taker_claim(ch, e->put_val, &fe_taker)) {
+    uint64_t want = 0;
+    if (chan_put_to_taker_claim(ch, e->put_val, &fe_taker, &want)) {
         e->ok = GOC_OK;
         uv_mutex_unlock(ch->lock);
         if (fe_taker != NULL) {
             long spin = 0;
-            while (atomic_load_explicit(&fe_taker->parked, memory_order_acquire) == 0) {
+            while (atomic_load_explicit(&fe_taker->parked, memory_order_acquire) != want) {
                 sched_yield();
             }
             post_to_run_queue(fe_taker->pool, fe_taker);
@@ -777,6 +986,23 @@ static void loop_process_pending_put(goc_entry *e)
 static void loop_process_pending_take(goc_entry *e)
 {
     goc_chan *ch = e->ch;
+    int cancelled = atomic_load_explicit(&e->cancelled, memory_order_relaxed);
+    int woken = atomic_load_explicit(&e->woken, memory_order_relaxed);
+    const char *fired_flag = "<none>";
+    if (e->fired) {
+        fired_flag = atomic_load_explicit(e->fired, memory_order_relaxed) ? "1" : "0";
+    }
+    GOC_DBG("loop_process_pending_take: entry=%p id=%llu ch=%p tag=%s kind=%d cancelled=%d woken=%d fired=%p fired_flag=%s is_put=%d\n",
+            (void*)e,
+            (unsigned long long)e->id,
+            (void*)e->ch,
+            e->ch ? goc_chan_get_debug_tag(e->ch) : "<none>",
+            (int)e->kind,
+            cancelled,
+            woken,
+            (void*)e->fired,
+            fired_flag,
+            (int)e->is_put);
     e->ch = NULL;   /* clear so a future drain_cb_queue pass skips this entry */
 
     void *val = NULL;
@@ -798,13 +1024,14 @@ static void loop_process_pending_take(goc_entry *e)
     }
 
     /* Value available from parked putter. */
-    if (chan_take_from_putter_claim(ch, &val, &fe_putter)) {
+    uint64_t want = 0;
+    if (chan_take_from_putter_claim(ch, &val, &fe_putter, &want)) {
         e->cb_result = val;
         e->ok = GOC_OK;
         uv_mutex_unlock(ch->lock);
         if (fe_putter != NULL) {
             long spin = 0;
-            while (atomic_load_explicit(&fe_putter->parked, memory_order_acquire) == 0) {
+            while (atomic_load_explicit(&fe_putter->parked, memory_order_acquire) != want) {
                 sched_yield();
                 if (++spin == 10000000L) {
                     GOC_DBG("loop_process_pending_take: SPIN STALL >10M ch=%p fe_putter=%p\n",
@@ -838,8 +1065,28 @@ static void drain_cb_queue(void)
     goc_entry *e;
     int iter = 0;
     size_t budget = GOC_CB_DRAIN_BUDGET;
+    size_t processed = 0;
     while (budget-- > 0 && (e = cb_queue_pop()) != NULL) {
         ++iter;
+        ++processed;
+        const char *ch_tag = e->ch ? goc_chan_get_debug_tag(e->ch) : NULL;
+        int cancelled = atomic_load_explicit(&e->cancelled, memory_order_relaxed);
+        int woken = atomic_load_explicit(&e->woken, memory_order_relaxed);
+        const char *fired_flag = "<none>";
+        if (e->fired) {
+            fired_flag = atomic_load_explicit(e->fired, memory_order_relaxed) ? "1" : "0";
+        }
+        GOC_DBG("drain_cb_queue: processing callback entry=%p id=%llu ch=%p tag=%s kind=%d is_put=%d cancelled=%d woken=%d fired=%p fired_flag=%s free_on_drain=%d\n",
+                (void*)e,
+                (unsigned long long)e->id,
+                (void*)e->ch,
+                ch_tag ? ch_tag : "<none>",
+                (int)e->kind, (int)e->is_put,
+                cancelled,
+                woken,
+                (void*)e->fired,
+                fired_flag,
+                (int)e->free_on_drain);
         if (e->kind != GOC_CALLBACK)
             continue;
 
@@ -849,28 +1096,69 @@ static void drain_cb_queue(void)
         if (e->ch != NULL &&
             !atomic_load_explicit(&e->woken, memory_order_acquire)) {
             if (e->is_put) {
+                GOC_DBG("drain_cb_queue: pending put op e=%p ch=%p tag=%s\n",
+                        (void*)e, (void*)e->ch,
+                        e->ch ? goc_chan_get_debug_tag(e->ch) : "<none>");
                 loop_process_pending_put(e);
+                GOC_DBG("drain_cb_queue: pending put processed e=%p ch=%p tag=%s ok=%d\n",
+                        (void*)e, (void*)e->ch,
+                        e->ch ? goc_chan_get_debug_tag(e->ch) : "<none>",
+                        (int)e->ok);
             } else {
+                GOC_DBG("drain_cb_queue: pending take op e=%p ch=%p tag=%s\n",
+                        (void*)e, (void*)e->ch,
+                        e->ch ? goc_chan_get_debug_tag(e->ch) : "<none>");
                 loop_process_pending_take(e);
+                GOC_DBG("drain_cb_queue: pending take processed e=%p ch=%p tag=%s ok=%d\n",
+                        (void*)e, (void*)e->ch,
+                        e->ch ? goc_chan_get_debug_tag(e->ch) : "<none>",
+                        (int)e->ok);
             }
             continue;
         }
 
         /* Already claimed by wake(): fire the callback. */
-        bool fod = e->free_on_drain;
-        if (e->cb)
+        bool free_on_drain = e->free_on_drain;
+        if (e->cb) {
+            GOC_DBG("drain_cb_queue: firing cb e=%p id=%llu ch=%p tag=%s ok=%d cb=%p result=%p\n",
+                    (void*)e,
+                    (unsigned long long)e->id,
+                    (void*)e->ch,
+                    ch_tag ? ch_tag : "<none>",
+                    (int)e->ok,
+                    (void*)(uintptr_t)e->cb,
+                    e->cb_result);
             e->cb(e->ch, e->cb_result, e->ok, e->ud);
-        else if (e->put_cb)
+        } else if (e->put_cb) {
+            GOC_DBG("drain_cb_queue: firing put_cb e=%p id=%llu ch=%p tag=%s ok=%d put_cb=%p put_val=%p\n",
+                    (void*)e,
+                    (unsigned long long)e->id,
+                    (void*)e->ch,
+                    ch_tag ? ch_tag : "<none>",
+                    (int)e->ok,
+                    (void*)(uintptr_t)e->put_cb,
+                    e->put_val);
             e->put_cb(e->ch, e->put_val, e->ok, e->ud);
-        if (fod) free(e);
+        } else {
+            GOC_DBG("drain_cb_queue: callback entry e=%p has no cb or put_cb\n",
+                    (void*)e);
+        }
+        if (free_on_drain) free(e);
     }
 
     /* More callbacks queued? Yield back to libuv and request another wakeup
      * pass instead of monopolizing the loop thread in one giant drain. */
-    if (atomic_load_explicit(&g_cb_queue_depth, memory_order_relaxed) > 0) {
-        uv_async_t *w = atomic_load_explicit(&g_wakeup, memory_order_acquire);
-        if (w)
-            uv_async_send(w);
+    size_t after_depth = atomic_load_explicit(&g_cb_queue_depth, memory_order_relaxed);
+    GOC_DBG("drain_cb_queue: processed=%zu depth_after=%zu pending=%d state=%d\n",
+            processed,
+            after_depth,
+            atomic_load_explicit(&g_wakeup_pending, memory_order_relaxed),
+            atomic_load_explicit(&g_loop_state, memory_order_relaxed));
+
+    if (after_depth > 0) {
+        GOC_DBG("drain_cb_queue: queue non-empty after drain depth=%zu, sending wakeup\n",
+                after_depth);
+        wakeup_send_if_needed();
     }
 }
 
@@ -878,18 +1166,40 @@ static void drain_cb_queue(void)
 static void on_wakeup(uv_async_t *h)
 {
     (void)h;
+    int pending_before = atomic_load_explicit(&g_wakeup_pending, memory_order_relaxed);
+    size_t depth_before = atomic_load_explicit(&g_cb_queue_depth, memory_order_relaxed);
+    long wakeup_id = ++g_wakeup_count;
+    GOC_DBG("on_wakeup: #%ld pending_before=%d depth_before=%zu\n",
+            wakeup_id,
+            pending_before,
+            depth_before);
+    atomic_store_explicit(&g_wakeup_pending, 0, memory_order_release);
     goc_uv_callback_enter("on_wakeup");
-    GOC_DBG("on_wakeup: entered g_loop=%p g_wakeup_raw=%p active=%d closing=%d loop_alive=%d depth=%zu\n",
+    GOC_DBG("on_wakeup: entered g_loop=%p g_wakeup_raw=%p active=%d closing=%d has_ref=%d loop_alive=%d depth=%zu\n",
             (void*)g_loop,
             (void*)g_wakeup_raw,
             g_wakeup_raw ? uv_is_active((uv_handle_t*)g_wakeup_raw) : -1,
             g_wakeup_raw ? uv_is_closing((uv_handle_t*)g_wakeup_raw) : -1,
+            g_wakeup_raw ? uv_has_ref((uv_handle_t*)g_wakeup_raw) : -1,
             g_loop ? uv_loop_alive(g_loop) : -1,
             atomic_load_explicit(&g_cb_queue_depth, memory_order_relaxed));
+    GOC_DBG("on_wakeup: cb_queue depth_before=%zu\n",
+            atomic_load_explicit(&g_cb_queue_depth, memory_order_relaxed));
     drain_cb_queue_guarded();
+    size_t depth_after = atomic_load_explicit(&g_cb_queue_depth, memory_order_relaxed);
+    GOC_DBG("on_wakeup: after drain g_loop=%p depth=%zu hwm=%zu state=%d wakeup=%p active=%d closing=%d has_ref=%d pending_after=%d\n",
+            (void*)g_loop,
+            depth_after,
+            atomic_load_explicit(&g_cb_queue_hwm, memory_order_relaxed),
+            atomic_load_explicit(&g_loop_state, memory_order_relaxed),
+            (void*)g_wakeup_raw,
+            g_wakeup_raw ? uv_is_active((uv_handle_t*)g_wakeup_raw) : -1,
+            g_wakeup_raw ? uv_is_closing((uv_handle_t*)g_wakeup_raw) : -1,
+            g_wakeup_raw ? uv_has_ref((uv_handle_t*)g_wakeup_raw) : -1,
+            atomic_load_explicit(&g_wakeup_pending, memory_order_relaxed));
     GOC_DBG("on_wakeup: exit g_loop=%p depth=%zu\n",
             (void*)g_loop,
-            atomic_load_explicit(&g_cb_queue_depth, memory_order_relaxed));
+            depth_after);
     goc_uv_callback_exit("on_wakeup");
 }
 
@@ -900,9 +1210,23 @@ static void on_shutdown_signal(uv_async_t *h)
 {
     (void)h;
     goc_uv_callback_enter("on_shutdown_signal");
-    GOC_DBG("on_shutdown_signal: entered g_loop=%p g_shutdown_async=%p g_wakeup_raw=%p g_wakeup=%p alive=%d state=%d depth=%zu hwm=%zu\n",
-            (void*)g_loop, (void*)g_shutdown_async, (void*)g_wakeup_raw,
+    int wakeup_active = g_wakeup_raw ? uv_is_active((uv_handle_t*)g_wakeup_raw) : -1;
+    int wakeup_closing = g_wakeup_raw ? uv_is_closing((uv_handle_t*)g_wakeup_raw) : -1;
+    int wakeup_has_ref = g_wakeup_raw ? uv_has_ref((uv_handle_t*)g_wakeup_raw) : -1;
+    int shutdown_active = g_shutdown_async ? uv_is_active((uv_handle_t*)g_shutdown_async) : -1;
+    int shutdown_closing = g_shutdown_async ? uv_is_closing((uv_handle_t*)g_shutdown_async) : -1;
+    int shutdown_has_ref = g_shutdown_async ? uv_has_ref((uv_handle_t*)g_shutdown_async) : -1;
+    GOC_DBG("on_shutdown_signal: entered g_loop=%p g_shutdown_async=%p shutdown_active=%d shutdown_closing=%d shutdown_has_ref=%d g_wakeup_raw=%p wakeup_active=%d wakeup_closing=%d wakeup_has_ref=%d g_wakeup=%p g_wakeup_pending=%d alive=%d state=%d depth=%zu hwm=%zu\n",
+            (void*)g_loop, (void*)g_shutdown_async,
+            shutdown_active,
+            shutdown_closing,
+            shutdown_has_ref,
+            (void*)g_wakeup_raw,
+            wakeup_active,
+            wakeup_closing,
+            wakeup_has_ref,
             (void*)atomic_load_explicit(&g_wakeup, memory_order_relaxed),
+            atomic_load_explicit(&g_wakeup_pending, memory_order_relaxed),
             g_loop ? uv_loop_alive(g_loop) : -1,
             atomic_load_explicit(&g_loop_state, memory_order_relaxed),
             atomic_load_explicit(&g_cb_queue_depth, memory_order_relaxed),
@@ -1028,6 +1352,28 @@ static void loop_thread_fn(void *arg)
                 ret, iter, (void*)g_loop, uv_loop_alive(g_loop),
                 atomic_load_explicit(&g_loop_state, memory_order_relaxed),
                 atomic_load_explicit(&g_cb_queue_depth, memory_order_relaxed));
+        if (ret == 1) {
+            int wakeup_has_ref = g_wakeup_raw ? uv_has_ref((uv_handle_t*)g_wakeup_raw) : -1;
+            int shutdown_has_ref = g_shutdown_async ? uv_has_ref((uv_handle_t*)g_shutdown_async) : -1;
+            int timer_has_ref = g_timer_mgr ? uv_has_ref((uv_handle_t*)g_timer_mgr) : -1;
+            size_t deferred_unreg_len = goc_deferred_handle_unreg_len();
+            size_t deferred_close_len = goc_deferred_close_len();
+            GOC_DBG("loop_thread_fn: uv_run(ONCE) returned 1 with handle_count=%zu cb_depth=%zu hwm=%zu g_loop_state=%d alive=%d g_wakeup=%p g_shutdown_async=%p g_wakeup_pending=%d g_wakeup_has_ref=%d g_shutdown_async_has_ref=%d g_timer_mgr_has_ref=%d deferred_unreg=%zu deferred_close=%zu\n",
+                    post_loop_count,
+                    atomic_load_explicit(&g_cb_queue_depth, memory_order_relaxed),
+                    atomic_load_explicit(&g_cb_queue_hwm, memory_order_relaxed),
+                    atomic_load_explicit(&g_loop_state, memory_order_relaxed),
+                    g_loop ? uv_loop_alive(g_loop) : -1,
+                    (void*)g_wakeup_raw,
+                    (void*)g_shutdown_async,
+                    atomic_load_explicit(&g_wakeup_pending, memory_order_relaxed),
+                    wakeup_has_ref,
+                    shutdown_has_ref,
+                    timer_has_ref,
+                    deferred_unreg_len,
+                    deferred_close_len);
+            goc_uv_walk_log(g_loop, "loop_thread_fn: post-uv_run(ONCE) ret=1 live handles");
+        }
         if (iter % 500 == 0) {
             GOC_DBG("loop_thread_fn: after UV_RUN iter=%ld ret=%d depth=%zu\n",
                     iter, ret, atomic_load_explicit(&g_cb_queue_depth, memory_order_relaxed));
@@ -1133,6 +1479,11 @@ void loop_init(void)
     assert(g_wakeup_raw);
     rc = uv_async_init(g_loop, g_wakeup_raw, on_wakeup);
     goc_uv_init_log("uv_async_init wakeup", rc, g_loop, (uv_handle_t*)g_wakeup_raw);
+    GOC_DBG("loop_init: g_wakeup_raw=%p active=%d closing=%d has_ref=%d\n",
+            (void*)g_wakeup_raw,
+            uv_is_active((uv_handle_t*)g_wakeup_raw),
+            uv_is_closing((uv_handle_t*)g_wakeup_raw),
+            uv_has_ref((uv_handle_t*)g_wakeup_raw));
 
     /* 3. Publish wakeup pointer atomically. */
     atomic_store_explicit(&g_wakeup, g_wakeup_raw, memory_order_release);
@@ -1143,6 +1494,7 @@ void loop_init(void)
     assert(g_shutdown_async);
     rc = uv_async_init(g_loop, g_shutdown_async, on_shutdown_signal);
     goc_uv_init_log("uv_async_init shutdown", rc, g_loop, (uv_handle_t*)g_shutdown_async);
+    uv_unref((uv_handle_t*)g_shutdown_async);
 
     /* 5. Initialise the MPSC callback queue. */
     cb_queue_init();
@@ -1181,40 +1533,51 @@ void loop_shutdown(void)
     }
     uv_mutex_unlock(&g_loop_submit_lock);
 
-    bool shutdown_sent = false;
-    if (atomic_exchange_explicit(&g_shutdown_requested, 1, memory_order_acq_rel) == 0) {
-        shutdown_sent = true;
-    } else {
-        GOC_DBG("loop_shutdown: shutdown already requested, skipping uv_async_send shutdown_async=%p\n",
-                (void*)g_shutdown_async);
-    }
-    GOC_DBG("loop_shutdown: g_loop_state set to SHUTTING_DOWN g_loop=%p state=%d g_shutdown_async=%p active=%d closing=%d shutdown_sent=%d\n",
+    GOC_DBG("loop_shutdown: g_loop_state set to SHUTTING_DOWN g_loop=%p state=%d g_shutdown_async=%p active=%d closing=%d\n",
             (void*)g_loop,
             atomic_load_explicit(&g_loop_state, memory_order_relaxed),
             (void*)g_shutdown_async,
             g_shutdown_async ? uv_is_active((uv_handle_t*)g_shutdown_async) : -1,
-            g_shutdown_async ? uv_is_closing((uv_handle_t*)g_shutdown_async) : -1,
-            shutdown_sent);
+            g_shutdown_async ? uv_is_closing((uv_handle_t*)g_shutdown_async) : -1);
 
     /* Signal the loop thread to drain, close handles, and exit. */
-    GOC_DBG("loop_shutdown: before uv_async_send shutdown_async=%p active=%d closing=%d timer_heap_len=%zu\n",
+    uv_async_t *wake = atomic_load_explicit(&g_wakeup, memory_order_acquire);
+    GOC_DBG("loop_shutdown: before uv_async_send shutdown_async=%p active=%d closing=%d has_ref=%d g_wakeup=%p wake_active=%d wake_closing=%d wake_has_ref=%d timer_heap_len=%zu\n",
             (void*)g_shutdown_async,
             g_shutdown_async ? uv_is_active((uv_handle_t*)g_shutdown_async) : -1,
             g_shutdown_async ? uv_is_closing((uv_handle_t*)g_shutdown_async) : -1,
+            g_shutdown_async ? uv_has_ref((uv_handle_t*)g_shutdown_async) : -1,
+            (void*)wake,
+            wake ? uv_is_active((uv_handle_t*)wake) : -1,
+            wake ? uv_is_closing((uv_handle_t*)wake) : -1,
+            wake ? uv_has_ref((uv_handle_t*)wake) : -1,
             g_timer_heap_len);
     int rcs = UV_EINVAL;
-    if (shutdown_sent) {
-        if (g_shutdown_async && !uv_is_closing((uv_handle_t*)g_shutdown_async)) {
-            rcs = uv_async_send(g_shutdown_async);
-        } else {
-            GOC_DBG("loop_shutdown: shutdown_async closing or missing, skipping uv_async_send shutdown_async=%p active=%d closing=%d\n",
-                    (void*)g_shutdown_async,
-                    g_shutdown_async ? uv_is_active((uv_handle_t*)g_shutdown_async) : -1,
-                    g_shutdown_async ? uv_is_closing((uv_handle_t*)g_shutdown_async) : -1);
-        }
+    if (g_shutdown_async && !uv_is_closing((uv_handle_t*)g_shutdown_async)) {
+        rcs = uv_async_send(g_shutdown_async);
     } else {
-        GOC_DBG("loop_shutdown: shutdown send suppressed because request already pending shutdown_async=%p\n",
-                (void*)g_shutdown_async);
+        GOC_DBG("loop_shutdown: shutdown_async closing or missing, skipping uv_async_send shutdown_async=%p active=%d closing=%d\n",
+                (void*)g_shutdown_async,
+                g_shutdown_async ? uv_is_active((uv_handle_t*)g_shutdown_async) : -1,
+                g_shutdown_async ? uv_is_closing((uv_handle_t*)g_shutdown_async) : -1);
+    }
+    if (rcs < 0) {
+        uv_async_t *wake = atomic_load_explicit(&g_wakeup, memory_order_acquire);
+        if (wake && !uv_is_closing((uv_handle_t*)wake)) {
+            int wake_rc = uv_async_send(wake);
+            GOC_DBG("loop_shutdown: uv_async_send(shutdown_async) rc=%d, fallback wakeup rc=%d wake=%p active=%d closing=%d\n",
+                    rcs,
+                    wake_rc,
+                    (void*)wake,
+                    uv_is_active((uv_handle_t*)wake),
+                    uv_is_closing((uv_handle_t*)wake));
+        } else {
+            GOC_DBG("loop_shutdown: uv_async_send(shutdown_async) rc=%d and fallback wakeup unavailable wake=%p active=%d closing=%d\n",
+                    rcs,
+                    (void*)wake,
+                    wake ? uv_is_active((uv_handle_t*)wake) : -1,
+                    wake ? uv_is_closing((uv_handle_t*)wake) : -1);
+        }
     }
     GOC_DBG("loop_shutdown: shutdown send rc=%d g_shutdown_async=%p active=%d closing=%d timer_heap_len=%zu\n", rcs,
             (void*)g_shutdown_async,
@@ -1230,93 +1593,29 @@ void loop_shutdown(void)
             atomic_load_explicit(&g_cb_queue_depth, memory_order_relaxed),
             atomic_load_explicit(&g_cb_queue_hwm, memory_order_relaxed),
             atomic_load_explicit(&g_loop_state, memory_order_relaxed));
-    GOC_DBG("loop_shutdown: done\n");
 
-    /* All handles are closed; the loop should be idle. */
-    size_t walk_handles = 0;
-    uv_walk(g_loop, close_remaining_handle_cb, &walk_handles);
-    GOC_DBG("loop_shutdown: after uv_walk g_loop=%p alive=%d walk_handles=%zu state=%d\n",
-            (void*)g_loop,
-            uv_loop_alive(g_loop),
-            walk_handles,
-            atomic_load_explicit(&g_loop_state, memory_order_relaxed));
-    size_t loop_shutdown_count = 0;
-    uv_walk(g_loop, loop_walk_handle_cb, &loop_shutdown_count);
-    GOC_DBG("loop_shutdown: pre-final uv_run handle count=%zu g_loop=%p alive=%d\n",
-            loop_shutdown_count, (void*)g_loop, uv_loop_alive(g_loop));
-    GOC_DBG("loop_shutdown: final uv_run(NOWAIT) before uv_loop_close g_loop=%p\n",
-            (void*)g_loop);
-    g_loop->stop_flag = 1;
-    uv_run(g_loop, UV_RUN_NOWAIT);
+    GOC_DBG("loop_shutdown: close all remaining handles g_loop=%p\n", (void*)g_loop);
+    uv_walk(g_loop, close_remaining_handle_cb, NULL);
 
-    int abandon_loop_close = 0;
-    while (true) {
-        size_t close_handle_count = 0;
-        uv_walk(g_loop, loop_walk_handle_cb, &close_handle_count);
-        int pre_close_alive = uv_loop_alive(g_loop);
-        GOC_DBG("loop_shutdown: before uv_loop_close g_loop=%p alive=%d handle_count=%zu\n",
-                (void*)g_loop, pre_close_alive, close_handle_count);
-        if (!pre_close_alive && close_handle_count == 0) {
-            GOC_DBG("loop_shutdown: loop is already dead with no handles before uv_loop_close, skipping close g_loop=%p\n",
-                    (void*)g_loop);
-            break;
-        }
-        int loop_close_rc = uv_loop_close(g_loop);
-        int loop_alive = uv_loop_alive(g_loop);
-        GOC_DBG("loop_shutdown: uv_loop_close g_loop=%p rc=%d alive=%d depth=%zu hwm=%zu state=%d\n",
-                (void*)g_loop,
-                loop_close_rc,
-                loop_alive,
-                atomic_load_explicit(&g_cb_queue_depth, memory_order_relaxed),
-                atomic_load_explicit(&g_cb_queue_hwm, memory_order_relaxed),
-                atomic_load_explicit(&g_loop_state, memory_order_relaxed));
+    GOC_DBG("loop_shutdown: final uv_run DEFAULT g_loop=%p\n", (void*)g_loop);
+    uv_run(g_loop, UV_RUN_DEFAULT);
 
-        if (loop_close_rc == 0 && !loop_alive)
-            break;
-
-        if (loop_close_rc == 0 && loop_alive) {
-            GOC_DBG("loop_shutdown: uv_loop_close returned 0 but loop still alive, abandoning close and preserving g_loop=%p alive=%d\n",
-                    (void*)g_loop, loop_alive);
-            abandon_loop_close = true;
-            break;
-        }
-
-        if (loop_close_rc == UV_EBUSY) {
-            size_t busy_handle_count = 0;
-            GOC_DBG("loop_shutdown: uv_loop_close busy, dumping remaining handles g_loop=%p\n",
-                    (void*)g_loop);
-            uv_walk(g_loop, loop_walk_handle_cb, &busy_handle_count);
-            GOC_DBG("loop_shutdown: uv_loop_close busy handle_count=%zu g_loop=%p\n",
-                    busy_handle_count, (void*)g_loop);
-        }
-
-        if (loop_close_rc != 0 && loop_close_rc != UV_EBUSY) {
-            GOC_DBG("loop_shutdown: uv_loop_close unexpected rc=%d g_loop=%p alive=%d\n",
-                    loop_close_rc, (void*)g_loop, uv_loop_alive(g_loop));
-            break;
-        }
-
-        uv_walk(g_loop, close_remaining_handle_cb, NULL);
-        while (uv_loop_alive(g_loop)) {
-            size_t loop_count = 0;
-            uv_walk(g_loop, loop_walk_handle_cb, &loop_count);
-            GOC_DBG("loop_shutdown: retry uv_run DEFAULT g_loop=%p alive=%d handle_count=%zu\n",
-                    (void*)g_loop, uv_loop_alive(g_loop), loop_count);
-            int run_rc = uv_run(g_loop, UV_RUN_DEFAULT);
-            GOC_DBG("loop_shutdown: retry uv_run DEFAULT rc=%d g_loop=%p alive=%d\n",
-                    run_rc, (void*)g_loop, uv_loop_alive(g_loop));
-            uv_walk(g_loop, close_remaining_handle_cb, NULL);
-        }
+    GOC_DBG("loop_shutdown: uv_loop_close g_loop=%p alive=%d\n",
+            (void*)g_loop, uv_loop_alive(g_loop));
+    int loop_close_rc = uv_loop_close(g_loop);
+    if (loop_close_rc != 0) {
+        GOC_DBG("loop_shutdown: uv_loop_close failed rc=%d g_loop=%p alive=%d\n",
+                loop_close_rc, (void*)g_loop, uv_loop_alive(g_loop));
     }
 
     uv_mutex_destroy(&g_loop_submit_lock);
     atomic_store_explicit(&g_loop_state, GOC_LOOP_STATE_STOPPED,
                           memory_order_release);
-    if (!abandon_loop_close) {
+    if (loop_close_rc == 0) {
         free(g_loop);
         g_loop = NULL;
     } else {
-        GOC_DBG("loop_shutdown: preserved g_loop=%p after abandoning uv_loop_close\n",
+        GOC_DBG("loop_shutdown: preserved g_loop=%p after uv_loop_close failure\n",
                 (void*)g_loop);
     }
 }

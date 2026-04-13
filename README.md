@@ -487,7 +487,7 @@ These functions may suspend the calling fiber. **Call only from inside a fiber**
 |---|---|---|
 | `goc_take` | `goc_val_t* goc_take(goc_chan* ch)` | Receive the next value from `ch`. Blocks until a value is available or the channel is closed. Returns a GC-managed pointer to `{val, GOC_OK}` on success, `{NULL, GOC_CLOSED}` on close. Asserts that the caller is running inside a fiber — calling from a bare OS thread aborts with a clear message. |
 | `goc_put` | `goc_status_t goc_put(goc_chan* ch, void* val)` | Send `val` into `ch`. Blocks until a receiver accepts or the channel is closed. Returns `GOC_OK` on success, `GOC_CLOSED` on close. Asserts that the caller is running inside a fiber — calling from a bare OS thread aborts with a clear message. |
-| `goc_take_all` | `goc_val_t** goc_take_all(goc_chan** chs, size_t n)` | Receive from every channel in `chs[0..n-1]` in order, suspending on each one in turn. Returns a GC-managed array of `n` `goc_val_t*` results in the same order as `chs[]`. Each element follows `goc_take` semantics: `{val, GOC_OK}` on success, `{NULL, GOC_CLOSED}` on close. Must only be called from a fiber. |
+| `goc_take_all` | `goc_val_t** goc_take_all(goc_chan** chs, size_t n)` | Start a concurrent receive on every channel in `chs[0..n-1]`, then wait for all results. Returns a GC-managed array of `n` `goc_val_t*` results in the same order as `chs[]`. Each element follows `goc_take` semantics: `{val, GOC_OK}` on success, `{NULL, GOC_CLOSED}` on close. Must only be called from a fiber. |
 
 ---
 
@@ -499,7 +499,7 @@ Blocks the calling OS thread (not a fiber). Calling these from a fiber is a runt
 |---|---|---|
 | `goc_take_sync` | `goc_val_t* goc_take_sync(goc_chan* ch)` | Receive a value, blocking the OS thread. Returns a GC-managed pointer to `{val, GOC_OK}` on success, `{NULL, GOC_CLOSED}` on close. |
 | `goc_put_sync` | `goc_status_t goc_put_sync(goc_chan* ch, void* val)` | Send `val`, blocking the OS thread. Returns `GOC_OK` on success, `GOC_CLOSED` on close. |
-| `goc_take_all_sync` | `goc_val_t** goc_take_all_sync(goc_chan** chs, size_t n)` | Receive from every channel in `chs[0..n-1]` in order, blocking the OS thread on each one in turn. Returns a GC-managed array of `n` `goc_val_t*` results in the same order as `chs[]`. Each element follows `goc_take_sync` semantics: `{val, GOC_OK}` on success, `{NULL, GOC_CLOSED}` on close. Must not be called from a fiber. |
+| `goc_take_all_sync` | `goc_val_t** goc_take_all_sync(goc_chan** chs, size_t n)` | Start a concurrent receive on every channel in `chs[0..n-1]`, then block the OS thread until all results are ready. Returns a GC-managed array of `n` `goc_val_t*` results in the same order as `chs[]`. Each element follows `goc_take_sync` semantics: `{val, GOC_OK}` on success, `{NULL, GOC_CLOSED}` on close. Must not be called from a fiber. |
 
 ---
 
@@ -618,7 +618,7 @@ goc_close(w);          /* release */
 
 The default pool is created by `goc_init` with `max(4, hardware_concurrency)` worker threads. This can be overridden by setting the `GOC_POOL_THREADS` environment variable to a positive integer before calling `goc_init`. Invalid values (non-numeric, zero, or negative) are silently ignored and the default is used.
 
-Pass `-DLIBGOC_DEBUG=ON` to CMake to enable verbose `[GOC_DBG]` diagnostic output to `stderr` from the scheduler, I/O, and HTTP layers at compile time. Off by default.
+Pass `-DLIBGOC_DEBUG=ON` to CMake to enable verbose timestamped `[GOC_DBG]` diagnostic output to `stderr` from the scheduler, I/O, and HTTP layers at compile time. In debug builds, output is buffered in-process and flushed automatically on exit or crash. Off by default.
 
 ```c
 typedef enum {

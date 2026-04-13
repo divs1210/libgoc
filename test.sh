@@ -6,6 +6,34 @@ set -o pipefail
 BUILD_DIR="${BUILD_DIR:-build}"
 LOG_FILE="${LOG_FILE:-test.log}"
 WATCH_MODE="${WATCH:-0}"
+DEBUG_BUILD="0"
+
+usage() {
+    echo "Usage: $0 [-dbg <0|1>]"
+    echo "  -dbg  Build with LIBGOC_DEBUG=ON when 1, OFF when 0. Default: 0."
+    exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -dbg)
+            shift
+            if [[ $# -eq 0 || ! "$1" =~ ^[01]$ ]]; then
+                echo "Error: -dbg requires 0 or 1."
+                usage
+            fi
+            DEBUG_BUILD="$1"
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            echo "Error: Unknown option '$1'."
+            usage
+            ;;
+    esac
+done
 
 # Truncate and stream all output (stdout+stderr) to console and log file.
 exec > >(tee "$LOG_FILE") 2>&1
@@ -15,7 +43,7 @@ FAILED_TESTS=()
 configure_build() {
     cmake -S . -B "$BUILD_DIR" \
         -DGOC_ENABLE_STATS=ON \
-        -DLIBGOC_DEBUG=ON
+        -DLIBGOC_DEBUG="$DEBUG_BUILD"
 }
 
 build_project() {
@@ -96,10 +124,15 @@ run_cycle() {
 
 rm -rf "$BUILD_DIR"
 
+debug_status="OFF"
+if [[ "$DEBUG_BUILD" == "1" ]]; then
+    debug_status="ON"
+fi
+
 echo "== libgoc test runner =="
 echo "Build dir : $BUILD_DIR"
 echo "Log file  : $LOG_FILE"
-echo "Debug     : LIBGOC_DEBUG=ON"
+echo "Debug     : LIBGOC_DEBUG=$debug_status"
 echo "Watch mode: $WATCH_MODE"
 
 last_status=0

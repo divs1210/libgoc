@@ -31,16 +31,31 @@
 #  define strcasecmp  _stricmp
 #else
 #  include <strings.h>
+#  include <unistd.h>
+#  include <sys/socket.h>
 #endif
 #include <stdio.h>
 #include <ctype.h>
 #include <assert.h>
+#include <errno.h>
+
+static void http_client_fiber(void* arg);
+void (*g_http_client_fiber_ptr)(void*) = http_client_fiber;
+#include <stdbool.h>
 #include <stdatomic.h>
+#include <uv.h>
 #if defined(SO_REUSEPORT)
-#  include <sys/socket.h>
-#  include <uv.h>
 #  define GOC_HTTP_REUSEPORT 1
+#else
+#  define GOC_HTTP_REUSEPORT 0
 #endif
+
+#if defined(GOC_HTTP_REUSEPORT) && defined(__linux__)
+#  define GOC_HTTP_REUSEPORT_LINUX 1
+#else
+#  define GOC_HTTP_REUSEPORT_LINUX 0
+#endif
+
 #include "../vendor/picohttpparser/picohttpparser.h"
 #include "../include/goc_http.h"
 #include "../include/goc_io.h"
@@ -60,6 +75,44 @@ static goc_val_t* goc_http_chan_take(goc_chan* ch)
 static goc_status_t goc_http_chan_put(goc_chan* ch, void* val)
 {
     return goc_in_fiber() ? goc_put(ch, val) : goc_put_sync(ch, val);
+}
+
+#if GOC_HTTP_REUSEPORT_LINUX
+static bool goc_http_reuseport_supported(int family)
+{
+    int fd = socket(family, SOCK_STREAM, 0);
+    if (fd < 0)
+        return false;
+
+    int optval = 1;
+    int rc = setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
+    int saved_errno = errno;
+    close(fd);
+    if (rc < 0) {
+        GOC_DBG(
+                "goc_http_reuseport_supported: SO_REUSEPORT unsupported family=%d errno=%d\n",
+                family, saved_errno);
+    }
+    return rc == 0;
+}
+#endif
+
+typedef struct {
+    goc_chan* ready_ch;
+    goc_chan* internal_ready_ch;
+} goc_http_listen_ready_forward_arg_t;
+
+static void goc_http_listen_ready_forward(void* arg)
+{
+    goc_http_listen_ready_forward_arg_t* f =
+        (goc_http_listen_ready_forward_arg_t*)arg;
+    goc_val_t* v = goc_http_chan_take(f->internal_ready_ch);
+    int rc = UV_ECANCELED;
+    if (v && v->ok == GOC_OK)
+        rc = goc_unbox_int(v->val);
+    goc_http_chan_put(f->ready_ch, goc_box_int(rc));
+    goc_close(f->ready_ch);
+    free(f);
 }
 
 /* =========================================================================
@@ -108,8 +161,7 @@ struct goc_http_server {
     size_t       n_routes;
     size_t       cap_routes;
 
-    goc_pool*    pool;
-    goc_array*   middleware;
+    goc_array* middleware;
 };
 
 /* Per-worker-thread HTTP keep-alive slot for outbound client requests.
@@ -148,11 +200,6 @@ static goc_chan* http_client_non_keepalive_sem(uint64_t req_id)
 {
     goc_chan* sem = atomic_load_explicit(&g_http_non_keepalive_sem,
                                          memory_order_acquire);
-    GOC_DBG("http_client_non_keepalive_sem[%llu]: loaded sem=%p init=%d\n",
-            (unsigned long long)req_id,
-            (void*)sem,
-            atomic_load_explicit(&g_http_non_keepalive_sem_init,
-                                 memory_order_acquire));
     if (sem) {
         GOC_DBG("http_client_non_keepalive_sem[%llu]: returning existing sem=%p\n",
                 (unsigned long long)req_id,
@@ -177,33 +224,18 @@ static goc_chan* http_client_non_keepalive_sem(uint64_t req_id)
         GOC_DBG("http_client_non_keepalive_sem[%llu]: initialized sem=%p\n",
                 (unsigned long long)req_id,
                 (void*)sem);
-    } else {
-        int spin_count = 0;
-        GOC_DBG("http_client_non_keepalive_sem[%llu]: waiting for sem init to complete\n",
-                (unsigned long long)req_id);
-        while ((sem = atomic_load_explicit(&g_http_non_keepalive_sem,
-                                          memory_order_acquire)) == NULL) {
-            spin_count++;
-            if (spin_count <= 32 || (spin_count & 0x1F) == 0) {
-                GOC_DBG("http_client_non_keepalive_sem[%llu]: spin/yield waiting for sem count=%d sem=%p\n",
-                        (unsigned long long)req_id,
-                        spin_count,
-                        (void*)sem);
-            }
-            GOC_DBG("http_client_non_keepalive_sem[%llu]: before goc_yield spin=%d\n",
-                    (unsigned long long)req_id, spin_count);
-            goc_yield();
-            GOC_DBG("http_client_non_keepalive_sem[%llu]: after goc_yield spin=%d sem=%p\n",
-                    (unsigned long long)req_id,
-                    spin_count,
-                    (void*)atomic_load_explicit(&g_http_non_keepalive_sem,
-                                               memory_order_acquire));
-        }
-        GOC_DBG("http_client_non_keepalive_sem[%llu]: acquired sem after wait=%p spin_count=%d\n",
-                (unsigned long long)req_id,
-                (void*)sem,
-                spin_count);
+        return sem;
     }
+
+    GOC_DBG("http_client_non_keepalive_sem[%llu]: waiting for sem init to complete\n",
+            (unsigned long long)req_id);
+    while (!(sem = atomic_load_explicit(&g_http_non_keepalive_sem,
+                                       memory_order_acquire))) {
+        goc_yield();
+    }
+    GOC_DBG("http_client_non_keepalive_sem[%llu]: acquired sem=%p\n",
+            (unsigned long long)req_id,
+            (void*)sem);
     return sem;
 }
 
@@ -295,7 +327,7 @@ void goc_http_reset_globals(void)
  * ====================================================================== */
 static void accept_loop_fiber(void* arg);
 static void handle_conn_fiber(void* arg);
-#ifdef GOC_HTTP_REUSEPORT
+#if GOC_HTTP_REUSEPORT_LINUX
 static void reuseport_accept_loop_fiber(void* arg);
 #endif
 
@@ -339,7 +371,6 @@ goc_http_server_opts_t* goc_http_server_opts(void)
     goc_http_server_opts_t* o =
         (goc_http_server_opts_t*)goc_malloc(sizeof(goc_http_server_opts_t));
     memset(o, 0, sizeof(*o));
-    o->pool = goc_current_or_default_pool();
     return o;
 }
 
@@ -349,7 +380,6 @@ goc_http_server_t* goc_http_server_make(const goc_http_server_opts_t* opts)
         (goc_http_server_t*)goc_malloc(sizeof(goc_http_server_t));
     memset(srv, 0, sizeof(*srv));
 
-    srv->pool       = opts && opts->pool ? opts->pool : goc_current_or_default_pool();
     srv->middleware = opts ? opts->middleware : NULL;
     srv->close_ch   = goc_chan_make(0);
     goc_chan_set_debug_tag(srv->close_ch, "http_close_ch");
@@ -394,15 +424,20 @@ goc_chan* goc_http_server_listen(goc_http_server_t* srv, const char* host, int p
         return ready_ch;
     }
 
-    goc_pool* pool = srv->pool ? srv->pool : goc_current_or_default_pool();
+    goc_pool* pool = goc_current_or_default_pool();
     GOC_DBG(
             "goc_http_server_listen: srv=%p host=%s port=%d pool=%p nw_pending=%zu\n",
             (void*)srv, host, port, (void*)pool, goc_pool_thread_count(pool));
 
-#ifdef GOC_HTTP_REUSEPORT
+#if GOC_HTTP_REUSEPORT_LINUX
     /* SO_REUSEPORT path: one listener per worker, kernel load-balances. */
     size_t nw = goc_pool_thread_count(pool);
-    if (nw > 1) {
+    int use_reuseport = nw > 1 && goc_http_reuseport_supported(addr.ss_family);
+    if (nw > 1 && !use_reuseport) {
+        GOC_DBG(
+                "goc_http_server_listen: SO_REUSEPORT unsupported at runtime; falling back to single listener\n");
+    }
+    if (use_reuseport) {
         GOC_DBG(
                 "goc_http_server_listen: SO_REUSEPORT path using %zu listeners\n",
                 nw);
@@ -423,7 +458,7 @@ goc_chan* goc_http_server_listen(goc_http_server_t* srv, const char* host, int p
             a->addrlen       = addrlen;
             a->slot          = i;
             a->slot_ready_ch = slot_ready_chs[i];
-            goc_go_on(pool, reuseport_accept_loop_fiber, a);
+            goc_go_on_worker(pool, i, reuseport_accept_loop_fiber, a);
         }
 
         /* Pin the server struct in the GC while accept loop fibers run. */
@@ -432,19 +467,35 @@ goc_chan* goc_http_server_listen(goc_http_server_t* srv, const char* host, int p
         /* Collect per-fiber ready signals; forward first error (or 0). */
         int first_err = 0;
         for (size_t i = 0; i < nw; i++) {
-            goc_val_t* v = goc_http_take(slot_ready_chs[i]);
+            goc_val_t* v = goc_http_chan_take(slot_ready_chs[i]);
             int rc = (v && v->ok == GOC_OK) ? goc_unbox_int(v->val) : UV_ECANCELED;
             if (rc < 0 && first_err == 0)
                 first_err = rc;
         }
-        free(slot_ready_chs);
 
-        GOC_DBG(
-                "goc_http_server_listen: reuseport listeners ready first_err=%d\n",
-                first_err);
-        goc_http_chan_put(ready_ch, goc_box_int(first_err));
-        goc_close(ready_ch);
-        return ready_ch;
+        if (first_err < 0) {
+            GOC_DBG(
+                    "goc_http_server_listen: reuseport listen failed first_err=%d, falling back to single listener\n",
+                    first_err);
+            for (size_t i = 0; i < nw; i++) {
+                if (srv->listener_accept_chs && srv->listener_accept_chs[i])
+                    goc_close(srv->listener_accept_chs[i]);
+                if (srv->listener_tcps && srv->listener_tcps[i])
+                    goc_io_handle_close((uv_handle_t*)srv->listener_tcps[i]);
+            }
+            srv->listener_accept_chs = NULL;
+            srv->listener_tcps = NULL;
+            srv->n_listeners = 0;
+            free(slot_ready_chs);
+        } else {
+            free(slot_ready_chs);
+            GOC_DBG(
+                    "goc_http_server_listen: reuseport listeners ready first_err=%d\n",
+                    first_err);
+            goc_http_chan_put(ready_ch, goc_box_int(first_err));
+            goc_close(ready_ch);
+            return ready_ch;
+        }
     }
 #endif
 
@@ -475,14 +526,25 @@ goc_chan* goc_http_server_listen(goc_http_server_t* srv, const char* host, int p
     GOC_DBG(
             "goc_http_server_listen: tcp_bind succeeded tcp=%p, creating accept_ch\n",
             (void*)srv->tcp);
-    /* Start listening; ready_ch will receive goc_box_int(0) when uv_listen
-     * has been called on the event-loop thread. */
-    srv->accept_ch = goc_io_tcp_server_make(srv->tcp, 128, ready_ch);
+    /* Start listening; internal_ready_ch will receive goc_box_int(0) when uv_listen
+     * has been called on the event-loop thread, or UV_ECANCELED if that channel
+     * closes unexpectedly. */
+    goc_chan* internal_ready_ch = goc_chan_make(1);
+    srv->accept_ch = goc_io_tcp_server_make(srv->tcp, 128, internal_ready_ch);
     if (srv->accept_ch)
         goc_chan_set_debug_tag(srv->accept_ch, "http_accept_ch");
 
     /* Pin the server struct in the GC while the accept loop fiber runs. */
     gc_handle_register(srv);
+
+    /* Forward the internal ready result into the externally returned channel.
+     * This guarantees callers always get an explicit rc or UV_ECANCELED. */
+    goc_http_listen_ready_forward_arg_t* f =
+        (goc_http_listen_ready_forward_arg_t*)malloc(
+            sizeof(goc_http_listen_ready_forward_arg_t));
+    f->ready_ch = ready_ch;
+    f->internal_ready_ch = internal_ready_ch;
+    goc_go_on(pool, goc_http_listen_ready_forward, f);
 
     /* Spawn the single accept loop fiber. */
     goc_go_on(pool, accept_loop_fiber, srv);
@@ -539,6 +601,11 @@ goc_chan* goc_http_server_close(goc_http_server_t* srv)
     GOC_DBG(
             "goc_http_server_close: begin drain was_listening=%d accept_ch=%p active_conns=%d shutdown_ch=%p\n",
             was_listening,
+            (void*)srv->accept_ch,
+            atomic_load(&srv->active_conns),
+            (void*)srv->shutdown_ch);
+    GOC_DBG(
+            "goc_http_server_close: close dispatch complete accept_ch=%p active_conns=%d shutdown_ch=%p\n",
             (void*)srv->accept_ch,
             atomic_load(&srv->active_conns),
             (void*)srv->shutdown_ch);
@@ -667,7 +734,7 @@ typedef struct {
     goc_chan*     close_ch; /* captured at spawn; srv->close_ch may be NULL by the time the fiber runs */
 } conn_arg_t;
 
-#ifdef GOC_HTTP_REUSEPORT
+#if GOC_HTTP_REUSEPORT_LINUX
 /* Each reuseport_accept_loop_fiber:
  *  1. Inits its own uv_tcp_t on the current worker's loop (Phase 2 direct path).
  *  2. Sets SO_REUSEPORT on the socket via setsockopt.
@@ -706,18 +773,56 @@ static void reuseport_accept_loop_fiber(void* arg)
 
     /* Set SO_REUSEPORT before bind so the kernel can load-balance across
      * all N listeners bound to the same port. */
-    uv_os_fd_t fd;
-    uv_fileno((uv_handle_t*)tcp, &fd);
+    uv_os_fd_t rawfd = socket(a->addr.ss_family, SOCK_STREAM, 0);
+    if (rawfd < 0) {
+        int eno = errno;
+        GOC_DBG(
+                "reuseport_accept_loop_fiber[%zu]: socket failed family=%d errno=%d\n",
+                slot, a->addr.ss_family, eno);
+        goc_io_handle_close((uv_handle_t*)tcp);
+        goc_http_chan_put(slot_ready_ch, goc_box_int(-eno));
+        goc_close(slot_ready_ch);
+        if (atomic_fetch_sub_explicit(&srv->active_conns, 1, memory_order_release) == 1)
+            goc_close(srv->shutdown_ch);
+        return;
+    }
+
     int optval = 1;
-    if (setsockopt((int)fd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval)) < 0) {
-        /* Not fatal: fall through to bind — it will likely fail too, and the
-         * error will be surfaced via slot_ready_ch. */
+    if (setsockopt((int)rawfd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval)) < 0) {
+        int eno = errno;
+        GOC_DBG(
+                "reuseport_accept_loop_fiber[%zu]: setsockopt(SO_REUSEPORT) failed fd=%d errno=%d\n",
+                slot, (int)rawfd, eno);
+        close(rawfd);
+        goc_io_handle_close((uv_handle_t*)tcp);
+        goc_http_chan_put(slot_ready_ch, goc_box_int(-eno));
+        goc_close(slot_ready_ch);
+        if (atomic_fetch_sub_explicit(&srv->active_conns, 1, memory_order_release) == 1)
+            goc_close(srv->shutdown_ch);
+        return;
+    }
+
+    int rc = uv_tcp_open(tcp, rawfd);
+    if (rc < 0) {
+        GOC_DBG(
+                "reuseport_accept_loop_fiber[%zu]: uv_tcp_open failed tcp=%p rawfd=%d rc=%d\n",
+                slot, (void*)tcp, (int)rawfd, rc);
+        close(rawfd);
+        goc_io_handle_close((uv_handle_t*)tcp);
+        goc_http_chan_put(slot_ready_ch, goc_box_int(rc));
+        goc_close(slot_ready_ch);
+        if (atomic_fetch_sub_explicit(&srv->active_conns, 1, memory_order_release) == 1)
+            goc_close(srv->shutdown_ch);
+        return;
     }
 
     /* Bind. */
     r = goc_unbox_int(
             goc_take(goc_io_tcp_bind(tcp, (const struct sockaddr*)&a->addr))->val);
     if (r < 0) {
+        GOC_DBG(
+                "reuseport_accept_loop_fiber[%zu]: bind failed tcp=%p addr_family=%d rc=%d\n",
+                slot, (void*)tcp, a->addr.ss_family, r);
         goc_io_handle_close((uv_handle_t*)tcp);
         goc_http_chan_put(slot_ready_ch, goc_box_int(r));
         goc_close(slot_ready_ch);
@@ -741,7 +846,7 @@ static void reuseport_accept_loop_fiber(void* arg)
     srv->listener_tcps[slot]       = tcp;
     srv->listener_accept_chs[slot] = accept_ch;
 
-    if (close_ch && goc_chan_is_closing(close_ch)) {
+    if (close_ch && !goc_chan_is_open(close_ch)) {
         GOC_DBG(
                 "reuseport_accept_loop_fiber[%zu]: server already closing, closing accept_ch=%p tcp=%p\n",
                 slot, (void*)accept_ch, (void*)tcp);
@@ -773,7 +878,9 @@ static void reuseport_accept_loop_fiber(void* arg)
         }
         uv_tcp_t* conn = (uv_tcp_t*)v->val;
         GOC_DBG(
-                "reuseport_accept_loop_fiber: accepted conn=%p active_conns=%d\n",
+                "reuseport_accept_loop_fiber[%zu] current_worker=%d: accepted conn=%p active_conns=%d\n",
+                slot,
+                goc_current_worker_id(),
                 (void*)conn,
                 atomic_load(&srv->active_conns));
         conn_arg_t* ca = (conn_arg_t*)goc_malloc(sizeof(conn_arg_t));
@@ -781,8 +888,19 @@ static void reuseport_accept_loop_fiber(void* arg)
         ca->conn     = conn;
         ca->close_ch = close_ch;
         atomic_fetch_add_explicit(&srv->active_conns, 1, memory_order_release);
-        goc_pool* pool = srv->pool ? srv->pool : goc_current_or_default_pool();
-        goc_go_on(pool, handle_conn_fiber, ca);
+        goc_pool* pool = goc_current_or_default_pool();
+        size_t worker_count = goc_pool_thread_count(pool);
+        size_t target_worker = goc_current_worker_id();
+        if (worker_count > 1)
+            target_worker = (target_worker + 1) % worker_count;
+        GOC_DBG(
+                "reuseport_accept_loop_fiber[%zu]: scheduling handle_conn_fiber on worker=%zu pool=%p conn=%p active_conns=%d\n",
+                slot,
+                target_worker,
+                (void*)pool,
+                (void*)conn,
+                atomic_load(&srv->active_conns));
+        goc_go_on_worker(pool, target_worker, handle_conn_fiber, ca);
     }
 
     /* Drain buffered accepted connections that were not yet dispatched. */
@@ -859,8 +977,20 @@ static void accept_loop_fiber(void* arg)
                 "accept_loop_fiber: spawning handle_conn_fiber for conn=%p new active_conns=%d\n",
                 (void*)conn,
                 atomic_load(&srv->active_conns));
-        goc_pool* pool = srv->pool ? srv->pool : goc_current_or_default_pool();
-        goc_go_on(pool, handle_conn_fiber, a);
+        goc_pool* pool = goc_current_or_default_pool();
+        size_t worker_count = goc_pool_thread_count(pool);
+        size_t target_worker = goc_current_worker_id();
+        if (worker_count > 1) {
+            static size_t next_target = 0;
+            target_worker = next_target % worker_count;
+            next_target++;
+        }
+        GOC_DBG(
+                "accept_loop_fiber: scheduling handle_conn_fiber on worker=%zu pool=%p conn=%p\n",
+                target_worker,
+                (void*)pool,
+                (void*)conn);
+        goc_go_on_worker(pool, target_worker, handle_conn_fiber, a);
     }
 
     /* Drain any connections buffered in accept_ch that were not yet spawned.
@@ -899,7 +1029,12 @@ static void accept_loop_fiber(void* arg)
 /* Maximum number of HTTP headers accepted per request. */
 #define GOC_SERVER_MAX_HDRS     64
 
-
+#define free_buf(buf) do {            \
+    if (buf) {                          \
+        free(buf);                      \
+        (buf) = NULL;                   \
+    }                                   \
+} while (0)
 
 static void handle_conn_fiber(void* arg)
 {
@@ -1334,8 +1469,7 @@ static void handle_conn_fiber(void* arg)
     }
 
 done:
-    if (buf)
-        free(buf);
+    free_buf(buf);
     if (headers)
         free(headers);
     GOC_DBG("handle_conn_fiber[%llu]: exit conn=%p active_conns_before=%d\n",
@@ -1466,7 +1600,6 @@ goc_http_request_opts_t* goc_http_request_opts(void)
     goc_http_request_opts_t* o =
         (goc_http_request_opts_t*)goc_malloc(sizeof(goc_http_request_opts_t));
     memset(o, 0, sizeof(*o));
-    o->pool = goc_current_or_default_pool();
     return o;
 }
 
@@ -1711,7 +1844,28 @@ typedef struct {
     int        keep_alive;
     goc_array* extra_headers;
     goc_chan*  ch;         /* result channel — caller is waiting on this */
+
+    _Atomic(uv_tcp_t*) tcp;
+    _Atomic(int)         tcp_initialized;
+    _Atomic(int)         cancel_requested;
 } http_client_arg_t;
+
+static void http_client_cancel(void* ud)
+{
+    http_client_arg_t* a = (http_client_arg_t*)ud;
+    if (!atomic_load_explicit(&a->cancel_requested, memory_order_acquire))
+        return;
+
+    uv_tcp_t* tcp = atomic_load_explicit(&a->tcp, memory_order_acquire);
+    int tcp_initialized = atomic_load_explicit(&a->tcp_initialized, memory_order_acquire);
+    if (tcp && tcp_initialized) {
+        if (g_http_ka_slot.tcp == tcp)
+            keepalive_slot_drop(&g_http_ka_slot);
+        goc_io_handle_close((uv_handle_t*)tcp);
+        atomic_store_explicit(&a->tcp, NULL, memory_order_release);
+        atomic_store_explicit(&a->tcp_initialized, 0, memory_order_release);
+    }
+}
 
 static void http_client_fiber(void* arg)
 {
@@ -1726,7 +1880,7 @@ static void http_client_fiber(void* arg)
                                                    1,
                                                    memory_order_acq_rel) + 1;
     const char* error_reason = NULL;
-    GOC_DBG("http_client_fiber[%llu]: started method=%s host=%s port=%u path=%s ch=%p keep_alive=%d slot={tcp=%p host=%s port=%u in_use=%d} active_inflight=%d\n",
+    GOC_DBG("http_client_fiber[%llu]: started method=%s host=%s port=%u path=%s ch=%p keep_alive=%d slot={tcp=%p host=%s port=%u in_use=%d} active_inflight=%d current_worker=%d\n",
             (unsigned long long)a->req_id,
             a->method, a->host, a->port, a->path_and_query, (void*)a->ch,
             a->keep_alive,
@@ -1734,7 +1888,13 @@ static void http_client_fiber(void* arg)
             g_http_ka_slot.host ? g_http_ka_slot.host : "<null>",
             (unsigned)g_http_ka_slot.port,
             g_http_ka_slot.in_use,
-            active_inflight);
+            active_inflight,
+            goc_current_worker_id());
+    GOC_DBG("http_client_fiber[%llu]: entry arg=%p ch=%p pool=%p\n",
+            (unsigned long long)a->req_id,
+            (void*)arg,
+            (void*)a->ch,
+            (void*)goc_current_or_default_pool());
 
 retry_connect:
     if (!a->keep_alive) {
@@ -1755,8 +1915,22 @@ retry_connect:
         keepalive_slot_matches(&g_http_ka_slot, a->host, a->port)) {
         tcp = g_http_ka_slot.tcp;
         tcp_initialized = 1;
+        atomic_store_explicit(&a->tcp, tcp, memory_order_release);
+        atomic_store_explicit(&a->tcp_initialized, 1, memory_order_release);
+
+        /* Take ownership of the thread-local keepalive slot. This avoids
+         * leaving the original worker's slot stuck in_use if the fiber
+         * migrates to another thread while the request is in flight. */
+        g_http_ka_slot.tcp = NULL;
+        g_http_ka_slot.host = NULL;
+        g_http_ka_slot.port = 0;
         g_http_ka_slot.in_use = 1;
         using_keepalive_slot = 1;
+    }
+
+    if (atomic_load_explicit(&a->cancel_requested, memory_order_acquire)) {
+        error_reason = "cancelled";
+        goto deliver_error;
     }
 
     GOC_DBG("http_client_fiber[%llu]: keepalive check complete tcp=%p tcp_initialized=%d using_keepalive_slot=%d keep_alive=%d\n",
@@ -1820,6 +1994,13 @@ retry_connect:
             goto deliver_error;
         }
         tcp_initialized = 1;
+        atomic_store_explicit(&a->tcp, tcp, memory_order_release);
+        atomic_store_explicit(&a->tcp_initialized, 1, memory_order_release);
+
+        if (atomic_load_explicit(&a->cancel_requested, memory_order_acquire)) {
+            error_reason = "cancelled";
+            goto deliver_error;
+        }
 
         GOC_DBG("http_client_fiber[%llu]: tcp_connect starting tcp=%p\n",
                 (unsigned long long)a->req_id,
@@ -1836,6 +2017,8 @@ retry_connect:
                 goc_io_handle_close((uv_handle_t*)tcp);
             tcp = NULL;
             tcp_initialized = 0;
+            atomic_store_explicit(&a->tcp, NULL, memory_order_release);
+            atomic_store_explicit(&a->tcp_initialized, 0, memory_order_release);
             goto deliver_error;
         }
     }
@@ -1882,11 +2065,17 @@ retry_connect:
             (unsigned long long)a->req_id,
             (void*)tcp,
             rc);
+    if (atomic_load_explicit(&a->cancel_requested, memory_order_acquire)) {
+        error_reason = "cancelled";
+        goto deliver_error;
+    }
     if (rc < 0) {
         if (using_keepalive_slot && !keepalive_retry) {
             keepalive_slot_drop(&g_http_ka_slot);
             tcp = NULL;
             tcp_initialized = 0;
+            atomic_store_explicit(&a->tcp, NULL, memory_order_release);
+            atomic_store_explicit(&a->tcp_initialized, 0, memory_order_release);
             using_keepalive_slot = 0;
             keepalive_retry = 1;
             goto retry_connect;
@@ -1899,6 +2088,8 @@ retry_connect:
             goc_io_handle_close((uv_handle_t*)tcp);
         tcp = NULL;
         tcp_initialized = 0;
+        atomic_store_explicit(&a->tcp, NULL, memory_order_release);
+        atomic_store_explicit(&a->tcp_initialized, 0, memory_order_release);
         goto deliver_error;
     }
 
@@ -1942,6 +2133,10 @@ retry_connect:
                     (void*)tcp,
                     r->nread,
                     resp_len);
+            if (atomic_load_explicit(&a->cancel_requested, memory_order_acquire)) {
+                error_reason = "cancelled";
+                break;
+            }
             if (r->nread < 0) { break; }
 
             /* Grow plain-malloc buffer. */
@@ -2010,6 +2205,23 @@ retry_connect:
                     resp_len,
                     body_start,
                     content_length);
+            if (using_keepalive_slot && !keepalive_retry) {
+                GOC_DBG("http_client_fiber[%llu]: keepalive socket stale, retrying without keepalive slot\n",
+                        (unsigned long long)a->req_id);
+                keepalive_slot_drop(&g_http_ka_slot);
+                using_keepalive_slot = 0;
+                tcp = NULL;
+                tcp_initialized = 0;
+                keepalive_retry = 1;
+                free_buf(resp_buf);
+                resp_buf = NULL;
+                resp_len = 0;
+                resp_cap = 0;
+                response = NULL;
+                content_length = -1;
+                body_start = 0;
+                goto retry_connect;
+            }
             if (using_keepalive_slot)
                 keepalive_slot_drop(&g_http_ka_slot);
             else if (tcp) {
@@ -2018,7 +2230,7 @@ retry_connect:
                 tcp = NULL;
                 tcp_initialized = 0;
             }
-            if (resp_buf) free(resp_buf);
+            free_buf(resp_buf);
             goto deliver_error;
         }
         size_t blen = resp_len > body_start ? resp_len - body_start : 0;
@@ -2027,7 +2239,7 @@ retry_connect:
         char* body = (char*)goc_malloc(blen + 1);
         if (blen && resp_buf) memcpy(body, resp_buf + body_start, blen);
         body[blen] = '\0';
-        if (resp_buf) free(resp_buf);
+        free_buf(resp_buf);
         response->body     = body;
         response->body_len = blen;
 
@@ -2036,7 +2248,15 @@ retry_connect:
                        !response_has_connection_close(response);
         if (can_keep) {
             if (using_keepalive_slot) {
+                /* Return the active keepalive socket to the current worker's
+                 * slot, even if the request migrated to another thread. */
+                keepalive_slot_drop(&g_http_ka_slot);
+                g_http_ka_slot.tcp    = tcp;
+                g_http_ka_slot.host   = a->host;
+                g_http_ka_slot.port   = a->port;
                 g_http_ka_slot.in_use = 0;
+                tcp = NULL;
+                tcp_initialized = 0;
             } else if (!g_http_ka_slot.in_use) {
                 keepalive_slot_drop(&g_http_ka_slot);
                 g_http_ka_slot.tcp    = tcp;
@@ -2130,7 +2350,7 @@ deliver_error: {
         tcp = NULL;
         tcp_initialized = 0;
     }
-    if (resp_buf) free(resp_buf);
+    free_buf(resp_buf);
     goc_http_response_t* r =
         (goc_http_response_t*)goc_malloc(sizeof(goc_http_response_t));
     memset(r, 0, sizeof(*r));
@@ -2213,14 +2433,18 @@ goc_chan* goc_http_request(const char* method, const char* url,
     a->keep_alive     = opts ? opts->keep_alive : 0;
     a->extra_headers  = opts ? opts->headers : NULL;
     a->ch             = ch;
+    atomic_store_explicit(&a->tcp, NULL, memory_order_relaxed);
+    atomic_store_explicit(&a->tcp_initialized, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->cancel_requested, 0, memory_order_relaxed);
+    chan_set_on_close(ch, http_client_cancel, a);
 
-            GOC_DBG("goc_http_request[%llu]: method=%s url=%s host=%s port=%u path=%s keep_alive=%d timeout_ms=%llu ch=%p\n",
+            GOC_DBG("goc_http_request[%llu]: entry method=%s url=%s host=%s port=%u path=%s keep_alive=%d timeout_ms=%llu ch=%p\n",
             (unsigned long long)a->req_id, method, url, host, (unsigned)port, pq,
             opts ? opts->keep_alive : 0,
                 (unsigned long long)(opts ? opts->timeout_ms : 0),
             (void*)ch);
 
-    goc_pool* req_pool = (opts && opts->pool) ? opts->pool : goc_current_or_default_pool();
+    goc_pool* req_pool = goc_current_or_default_pool();
     GOC_DBG("goc_http_request[%llu]: scheduling client fiber req_id=%llu ch=%p pool=%p keep_alive=%d\n",
             (unsigned long long)a->req_id,
             (unsigned long long)a->req_id,
@@ -2238,10 +2462,10 @@ goc_chan* goc_http_request(const char* method, const char* url,
         };
         goc_alts_result_t* res = goc_alts(ops, 2);
         if (res->ch == tch) {
-            /* Timeout: close the original channel so it is removed from
-             * live_channels before goc_shutdown destroys its lock.  The HTTP
-             * client will fire its close callback harmlessly (goc_close is
-             * idempotent). */
+            /* Timeout: cancel the underlying HTTP fiber and close the
+             * request channel so the client fiber can tear down its socket
+             * early instead of continuing to read a stale response. */
+            atomic_store_explicit(&a->cancel_requested, 1, memory_order_release);
             GOC_DBG("goc_http_request[%llu]: timeout after %u ms url=%s keep_alive=%d\n",
                     (unsigned long long)a->req_id,
                     (unsigned)(opts ? opts->timeout_ms : 0),

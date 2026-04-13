@@ -339,10 +339,7 @@ static void lifecycle_abort_non_main_thread(const char* fn_name)
 
     uv_thread_t self = uv_thread_self();
     if (!uv_thread_equal(&self, &g_main_thread)) {
-        fprintf(stderr,
-                "libgoc: %s must be called from the main thread\n",
-                fn_name);
-        abort();
+        ABORT("%s must be called from the main thread\n", fn_name);
     }
 }
 
@@ -374,8 +371,7 @@ char* goc_sprintf(const char* fmt, ...) {
     int len = vsnprintf(NULL, 0, fmt, ap);
     va_end(ap);
     if (len < 0) {
-        fprintf(stderr, "libgoc: goc_sprintf: vsnprintf failed (len=%d)\n", len);
-        abort();
+        ABORT("goc_sprintf: vsnprintf failed (len=%d)\n", len);
     }
 
     char* buf = (char*)GC_malloc((size_t)len + 1);

@@ -181,10 +181,16 @@ static void pool_log_worker_loop_state(goc_worker* w, const char* context) {
 static void worker_wakeup_cb(uv_async_t* h) {
     (void)h;
     GOC_DBG(
-            "worker_wakeup_cb: tl_worker=%p current_worker=%d\n",
-            (void*)tl_worker, goc_current_worker_id());
+            "worker_wakeup_cb: entered target_worker=%zu current_worker=%d wakeup=%p\n",
+            tl_worker ? tl_worker->index : SIZE_MAX,
+            goc_current_worker_id(),
+            (void*)h);
     if (tl_worker)
         drain_worker_tasks(tl_worker);
+    GOC_DBG(
+            "worker_wakeup_cb: exit target_worker=%zu current_worker=%d\n",
+            tl_worker ? tl_worker->index : SIZE_MAX,
+            goc_current_worker_id());
 }
 
 uv_loop_t* goc_current_worker_loop(void) {
@@ -217,15 +223,35 @@ static uv_mutex_t  g_pool_registry_mutex;
 /* Post fn(arg) to the worker that owns the given loop.
  * Safe to call from any thread.  Aborts if loop is not a known worker loop. */
 static int worker_try_wakeup(goc_worker* w) {
-    if (!w || !w->wakeup)
+    if (!w || !w->wakeup) {
+        GOC_DBG("worker_try_wakeup: invalid worker or missing wakeup w=%p wakeup=%p\n",
+                (void*)w, w ? (void*)w->wakeup : NULL);
+        WIN_DBG("worker_try_wakeup: WIN invalid worker or missing wakeup w=%p wakeup=%p\n",
+                (void*)w, w ? (void*)w->wakeup : NULL);
         return UV_ECANCELED;
-    if (atomic_load_explicit(&w->closing, memory_order_acquire))
+    }
+    if (atomic_load_explicit(&w->closing, memory_order_acquire)) {
+        GOC_DBG("worker_try_wakeup: worker closing w=%p\n", (void*)w);
+        WIN_DBG("worker_try_wakeup: WIN worker closing w=%p\n", (void*)w);
         return UV_ECANCELED;
-    if (!uv_loop_alive(&w->loop))
+    }
+    if (uv_is_closing((uv_handle_t*)w->wakeup)) {
+        GOC_DBG("worker_try_wakeup: wakeup closing w=%p wakeup=%p\n",
+                (void*)w, (void*)w->wakeup);
+        WIN_DBG("worker_try_wakeup: WIN wakeup closing w=%p wakeup=%p\n",
+                (void*)w, (void*)w->wakeup);
         return UV_ECANCELED;
-    if (uv_is_closing((uv_handle_t*)w->wakeup))
+    }
+
+    int rc = uv_async_send(w->wakeup);
+    if (rc == UV_EBADF || rc == UV_EINVAL) {
+        GOC_DBG("worker_try_wakeup: wakeup send race; closing/invalid wakeup w=%p wakeup=%p rc=%d\n",
+                (void*)w, (void*)w->wakeup, rc);
+        WIN_DBG("worker_try_wakeup: WIN wakeup send race; closing/invalid wakeup w=%p wakeup=%p rc=%d\n",
+                (void*)w, (void*)w->wakeup, rc);
         return UV_ECANCELED;
-    return uv_async_send(w->wakeup);
+    }
+    return rc;
 }
 
 int post_on_handle_loop(uv_loop_t* loop, void (*fn)(void*), void* arg) {
@@ -257,14 +283,6 @@ int post_on_handle_loop(uv_loop_t* loop, void (*fn)(void*), void* arg) {
                     GOC_DBG(
                             "post_on_handle_loop: rejected loop=%p fn=%p arg=%p worker_closing=1\n",
                             (void*)loop, (void*)fn, arg);
-                    return UV_ECANCELED;
-                }
-                if (!loop_alive) {
-                    uv_mutex_unlock(&g_pool_registry_mutex);
-                    GOC_DBG(
-                            "post_on_handle_loop: rejected dead loop=%p pool=%p worker=%zu wakeup=%p fn=%p arg=%p\n",
-                            (void*)loop, (void*)pool, i, (void*)w->wakeup,
-                            (void*)fn, arg);
                     return UV_ECANCELED;
                 }
                 uv_mutex_unlock(&g_pool_registry_mutex);
@@ -308,10 +326,7 @@ int post_on_handle_loop(uv_loop_t* loop, void (*fn)(void*), void* arg) {
         }
     }
     uv_mutex_unlock(&g_pool_registry_mutex);
-    fprintf(stderr,
-            "libgoc: post_on_handle_loop: loop %p not found in registry\n",
-            (void*)loop);
-    abort();
+    ABORT("post_on_handle_loop: loop %p not found in registry\n", (void*)loop);
 }
 
 /* -------------------------------------------------------------------------
@@ -480,7 +495,12 @@ static void pool_dispatch_spawn_list(goc_pool* pool, goc_spawn_req* reqs) {
                                                   reqs->fn,
                                                   reqs->fn_arg,
                                                   reqs->join_ch);
-        post_to_run_queue(pool, entry);
+        if (reqs->home_worker_idx != SIZE_MAX) {
+            entry->home_worker_idx = reqs->home_worker_idx;
+            post_to_specific_worker(pool, reqs->home_worker_idx, entry);
+        } else {
+            post_to_run_queue(pool, entry);
+        }
         GC_free(reqs);
         reqs = next;
     }
@@ -528,14 +548,14 @@ void pool_submit_spawn(goc_pool* pool,
     goc_spawn_req* req = (goc_spawn_req*)GC_malloc_uncollectable(sizeof(goc_spawn_req));
     if (req == NULL) {
         uv_mutex_unlock(&pool->drain_mutex);
-        fprintf(stderr, "libgoc: failed to allocate deferred spawn request\n");
-        abort();
+        ABORT("failed to allocate deferred spawn request\n");
     }
 
-    req->fn      = fn;
-    req->fn_arg  = arg;
-    req->join_ch = join_ch;
-    req->next    = NULL;
+    req->fn              = fn;
+    req->fn_arg          = arg;
+    req->join_ch         = join_ch;
+    req->home_worker_idx = SIZE_MAX;
+    req->next            = NULL;
     pool_enqueue_spawn_locked(pool, req);
 
     goc_spawn_req* admitted = pool_collect_admitted_spawns_locked(pool);
@@ -559,16 +579,42 @@ static void pool_worker_fn(void* arg) {
     uint32_t seed = (uint32_t)(tl_worker->index ^ (uintptr_t)tl_worker);
 
     goc_entry* entry;
+    const char* source = "unknown";
 
     while (!atomic_load_explicit(&pool->shutdown, memory_order_acquire)) {
 
         /* 1. Pop from own deque (LIFO, cache-warm). */
         entry = wsdq_pop_bottom(&tl_worker->deque);
-        if (entry != NULL) { tl_worker->miss_streak = 0; goto run; }
+        GOC_DBG("pool_worker_fn: worker=%zu try pop own deque entry=%p deque_size_approx=%zu\n",
+                tl_worker->index, (void*)entry,
+                wsdq_approx_size(&tl_worker->deque));
+        if (entry != NULL) {
+            source = "own";
+            tl_worker->miss_streak = 0;
+            GOC_DBG("pool_worker_fn: worker=%zu picked own deque entry=%p fn=%p coro=%p home_worker_idx=%zu\n",
+                    tl_worker->index,
+                    (void*)entry,
+                    (void*)(uintptr_t)entry->fn,
+                    (void*)entry->coro,
+                    entry->home_worker_idx);
+            goto run;
+        }
 
         /* 2. Drain own injector (entries posted by external callers). */
         entry = injector_pop(&tl_worker->injector);
-        if (entry != NULL) { tl_worker->miss_streak = 0; goto run; }
+        GOC_DBG("pool_worker_fn: worker=%zu try pop injector entry=%p\n",
+                tl_worker->index, (void*)entry);
+        if (entry != NULL) {
+            source = "injector";
+            tl_worker->miss_streak = 0;
+            GOC_DBG("pool_worker_fn: worker=%zu picked injector entry=%p fn=%p coro=%p home_worker_idx=%zu\n",
+                    tl_worker->index,
+                    (void*)entry,
+                    (void*)(uintptr_t)entry->fn,
+                    (void*)entry->coro,
+                    entry->home_worker_idx);
+            goto run;
+        }
 
         /* 3. Steal phase: victim hinting, then randomized scan.
          *
@@ -582,24 +628,30 @@ static void pool_worker_fn(void* arg) {
             size_t victim_hint = tl_worker->last_steal_victim;
             if (victim_hint != SIZE_MAX && victim_hint != tl_worker->index) {
 #ifdef GOC_ENABLE_STATS
-                atomic_fetch_add_explicit(&tl_worker->steal_attempts, 1, memory_order_relaxed);
-                atomic_fetch_add_explicit(&g_steal_attempts,           1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&tl_worker->steal_attempts, 1, memory_order_seq_cst);
+                atomic_fetch_add_explicit(&g_steal_attempts,           1, memory_order_seq_cst);
 #endif
                 entry = wsdq_steal_top(&pool->workers[victim_hint].deque);
                 if (entry != NULL) {
 #ifdef GOC_ENABLE_STATS
-                    atomic_fetch_add_explicit(&tl_worker->steal_successes, 1, memory_order_relaxed);
-                    atomic_fetch_add_explicit(&g_steal_successes,           1, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&tl_worker->steal_successes, 1, memory_order_seq_cst);
+                    atomic_fetch_add_explicit(&g_steal_successes,           1, memory_order_seq_cst);
 #endif
+                    source = "steal-hint";
                     tl_worker->last_steal_victim = victim_hint;
                     tl_worker->miss_streak = 0;
+                    GOC_DBG("pool_worker_fn: worker=%zu steal success victim=%zu entry=%p miss_streak=%zu\n",
+                            tl_worker->index, victim_hint, (void*)entry,
+                            (size_t)tl_worker->miss_streak);
                     goto run;
                 }
 #ifdef GOC_ENABLE_STATS
-                atomic_fetch_add_explicit(&tl_worker->steal_misses, 1, memory_order_relaxed);
-                atomic_fetch_add_explicit(&g_steal_misses,           1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&tl_worker->steal_misses, 1, memory_order_seq_cst);
+                atomic_fetch_add_explicit(&g_steal_misses,           1, memory_order_seq_cst);
 #endif
                 tl_worker->miss_streak++;
+                GOC_DBG("pool_worker_fn: worker=%zu steal hint miss victim=%zu miss_streak=%zu\n",
+                        tl_worker->index, victim_hint, (size_t)tl_worker->miss_streak);
             }
             /* Fallback: randomized scan as before */
             seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
@@ -608,24 +660,30 @@ static void pool_worker_fn(void* arg) {
                 size_t victim = (tl_worker->index + offset + i) % pool->thread_count;
                 if (victim == tl_worker->index) continue;
 #ifdef GOC_ENABLE_STATS
-                atomic_fetch_add_explicit(&tl_worker->steal_attempts, 1, memory_order_relaxed);
-                atomic_fetch_add_explicit(&g_steal_attempts,           1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&tl_worker->steal_attempts, 1, memory_order_seq_cst);
+                atomic_fetch_add_explicit(&g_steal_attempts,           1, memory_order_seq_cst);
 #endif
                 entry = wsdq_steal_top(&pool->workers[victim].deque);
                 if (entry != NULL) {
 #ifdef GOC_ENABLE_STATS
-                    atomic_fetch_add_explicit(&tl_worker->steal_successes, 1, memory_order_relaxed);
-                    atomic_fetch_add_explicit(&g_steal_successes,           1, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&tl_worker->steal_successes, 1, memory_order_seq_cst);
+                    atomic_fetch_add_explicit(&g_steal_successes,           1, memory_order_seq_cst);
 #endif
+                    source = "steal";
                     tl_worker->last_steal_victim = victim;
                     tl_worker->miss_streak = 0;
+                    GOC_DBG("pool_worker_fn: worker=%zu steal success victim=%zu entry=%p miss_streak=%zu\n",
+                            tl_worker->index, victim, (void*)entry,
+                            (size_t)tl_worker->miss_streak);
                     goto run;
                 }
 #ifdef GOC_ENABLE_STATS
-                atomic_fetch_add_explicit(&tl_worker->steal_misses, 1, memory_order_relaxed);
-                atomic_fetch_add_explicit(&g_steal_misses,           1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&tl_worker->steal_misses, 1, memory_order_seq_cst);
+                atomic_fetch_add_explicit(&g_steal_misses,           1, memory_order_seq_cst);
 #endif
                 tl_worker->miss_streak++;
+                GOC_DBG("pool_worker_fn: worker=%zu steal miss victim=%zu miss_streak=%zu\n",
+                        tl_worker->index, victim, (size_t)tl_worker->miss_streak);
             }
             /* If all fail, clear the hint for next round */
             tl_worker->last_steal_victim = SIZE_MAX;
@@ -646,12 +704,18 @@ static void pool_worker_fn(void* arg) {
                 size_t idx = (tl_worker->index + 1) % pool->thread_count;
                 if (pool->workers[idx].wakeup) {
                     int rc = worker_try_wakeup(&pool->workers[idx]);
-                    GOC_DBG("pool_worker_fn: neighbor wakeup worker=%zu rc=%d\n",
-                            idx, rc);
+                    GOC_DBG("pool_worker_fn: neighbor wakeup worker=%zu rc=%d idle_count=%zu deque_depth=%zu\n",
+                            idx, rc, idle, depth);
+                    WIN_DBG("pool_worker_fn: WIN wakeup candidate worker=%zu neighbor=%zu idle=%zu depth=%zu rc=%d\n",
+                            tl_worker->index, idx, idle, depth, rc);
                 }
             }
         }
 
+        GOC_DBG("pool_worker_fn: worker=%zu idle enter idle_count=%zu deque_size_approx=%zu\n",
+                tl_worker->index,
+                atomic_load_explicit(&pool->idle_count, memory_order_seq_cst),
+                wsdq_approx_size(&tl_worker->deque));
         atomic_fetch_add_explicit(&pool->idle_count, 1, memory_order_seq_cst);
 
         entry = wsdq_pop_bottom(&tl_worker->deque);
@@ -659,13 +723,16 @@ static void pool_worker_fn(void* arg) {
             entry = injector_pop(&tl_worker->injector);
         if (entry != NULL) {
             atomic_fetch_sub_explicit(&pool->idle_count, 1, memory_order_relaxed);
+            GOC_DBG("pool_worker_fn: worker=%zu idle found work before uv_run entry=%p source=recheck\n",
+                    tl_worker->index, (void*)entry);
             goto run;
         }
 
         GOC_STATS_WORKER_STATUS((int)tl_worker->index, pool->id, GOC_WORKER_IDLE, (int)pool->live_count, 0, 0);
         GOC_DBG(
-                "pool_worker_fn: worker=%zu idle uv_run(ONCE) start loop=%p\n",
-                tl_worker->index, (void*)&tl_worker->loop);
+                "pool_worker_fn: worker=%zu idle uv_run(ONCE) start loop=%p idle_count=%zu\n",
+                tl_worker->index, (void*)&tl_worker->loop,
+                atomic_load_explicit(&pool->idle_count, memory_order_seq_cst));
         uv_run(&tl_worker->loop, UV_RUN_ONCE);
         goc_deferred_handle_unreg_flush();
         goc_deferred_close_flush();
@@ -673,10 +740,13 @@ static void pool_worker_fn(void* arg) {
                 "pool_worker_fn: worker=%zu idle uv_run(ONCE) end loop=%p\n",
                 tl_worker->index, (void*)&tl_worker->loop);
 #ifdef GOC_ENABLE_STATS
-        atomic_fetch_add_explicit(&tl_worker->idle_wakeups, 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&g_idle_wakeups,           1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&tl_worker->idle_wakeups, 1, memory_order_seq_cst);
+        atomic_fetch_add_explicit(&g_idle_wakeups,           1, memory_order_seq_cst);
 #endif
         atomic_fetch_sub_explicit(&pool->idle_count, 1, memory_order_relaxed);
+        GOC_DBG("pool_worker_fn: worker=%zu idle exit idle_count=%zu\n",
+                tl_worker->index,
+                atomic_load_explicit(&pool->idle_count, memory_order_seq_cst));
         tl_worker->miss_streak = 0;  /* fresh steal budget after wakeup */
         GOC_STATS_WORKER_STATUS((int)tl_worker->index, pool->id, GOC_WORKER_RUNNING, (int)pool->live_count, 0, 0);
         continue;   /* re-check shutdown and try again */
@@ -684,8 +754,9 @@ static void pool_worker_fn(void* arg) {
 run:
         /* --- from here, identical to old pool_worker_fn --- */
         GOC_DBG(
-                "pool_worker_fn: worker=%zu RUNNING fn=%p entry=%p\n",
-                tl_worker->index, (void*)(uintptr_t)entry->fn, (void*)entry);
+                "pool_worker_fn: worker=%zu RUNNING fn=%p entry=%p source=%s\n",
+                tl_worker->index, (void*)(uintptr_t)entry->fn, (void*)entry,
+                source);
 
         /* Canary check — abort on stack overflow before corrupting anything. */
         goc_stack_canary_check(entry->stack_canary_ptr);
@@ -732,6 +803,10 @@ run:
         GOC_DBG(
                 "pool_worker_fn: worker=%zu end uv_run(NOWAIT) loop=%p\n",
                 tl_worker->index, (void*)&tl_worker->loop);
+        GOC_DBG("pool_worker_fn: worker=%zu post-uv_run(NOWAIT) idle_count=%zu deque_size_approx=%zu\n",
+                tl_worker->index,
+                atomic_load_explicit(&pool->idle_count, memory_order_seq_cst),
+                wsdq_approx_size(&tl_worker->deque));
 
         goc_entry* fe = (goc_entry*)mco_get_user_data(coro);
         mco_state st = mco_status(coro);
@@ -760,17 +835,22 @@ run:
                     __asm__ volatile("" ::: "memory");
                     if (pool->workers[neighbor].wakeup) {
                         int rc = worker_try_wakeup(&pool->workers[neighbor]);
-                        GOC_DBG("pool_worker_fn: neighbor wakeup worker=%zu rc=%d\n",
-                                neighbor, rc);
+                        GOC_DBG("pool_worker_fn: neighbor wakeup worker=%zu rc=%d idle=%zu depth=%zu\n",
+                                neighbor, rc, idle, depth);
+                        WIN_DBG("pool_worker_fn: WIN post-yield wakeup worker=%zu neighbor=%zu idle=%zu depth=%zu rc=%d\n",
+                                tl_worker->index, neighbor, idle, depth, rc);
                     }
                 }
             }
         }
 
         /* If the fiber just parked, release the yield-gate so that any
-         * wake() spinning on parked==0 can proceed. */
-        if (fe != NULL)
-            atomic_store_explicit(&fe->parked, 1, memory_order_release);
+         * wake() spinning on the suspend state can proceed. */
+        if (fe != NULL) {
+            uint64_t parked = atomic_load_explicit(&fe->parked, memory_order_acquire);
+            if (parked & 1)
+                atomic_store_explicit(&fe->parked, parked + 1, memory_order_release);
+        }
 
         if (st == MCO_DEAD) {
             GOC_DBG("pool_worker_fn: worker=%zu FIBER DEAD fn=%p live_count BEFORE=%zu\n",
@@ -1000,10 +1080,12 @@ run:
 
 void post_to_run_queue(goc_pool* pool, goc_entry* entry) {
     goc_worker* w = tl_worker;
-    GOC_DBG("post_to_run_queue: fn=%p entry=%p pool=%p entry->pool=%p path=%s\n",
-            (void*)(uintptr_t)entry->fn, (void*)entry,
-            (void*)pool, (void*)entry->pool,
-            (w != NULL && w->pool == pool) ? "internal" : "external");
+    GOC_DBG("post_to_run_queue: fn=%p entry=%p kind=%d pool=%p entry->pool=%p path=%s internal=%d w=%p\n",
+            (void*)(uintptr_t)(entry ? entry->fn : NULL), (void*)entry,
+            entry ? (int)entry->kind : -1,
+            (void*)pool, (void*)(entry ? entry->pool : NULL),
+            (w != NULL && w->pool == pool) ? "internal" : "external",
+            (w != NULL && w->pool == pool), (void*)w);
     if (w != NULL && w->pool == pool) {
         /* Internal caller: push to executing worker's own deque.
          * Safe: the owner is inside mco_resume, not touching the deque. */
@@ -1018,6 +1100,13 @@ void post_to_run_queue(goc_pool* pool, goc_entry* entry) {
          * proactively wake peers. This avoids cross-worker steal/resume races
          * in ping-pong style workloads where locality matters for progress.
          * External posts (below) still wake an idle target worker. */
+        GOC_DBG("post_to_run_queue: internal enqueue entry=%p fn=%p coro=%p home_worker_idx=%zu worker=%zu idle_count=%zu\n",
+                (void*)entry,
+                (void*)(uintptr_t)entry->fn,
+                (void*)entry->coro,
+                entry->home_worker_idx,
+                w->index,
+                atomic_load_explicit(&pool->idle_count, memory_order_seq_cst));
         (void)pool;
     } else {
         /* External caller: push into target worker's injector (MPSC-safe).
@@ -1026,6 +1115,11 @@ void post_to_run_queue(goc_pool* pool, goc_entry* entry) {
                                                memory_order_relaxed)
                      % pool->thread_count;
         injector_push(&pool->workers[idx].injector, entry);
+        GOC_DBG("post_to_run_queue: external enqueue entry=%p target_worker=%zu idle_count=%zu injector_head=%p injector_tail=%p\n",
+                (void*)entry, idx,
+                atomic_load_explicit(&pool->idle_count, memory_order_seq_cst),
+                (void*)pool->workers[idx].injector.head,
+                (void*)pool->workers[idx].injector.tail);
 
         /* injector_push holds the mutex for the full operation; the unlock
          * is a full memory barrier, providing the seq_cst effect needed for
@@ -1035,14 +1129,94 @@ void post_to_run_queue(goc_pool* pool, goc_entry* entry) {
                     idx);
             return;
         }
-        if (atomic_load_explicit(&pool->idle_count, memory_order_seq_cst) > 0) {
-            if (pool->workers[idx].wakeup) {
-                int rc = worker_try_wakeup(&pool->workers[idx]);
-                GOC_DBG("post_to_run_queue: wakeup worker=%zu rc=%d\n",
-                        idx, rc);
-            }
+        if (pool->workers[idx].wakeup) {
+            int rc = worker_try_wakeup(&pool->workers[idx]);
+            GOC_DBG("post_to_run_queue: worker_try_wakeup target_worker=%zu rc=%d idle_count=%zu\n",
+                    idx, rc,
+                    atomic_load_explicit(&pool->idle_count, memory_order_seq_cst));
         }
     }
+}
+
+void post_to_specific_worker(goc_pool* pool,
+                             size_t worker_idx,
+                             goc_entry* entry) {
+    if (!pool || worker_idx >= pool->thread_count || !entry) {
+        ABORT("post_to_specific_worker: invalid arguments pool=%p worker_idx=%zu entry=%p\n",
+              (void*)pool, worker_idx, (void*)entry);
+    }
+
+    goc_worker* target = &pool->workers[worker_idx];
+    goc_worker* current = tl_worker;
+    if (current == target) {
+        wsdq_push_bottom(&target->deque, entry);
+        atomic_thread_fence(memory_order_seq_cst);
+        GOC_DBG("post_to_specific_worker: internal enqueue entry=%p worker=%zu\n",
+                (void*)entry, worker_idx);
+    } else {
+        injector_push(&target->injector, entry);
+        GOC_DBG("post_to_specific_worker: external enqueue entry=%p target_worker=%zu injector_head=%p injector_tail=%p\n",
+                (void*)entry, worker_idx,
+                (void*)target->injector.head,
+                (void*)target->injector.tail);
+        if (atomic_load_explicit(&pool->shutdown, memory_order_acquire)) {
+            GOC_DBG("post_to_specific_worker: pool shutdown, skip wakeup for worker=%zu\n",
+                    worker_idx);
+            return;
+        }
+        if (target->wakeup) {
+            int rc = worker_try_wakeup(target);
+            GOC_DBG("post_to_specific_worker: worker_try_wakeup target_worker=%zu rc=%d idle_count=%zu\n",
+                    worker_idx, rc,
+                    atomic_load_explicit(&pool->idle_count, memory_order_seq_cst));
+        }
+    }
+}
+
+void pool_submit_spawn_to_worker(goc_pool* pool,
+                                 size_t worker_idx,
+                                 void (*fn)(void*),
+                                 void* arg,
+                                 goc_chan* join_ch) {
+    bool bypass_throttle = (tl_worker != NULL && tl_worker->pool == pool);
+
+    uv_mutex_lock(&pool->drain_mutex);
+    pool->live_count++;
+
+    if (bypass_throttle ||
+        (pool->pending_spawn_head == NULL && !pool_spawn_cap_reached_locked(pool))) {
+        pool->resident_count++;
+        size_t live = pool->live_count;
+        GOC_DBG("pool_submit_spawn_to_worker: fn=%p worker=%zu bypass=%d resident=%zu live=%zu (fast path)\n",
+                (void*)(uintptr_t)fn, worker_idx,
+                (int)bypass_throttle, pool->resident_count, live);
+        uv_mutex_unlock(&pool->drain_mutex);
+
+        goc_entry* entry = goc_fiber_entry_create(pool, fn, arg, join_ch);
+        entry->home_worker_idx = worker_idx;
+        post_to_specific_worker(pool, worker_idx, entry);
+        return;
+    }
+
+    GOC_DBG("pool_submit_spawn_to_worker: fn=%p worker=%zu bypass=%d DEFERRED (cap reached or queue non-empty)\n",
+            (void*)(uintptr_t)fn, worker_idx, (int)bypass_throttle);
+    goc_spawn_req* req = (goc_spawn_req*)GC_malloc_uncollectable(sizeof(goc_spawn_req));
+    if (req == NULL) {
+        uv_mutex_unlock(&pool->drain_mutex);
+        ABORT("failed to allocate deferred spawn request\n");
+    }
+
+    req->fn              = fn;
+    req->fn_arg          = arg;
+    req->join_ch         = join_ch;
+    req->home_worker_idx = worker_idx;
+    req->next            = NULL;
+    pool_enqueue_spawn_locked(pool, req);
+
+    goc_spawn_req* admitted = pool_collect_admitted_spawns_locked(pool);
+    uv_mutex_unlock(&pool->drain_mutex);
+
+    pool_dispatch_spawn_list(pool, admitted);
 }
 
 /* -------------------------------------------------------------------------
@@ -1055,11 +1229,7 @@ void post_to_run_queue(goc_pool* pool, goc_entry* entry) {
 
 static void pool_abort_if_called_from_worker(goc_pool* pool, const char* api_name) {
     if (tl_worker != NULL && tl_worker->pool == pool) {
-        fprintf(stderr,
-                "libgoc: %s called from within target pool worker thread; "
-                "this is unsupported and would deadlock\n",
-                api_name);
-        abort();
+        ABORT("%s called from within target pool worker thread; this is unsupported and would deadlock\n", api_name);
     }
 
     /* The thread-local worker sentinel is the canonical way to detect
@@ -1115,13 +1285,15 @@ goc_pool* goc_pool_make(size_t threads) {
         int rc = goc_thread_create(&pool->workers[i].thread,
                                    pool_worker_fn, &pool->workers[i]);
         if (rc != 0) {
-            fprintf(stderr,
-                    "libgoc: failed to create worker thread %zu/%zu (errno=%d)\n",
-                    i + 1, threads, rc);
-            abort();
+            ABORT("failed to create worker thread %zu/%zu (errno=%d)\n", i + 1, threads, rc);
         }
         GOC_STATS_WORKER_STATUS((int)i, pool->id, GOC_WORKER_CREATED, 0, 0, 0);
     }
+
+    /* Ensure worker threads have reached idle state before the pool is used.
+     * This avoids races where a newly-created pool returns before workers are
+     * ready to steal or service posted work. */
+    pool_wait_all_idle(pool, threads);
 
     GOC_STATS_POOL_STATUS(pool->id, GOC_POOL_CREATED, (int)threads);
     registry_add(pool);
@@ -1202,7 +1374,7 @@ void goc_pool_destroy(goc_pool* pool) {
                     wakeup_closing,
                     atomic_load_explicit(&pool->shutdown, memory_order_relaxed),
                     rcs);
-            if (rcs < 0) {
+            if (rcs < 0 && rcs != UV_ECANCELED) {
                 GOC_DBG("goc_pool_destroy: uv_async_send FAILED worker=%zu wakeup=%p rc=%d\n",
                         i, (void*)pool->workers[i].wakeup, rcs);
             }
@@ -1325,10 +1497,10 @@ goc_drain_result_t goc_pool_destroy_timeout(goc_pool* pool, uint64_t ms) {
 void goc_pool_get_steal_stats(uint64_t *attempts, uint64_t *successes,
                               uint64_t *misses,   uint64_t *idle_wakeups)
 {
-    *attempts     = atomic_load_explicit(&g_steal_attempts,  memory_order_relaxed);
-    *successes    = atomic_load_explicit(&g_steal_successes, memory_order_relaxed);
-    *misses       = atomic_load_explicit(&g_steal_misses,    memory_order_relaxed);
-    *idle_wakeups = atomic_load_explicit(&g_idle_wakeups,    memory_order_relaxed);
+    *attempts     = atomic_load_explicit(&g_steal_attempts,  memory_order_seq_cst);
+    *successes    = atomic_load_explicit(&g_steal_successes, memory_order_seq_cst);
+    *misses       = atomic_load_explicit(&g_steal_misses,    memory_order_seq_cst);
+    *idle_wakeups = atomic_load_explicit(&g_idle_wakeups,    memory_order_seq_cst);
 }
 
 /* -------------------------------------------------------------------------

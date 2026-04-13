@@ -24,19 +24,27 @@
 /* -------------------------------------------------------------------------
  * Debug logging macro
  *
- * GOC_DBG(fmt, ...) emits a [GOC_DBG]-prefixed line to stderr and flushes
- * immediately. Compiled out entirely unless LIBGOC_DEBUG is defined at build
- * time (CMake: -DLIBGOC_DEBUG=ON; compiler: -DLIBGOC_DEBUG).
+ * GOC_DBG(fmt, ...) emits a timestamped [GOC_DBG] line to an in-process
+ * buffer. The buffer is flushed automatically when full and may be flushed
+ * explicitly on normal process exit or on crash. Compiled out entirely unless
+ * LIBGOC_DEBUG is defined at build time (CMake: -DLIBGOC_DEBUG=ON;
+ * compiler: -DLIBGOC_DEBUG).
  * ---------------------------------------------------------------------- */
 #ifdef LIBGOC_DEBUG
 #  define GOC_DBG(fmt, ...) \
-     do { fprintf(stderr, "[GOC_DBG] " fmt, ##__VA_ARGS__); fflush(stderr); } while (0)
+     do { goc_dbg_log("[GOC_DBG] " fmt, ##__VA_ARGS__); } while (0)
 #else
 #  define GOC_DBG(fmt, ...) do {} while (0)
 #endif
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+#ifdef LIBGOC_DEBUG
+void goc_dbg_log(const char *fmt, ...);
+void goc_dbg_flush(void);
+void goc_dbg_flush_signal_safe(void);
 #endif
 
 /* -------------------------------------------------------------------------
@@ -347,13 +355,13 @@ goc_val_t* goc_take_try(goc_chan* ch);
  * chs : array of n channel pointers.
  * n   : number of channels (0 is allowed; returns an empty GC array).
  *
- * Calls goc_take() on each channel in order, parking the calling fiber
- * on each one until a value arrives or the channel is closed.
+ * Starts a concurrent receive on every channel in chs[], then waits until
+ * all channels have delivered a value or closed. Results are returned in
+ * the same order as the input channel array.
  *
- * Returns a GC-managed array of n goc_val_t* results, one per channel,
- * in the same order as chs[].  Each element follows the same semantics
- * as a direct goc_take() call: {val, GOC_OK} on success or
- * {NULL, GOC_CLOSED} if the channel was closed.
+ * Returns a GC-managed array of n goc_val_t* results, one per channel.
+ * Each element follows the same semantics as a direct goc_take() call:
+ * {val, GOC_OK} on success or {NULL, GOC_CLOSED} if the channel was closed.
  *
  * Must only be called from within a fiber; calling from an OS thread
  * aborts with a diagnostic message (same constraint as goc_take).
@@ -366,13 +374,13 @@ goc_val_t** goc_take_all(goc_chan** chs, size_t n);
  * chs : array of n channel pointers.
  * n   : number of channels (0 is allowed; returns an empty GC array).
  *
- * Calls goc_take_sync() on each channel in order, blocking the calling
- * OS thread on each one until a value arrives or the channel is closed.
+ * Starts a concurrent receive on every channel in chs[], then blocks the
+ * calling OS thread until all channels have delivered a value or closed.
+ * Results are returned in the same order as the input channel array.
  *
- * Returns a GC-managed array of n goc_val_t* results, one per channel,
- * in the same order as chs[].  Each element follows the same semantics
- * as a direct goc_take_sync() call: {val, GOC_OK} on success or
- * {NULL, GOC_CLOSED} if the channel was closed.
+ * Returns a GC-managed array of n goc_val_t* results, one per channel.
+ * Each element follows the same semantics as a direct goc_take_sync() call:
+ * {val, GOC_OK} on success or {NULL, GOC_CLOSED} if the channel was closed.
  *
  * Must not be called from a fiber; calling from fiber context aborts
  * with a diagnostic message (same constraint as goc_take_sync).

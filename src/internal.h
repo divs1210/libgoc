@@ -20,6 +20,7 @@
 #include <uv.h>
 #include <gc.h>
 #include "minicoro.h"
+#include "chan_type.h"
 #include "../include/goc.h"
 
 /* Prevent accidental direct uv_close() calls inside libgoc source files.
@@ -68,6 +69,22 @@ static inline void goc_uv_close_log(const char *reason, uv_handle_t *handle)
             goc_uv_callback_depth,
             goc_uv_thread_id());
 }
+
+#define ABORT(fmt, ...) \
+    do { \
+        fprintf(stderr, "libgoc: " fmt, ##__VA_ARGS__); \
+        abort(); \
+    } while (0)
+
+#if defined(_WIN32) && defined(GOC_WIN_DBG)
+#define WIN_DBG(fmt, ...) \
+    do { \
+        fprintf(stderr, "[WIN_DBG] " fmt, ##__VA_ARGS__); \
+        fflush(stderr); \
+    } while (0)
+#else
+#define WIN_DBG(fmt, ...) do {} while (0)
+#endif
 
 static inline void goc_uv_callback_enter(const char *name)
 {
@@ -242,6 +259,7 @@ struct goc_entry {
 
     /* Fiber / pool context */
     goc_pool*          pool;            /* pool on which the fiber runs */
+    size_t             home_worker_idx; /* preferred worker for resumed fiber */
     mco_coro*          coro;            /* the fiber's coroutine handle */
     uint32_t*          stack_canary_ptr;/* points to lowest stack word; checked before resume */
     void*              fiber_root_handle; /* opaque handle returned by goc_fiber_root_register */
@@ -291,24 +309,28 @@ struct goc_entry {
      *
      * Protocol (GOC_FIBER entries only):
      *   `parked` lives on the fiber's INITIAL goc_entry (accessible via
-     *   mco_get_user_data(e->coro)).  Its values:
+     *   mco_get_user_data(e->coro)).  Its values are generation-encoded:
      *     0 = parking in progress (fiber set it just before releasing locks,
      *         mco_yield has not yet returned on the pool worker side)
-     *     1 = fiber is safely MCO_SUSPENDED (pool_worker_fn set it after
-     *         mco_resume returned)
+     *     odd = active park generation in progress; the fiber has not yet
+     *           reached MCO_SUSPENDED for that generation.
+     *     even = fiber is safely MCO_SUSPENDED for the encoded generation.
      *
      *   Fiber (goc_take / goc_put / goc_alts slow path):
-     *     Sets fiber_entry->parked = 0 while still holding the channel lock(s),
-     *     then releases the lock(s) and calls mco_yield.
+     *     Sets fiber_entry->parked = (gen << 1) | 1 while holding channel
+     *     lock(s), then releases the lock(s) and calls mco_yield.
      *
      *   pool_worker_fn (after mco_resume returns):
-     *     Sets fiber_entry->parked = 1.
+     *     Bumps the odd parked value to the even suspended value by adding 1.
      *
      *   wake() and goc_close() (GOC_FIBER case):
-     *     Spin with sched_yield() while fiber_entry->parked == 0 before
-     *     calling post_to_run_queue.  This guarantees the coroutine is truly
-     *     MCO_SUSPENDED before any worker thread calls mco_resume. */
-    _Atomic int              parked;      /* per-fiber flag; see protocol above */
+     *     Spin until the fiber_entry parked state reaches the exact suspended
+     *     value for the park generation being awakened.  This guarantees the
+     *     coroutine is truly MCO_SUSPENDED before any worker thread calls
+     *     mco_resume.
+     * -------------------------------------------------------------------------- */
+    _Atomic uint64_t         parked;      /* encoded park generation/state */
+    uint64_t                 parked_gen;  /* park generation assigned to this entry */
 };
 
 struct goc_spawn_req {
@@ -316,6 +338,7 @@ struct goc_spawn_req {
     void               (*fn)(void*);
     void*                 fn_arg;
     goc_chan*             join_ch;
+    size_t                home_worker_idx; /* optional worker affinity for deferred spawns */
 };
 
 /* ---------------------------------------------------------------------------
@@ -346,7 +369,7 @@ struct goc_spawn_req {
     /* Fixed stack mode: enable overflow protection */
     #define goc_stack_canary_init(entry)  do { (entry)->stack_canary_ptr = (uint32_t*)(entry)->coro->stack_base; } while(0)
     #define goc_stack_canary_set(ptr)     do { *(ptr) = GOC_STACK_CANARY; } while(0)
-    #define goc_stack_canary_check(ptr)   do { if (*(ptr) != GOC_STACK_CANARY) { fprintf(stderr, "libgoc: stack canary corrupted at %p (val=0x%08x); likely stack overflow\n", (void*)(ptr), *(ptr)); abort(); } } while(0)
+    #define goc_stack_canary_check(ptr)   do { if (*(ptr) != GOC_STACK_CANARY) { ABORT("stack canary corrupted at %p (val=0x%08x); likely stack overflow\n", (void*)(ptr), *(ptr)); } } while(0)
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -374,7 +397,15 @@ void chan_register(goc_chan* ch);
 void chan_unregister(goc_chan* ch);
 
 /* channel.c → used by goc_io.c */
-int goc_chan_is_closing(goc_chan* ch);
+goc_chan_close_state_t goc_chan_close_state(goc_chan* ch);
+static inline bool goc_chan_has_state(goc_chan* ch, goc_chan_close_state_t state)
+{
+    return goc_chan_close_state(ch) == state;
+}
+static inline bool goc_chan_is_open(goc_chan* ch)
+{
+    return goc_chan_has_state(ch, GOC_CHAN_OPEN);
+}
 
 /* gc.c → called from goc_init (gc.c) */
 void live_uv_handles_init(void);
@@ -386,8 +417,10 @@ void goc_deferred_handle_unreg_init(void);
 void goc_deferred_handle_unreg_shutdown(void);
 void goc_deferred_handle_unreg_add(uv_handle_t* handle);
 void goc_deferred_handle_unreg_flush(void);
+size_t goc_deferred_handle_unreg_len(void);
 void goc_deferred_close_add(uv_handle_t* handle, uv_close_cb cb, goc_chan* ch);
 void goc_deferred_close_flush(void);
+size_t goc_deferred_close_len(void);
 
 /* gc.c → used by fiber.c, pool.c */
 void* goc_fiber_root_register(mco_coro* coro, void* top, goc_entry* entry);
@@ -406,11 +439,26 @@ void* mco_get_suspended_sp(mco_coro* co);
 
 /* pool.c → used by fiber.c, channel.c */
 void post_to_run_queue(goc_pool* pool, goc_entry* entry);
+void post_to_specific_worker(goc_pool* pool,
+                             size_t worker_idx,
+                             goc_entry* entry);
 int  goc_pool_id(goc_pool* pool);
 void pool_submit_spawn(goc_pool* pool,
                        void (*fn)(void*),
                        void* arg,
                        goc_chan* join_ch);
+void pool_submit_spawn_to_worker(goc_pool* pool,
+                                 size_t worker_idx,
+                                 void (*fn)(void*),
+                                 void* arg,
+                                 goc_chan* join_ch);
+
+/* Internal helper: spawn a fiber on a specific worker. */
+goc_chan* goc_go_on_worker(goc_pool* pool,
+                            size_t worker_idx,
+                            void (*fn)(void*),
+                            void* arg);
+
 /* Test helper: spin until at least n workers are idle (parked on idle_sem).
  * Not part of the public API; declared here for use by internal test files. */
 void pool_wait_all_idle(goc_pool* pool, size_t n);
@@ -442,8 +490,10 @@ void loop_init(void);
 void loop_shutdown(void);
 int  goc_loop_is_shutting_down(void);
 void post_callback(goc_entry* entry, void* value);
+int  goc_loop_submit_callback_if_running(goc_entry* entry);
 void post_on_loop(void (*fn)(void*), void* arg);
 int  post_on_loop_checked(void (*fn)(void*), void* arg);
+void goc_loop_wakeup(void);
 
 /* goc_io.c → init / shutdown helpers */
 void goc_io_init(void);
