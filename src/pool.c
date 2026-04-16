@@ -226,19 +226,19 @@ static int worker_try_wakeup(goc_worker* w) {
     if (!w || !w->wakeup) {
         GOC_DBG("worker_try_wakeup: invalid worker or missing wakeup w=%p wakeup=%p\n",
                 (void*)w, w ? (void*)w->wakeup : NULL);
-        WIN_DBG("worker_try_wakeup: WIN invalid worker or missing wakeup w=%p wakeup=%p\n",
+        NON_LINUX_DBG("worker_try_wakeup: WIN invalid worker or missing wakeup w=%p wakeup=%p\n",
                 (void*)w, w ? (void*)w->wakeup : NULL);
         return UV_ECANCELED;
     }
     if (atomic_load_explicit(&w->closing, memory_order_acquire)) {
         GOC_DBG("worker_try_wakeup: worker closing w=%p\n", (void*)w);
-        WIN_DBG("worker_try_wakeup: WIN worker closing w=%p\n", (void*)w);
+        NON_LINUX_DBG("worker_try_wakeup: WIN worker closing w=%p\n", (void*)w);
         return UV_ECANCELED;
     }
     if (uv_is_closing((uv_handle_t*)w->wakeup)) {
         GOC_DBG("worker_try_wakeup: wakeup closing w=%p wakeup=%p\n",
                 (void*)w, (void*)w->wakeup);
-        WIN_DBG("worker_try_wakeup: WIN wakeup closing w=%p wakeup=%p\n",
+        NON_LINUX_DBG("worker_try_wakeup: WIN wakeup closing w=%p wakeup=%p\n",
                 (void*)w, (void*)w->wakeup);
         return UV_ECANCELED;
     }
@@ -247,7 +247,7 @@ static int worker_try_wakeup(goc_worker* w) {
     if (rc == UV_EBADF || rc == UV_EINVAL) {
         GOC_DBG("worker_try_wakeup: wakeup send race; closing/invalid wakeup w=%p wakeup=%p rc=%d\n",
                 (void*)w, (void*)w->wakeup, rc);
-        WIN_DBG("worker_try_wakeup: WIN wakeup send race; closing/invalid wakeup w=%p wakeup=%p rc=%d\n",
+        NON_LINUX_DBG("worker_try_wakeup: WIN wakeup send race; closing/invalid wakeup w=%p wakeup=%p rc=%d\n",
                 (void*)w, (void*)w->wakeup, rc);
         return UV_ECANCELED;
     }
@@ -706,7 +706,7 @@ static void pool_worker_fn(void* arg) {
                     int rc = worker_try_wakeup(&pool->workers[idx]);
                     GOC_DBG("pool_worker_fn: neighbor wakeup worker=%zu rc=%d idle_count=%zu deque_depth=%zu\n",
                             idx, rc, idle, depth);
-                    WIN_DBG("pool_worker_fn: WIN wakeup candidate worker=%zu neighbor=%zu idle=%zu depth=%zu rc=%d\n",
+                    NON_LINUX_DBG("pool_worker_fn: WIN wakeup candidate worker=%zu neighbor=%zu idle=%zu depth=%zu rc=%d\n",
                             tl_worker->index, idx, idle, depth, rc);
                 }
             }
@@ -837,7 +837,7 @@ run:
                         int rc = worker_try_wakeup(&pool->workers[neighbor]);
                         GOC_DBG("pool_worker_fn: neighbor wakeup worker=%zu rc=%d idle=%zu depth=%zu\n",
                                 neighbor, rc, idle, depth);
-                        WIN_DBG("pool_worker_fn: WIN post-yield wakeup worker=%zu neighbor=%zu idle=%zu depth=%zu rc=%d\n",
+                        NON_LINUX_DBG("pool_worker_fn: WIN post-yield wakeup worker=%zu neighbor=%zu idle=%zu depth=%zu rc=%d\n",
                                 tl_worker->index, neighbor, idle, depth, rc);
                     }
                 }

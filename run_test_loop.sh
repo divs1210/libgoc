@@ -7,10 +7,21 @@ LOG_FILE="${LOG_FILE:-test.log}"
 num_tests=1
 debug_build=1
 max_tries=20
+vmem_build=0
+non_linux_dbg_build=0
+if [[ "$(uname -s)" == "Linux" ]]; then
+    reuseport_default=1
+else
+    reuseport_default=0
+fi
+reuseport_build="$reuseport_default"
 
 usage() {
-    echo "Usage: $0 [-test-count <num-tests>] [-max-tries <n>] [-dbg <0|1>] <test-source-path>"
-    echo "Example: $0 -test-count 1 -max-tries 20 -dbg 1 tests/test_p06_thread_pool.c"
+    echo "Usage: $0 [-test-count <num-tests>] [-max-tries <n>] [-dbg <0|1>] [-rp <0|1>] [-nld <0|1>] [-vmem <0|1>] <test-source-path>"
+    echo "  -rp   Build with GOC_HTTP_REUSEPORT=1 when 1, otherwise 0. Defaults to $reuseport_default on this platform."
+    echo "  -nld  Build with GOC_NON_LINUX_DBG=1 when 1, OFF when 0. Default: 0."
+    echo "  -vmem Build with LIBGOC_VMEM=ON when 1, OFF when 0. Default: 0."
+    echo "Example: $0 -test-count 1 -max-tries 20 -dbg 1 -rp 1 -nld 0 -vmem 0 tests/test_p06_thread_pool.c"
     exit 1
 }
 
@@ -51,6 +62,33 @@ while [[ $# -gt 0 ]]; do
             debug_build="$1"
             shift
             ;;
+        -rp)
+            shift
+            if [[ $# -eq 0 || ! "$1" =~ ^[01]$ ]]; then
+                echo "Error: -rp requires 0 or 1."
+                usage
+            fi
+            reuseport_build="$1"
+            shift
+            ;;
+        -nld)
+            shift
+            if [[ $# -eq 0 || ! "$1" =~ ^[01]$ ]]; then
+                echo "Error: -nld requires 0 or 1."
+                usage
+            fi
+            non_linux_dbg_build="$1"
+            shift
+            ;;
+        -vmem)
+            shift
+            if [[ $# -eq 0 || ! "$1" =~ ^[01]$ ]]; then
+                echo "Error: -vmem requires 0 or 1."
+                usage
+            fi
+            vmem_build="$1"
+            shift
+            ;;
         -*)
             echo "Error: Unknown option '$1'."
             usage
@@ -80,6 +118,9 @@ if [[ "$debug_build" -eq 1 ]]; then
 else
     build_type="-DLIBGOC_DEBUG=OFF"
 fi
+rp_arg="-DGOC_HTTP_REUSEPORT=$reuseport_build"
+vmem_arg="-DLIBGOC_VMEM=$vmem_build"
+nld_arg="-DGOC_NON_LINUX_DBG=$non_linux_dbg_build"
 
 test_name="$(basename "$test_source" .c)"
 expected_line="${num_tests}/${num_tests} tests passed"
@@ -87,7 +128,7 @@ binary_path="$BUILD_DIR/$test_name"
 
 echo "Rebuilding from scratch in '$BUILD_DIR'..."
 rm -rf "$BUILD_DIR"
-cmake -S . -B "$BUILD_DIR" -DGOC_ENABLE_STATS=ON $build_type
+cmake -S . -B "$BUILD_DIR" -DGOC_ENABLE_STATS=ON $build_type $rp_arg $vmem_arg $nld_arg
 cmake --build "$BUILD_DIR" --target "$test_name"
 
 if [[ ! -x "$binary_path" ]]; then
@@ -95,6 +136,9 @@ if [[ ! -x "$binary_path" ]]; then
     exit 1
 fi
 
+echo "----------------------------------------------------------------"
+echo "| Debug build: $debug_build | reuseport: $reuseport_build | vmem: $vmem_build | non-Linux debug: $non_linux_dbg_build |"
+echo "----------------------------------------------------------------"
 echo "Running '$test_name' in a loop, expecting '$expected_line'..."
 
 tests_run=0

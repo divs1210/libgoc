@@ -2015,6 +2015,14 @@ static void on_connect_cb(uv_connect_t* req, int status)
                                   memory_order_release);
     }
     atomic_fetch_sub_explicit(&g_uv_active_reqs, 1, memory_order_acq_rel);
+    NON_LINUX_DBG("on_connect_cb: req=%p status=%d err=%s ch=%p inflight_tracked=%d inflight=%ld active_reqs=%ld\n",
+            (void*)req,
+            status,
+            status < 0 ? uv_strerror(status) : "OK",
+            (void*)ctx->ch,
+            ctx->inflight_tracked,
+            atomic_load_explicit(&g_tcp_connect_inflight, memory_order_relaxed),
+            atomic_load_explicit(&g_uv_active_reqs, memory_order_relaxed));
     GOC_DBG("on_connect_cb: req=%p status=%d ch=%p inflight_tracked=%d inflight=%ld active_reqs=%ld\n",
             (void*)req,
             status,
@@ -2100,6 +2108,13 @@ static void on_tcp_connect_dispatch(void* arg)
                                   memory_order_acq_rel);
         atomic_fetch_add_explicit(&g_uv_active_reqs, 1, memory_order_acq_rel);
     }
+    NON_LINUX_DBG("on_tcp_connect_dispatch: uv_tcp_connect rc=%d err=%s handle=%p addr_family=%d inflight=%ld active_reqs=%ld\n",
+            rc,
+            rc < 0 ? uv_strerror(rc) : "OK",
+            (void*)d->handle,
+            d->addr.ss_family,
+            atomic_load_explicit(&g_tcp_connect_inflight, memory_order_relaxed),
+            atomic_load_explicit(&g_uv_active_reqs, memory_order_relaxed));
     GOC_DBG("on_tcp_connect_dispatch: uv_tcp_connect rc=%d req=%p handle=%p inflight=%ld active_reqs=%ld\n",
             rc, (void*)&ctx->req, (void*)d->handle,
             atomic_load_explicit(&g_tcp_connect_inflight, memory_order_relaxed),

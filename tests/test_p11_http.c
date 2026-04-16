@@ -1703,10 +1703,18 @@ static void p11_32_worker(void* arg)
         uint64_t done_ns = uv_hrtime();
 
         if (done_ns >= a->warmup_end_ns && done_ns < a->measure_end_ns) {
-            if (r && r->status == 200)
+            if (r && r->status == 200) {
                 succ++;
-            else
+            } else {
                 err++;
+                printf(
+                    "P11.32 worker error: url=%s status=%d r=%p succ=%llu err=%llu\n",
+                    a->url,
+                    r ? r->status : -1,
+                    (void*)r,
+                    (unsigned long long)succ,
+                    (unsigned long long)err);
+            }
         }
     }
 
@@ -1793,7 +1801,13 @@ static int p11_32_mode_run(int pool_threads, uint64_t* elapsed_ns_out,
     setenv("GOC_POOL_THREADS", envbuf, 1);
 #endif
 
+    printf("P11.32 mode_run: entering pool_threads=%d\n", pool_threads);
     goc_init();
+
+    goc_pool* default_pool = goc_current_or_default_pool();
+    printf("P11.32 mode_run: after goc_init default_pool=%p threads=%zu\n",
+            (void*)default_pool,
+            default_pool ? goc_pool_thread_count(default_pool) : 0);
 
     p11_32_run_t run;
     memset(&run, 0, sizeof(run));
@@ -1802,6 +1816,13 @@ static int p11_32_mode_run(int pool_threads, uint64_t* elapsed_ns_out,
 
     goc_go(fiber_p11_32_run, &run);
     goc_val_t* vd = goc_take_sync(run.done);
+
+    printf("P11.32 mode_run: done vd=%p ok=%d nreq=%d err=%llu elapsed_ns=%llu\n",
+            (void*)vd,
+            vd ? (int)vd->ok : -1,
+            run.nreq,
+            (unsigned long long)run.err,
+            (unsigned long long)run.elapsed_ns);
 
     int ok = vd && goc_unbox_int(vd->val) == 1 && run.nreq > 0 && run.err == 0;
     if (ok) {
@@ -1816,31 +1837,45 @@ static int p11_32_mode_run(int pool_threads, uint64_t* elapsed_ns_out,
 
 static void test_p11_32(void)
 {
-    TEST_BEGIN("P11.32 Throughput comparison pool=4 vs pool=1 (bench-style throughput workload)");
+    TEST_BEGIN("P11.32 Throughput comparison pool=1,2,4,8 (bench-style throughput workload)");
 
-    uint64_t ns1 = 0, ns2 = 0;
-    int req1 = 0, req2 = 0;
-    uint64_t err1 = 0, err2 = 0;
+    uint64_t ns1 = 0, ns2 = 0, ns4 = 0, ns8 = 0;
+    int req1 = 0, req2 = 0, req4 = 0, req8 = 0;
+    uint64_t err1 = 0, err2 = 0, err4 = 0, err8 = 0;
 
     ASSERT(p11_32_mode_run(1, &ns1, &req1, &err1) == 0);
-    ASSERT(p11_32_mode_run(4, &ns2, &req2, &err2) == 0);
-    ASSERT(req1 > 0 && req2 > 0);
-    ASSERT(err1 == 0 && err2 == 0);
+    ASSERT(p11_32_mode_run(2, &ns2, &req2, &err2) == 0);
+    ASSERT(p11_32_mode_run(4, &ns4, &req4, &err4) == 0);
+    ASSERT(p11_32_mode_run(8, &ns8, &req8, &err8) == 0);
+    ASSERT(req1 > 0 && req2 > 0 && req4 > 0 && req8 > 0);
+    ASSERT(err1 == 0 && err2 == 0 && err4 == 0 && err8 == 0);
     ASSERT(ns1 == (uint64_t)P11_32_MEASURE_MS * 1000000ULL);
     ASSERT(ns2 == (uint64_t)P11_32_MEASURE_MS * 1000000ULL);
+    ASSERT(ns4 == (uint64_t)P11_32_MEASURE_MS * 1000000ULL);
+    ASSERT(ns8 == (uint64_t)P11_32_MEASURE_MS * 1000000ULL);
 
     double sec1 = (double)ns1 / 1e9;
     double sec2 = (double)ns2 / 1e9;
+    double sec4 = (double)ns4 / 1e9;
+    double sec8 = (double)ns8 / 1e9;
     double rps1 = (double)req1 / sec1;
     double rps2 = (double)req2 / sec2;
-    double ratio = (rps1 > 0.0) ? (rps2 / rps1) : 0.0;
+    double rps4 = (double)req4 / sec4;
+    double rps8 = (double)req8 / sec8;
+    double ratio2 = (rps1 > 0.0) ? (rps2 / rps1) : 0.0;
+    double ratio4 = (rps1 > 0.0) ? (rps4 / rps1) : 0.0;
+    double ratio8 = (rps1 > 0.0) ? (rps8 / rps1) : 0.0;
 
     printf("\n    [P11.32] pool=1: %.2f req/s (%d req in %.3fs)\n", rps1, req1, sec1);
-    printf("    [P11.32] pool=4: %.2f req/s (%d req in %.3fs)\n", rps2, req2, sec2);
-    printf("    [P11.32] ratio pool4/pool1 = %.3f (informational)\n", ratio);
+    printf("    [P11.32] pool=2: %.2f req/s (%d req in %.3fs)\n", rps2, req2, sec2);
+    printf("    [P11.32] pool=4: %.2f req/s (%d req in %.3fs)\n", rps4, req4, sec4);
+    printf("    [P11.32] pool=8: %.2f req/s (%d req in %.3fs)\n", rps8, req8, sec8);
+    printf("    [P11.32] ratios: p2/p1=%.3f p4/p1=%.3f p8/p1=%.3f\n", ratio2, ratio4, ratio8);
 
-    ASSERT(rps1 > 0.0 && rps2 > 0.0);
-    ASSERT(ratio >= 1.1); /* at least 10% faster */
+    ASSERT(rps1 > 0.0 && rps2 > 0.0 && rps4 > 0.0 && rps8 > 0.0);
+    ASSERT(ratio2 > 1);
+    ASSERT(ratio4 > ratio2);
+    ASSERT(ratio8 > ratio4);
 
     TEST_PASS();
 done:;

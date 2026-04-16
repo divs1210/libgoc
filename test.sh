@@ -7,10 +7,21 @@ BUILD_DIR="${BUILD_DIR:-build}"
 LOG_FILE="${LOG_FILE:-test.log}"
 WATCH_MODE="${WATCH:-0}"
 DEBUG_BUILD="0"
+VMEM="0"
+NON_LINUX_DBG="0"
+if [[ "$(uname -s)" == "Linux" ]]; then
+    REUSEPORT_DEFAULT=1
+else
+    REUSEPORT_DEFAULT=0
+fi
+REUSEPORT="$REUSEPORT_DEFAULT"
 
 usage() {
-    echo "Usage: $0 [-dbg <0|1>]"
+    echo "Usage: $0 [-dbg <0|1>] [-rp <0|1>] [-vmem <0|1>]"
     echo "  -dbg  Build with LIBGOC_DEBUG=ON when 1, OFF when 0. Default: 0."
+    echo "  -rp   Build with GOC_HTTP_REUSEPORT=1 when 1, otherwise 0. Default: $REUSEPORT_DEFAULT."
+    echo "  -vmem Build with LIBGOC_VMEM=ON when 1, OFF when 0. Default: 0."
+    echo "  -nld  Build with GOC_NON_LINUX_DBG=1 when 1, OFF when 0. Default: 0."
     exit 1
 }
 
@@ -23,6 +34,33 @@ while [[ $# -gt 0 ]]; do
                 usage
             fi
             DEBUG_BUILD="$1"
+            shift
+            ;;
+        -rp)
+            shift
+            if [[ $# -eq 0 || ! "$1" =~ ^[01]$ ]]; then
+                echo "Error: -rp requires 0 or 1."
+                usage
+            fi
+            REUSEPORT="$1"
+            shift
+            ;;
+        -vmem)
+            shift
+            if [[ $# -eq 0 || ! "$1" =~ ^[01]$ ]]; then
+                echo "Error: -vmem requires 0 or 1."
+                usage
+            fi
+            VMEM="$1"
+            shift
+            ;;
+        -nld)
+            shift
+            if [[ $# -eq 0 || ! "$1" =~ ^[01]$ ]]; then
+                echo "Error: -nld requires 0 or 1."
+                usage
+            fi
+            NON_LINUX_DBG="$1"
             shift
             ;;
         -h|--help)
@@ -43,7 +81,10 @@ FAILED_TESTS=()
 configure_build() {
     cmake -S . -B "$BUILD_DIR" \
         -DGOC_ENABLE_STATS=ON \
-        -DLIBGOC_DEBUG="$DEBUG_BUILD"
+        -DLIBGOC_DEBUG="$DEBUG_BUILD" \
+        -DGOC_HTTP_REUSEPORT="$REUSEPORT" \
+        -DLIBGOC_VMEM="$VMEM" \
+        -DGOC_NON_LINUX_DBG="$NON_LINUX_DBG"
 }
 
 build_project() {
@@ -133,6 +174,9 @@ echo "== libgoc test runner =="
 echo "Build dir : $BUILD_DIR"
 echo "Log file  : $LOG_FILE"
 echo "Debug     : LIBGOC_DEBUG=$debug_status"
+echo "Reuseport : GOC_HTTP_REUSEPORT=$REUSEPORT"
+echo "Non-Linux : GOC_NON_LINUX_DBG=$NON_LINUX_DBG"
+echo "VMEM      : LIBGOC_VMEM=$VMEM"
 echo "Watch mode: $WATCH_MODE"
 
 last_status=0

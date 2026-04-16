@@ -76,14 +76,14 @@ static inline void goc_uv_close_log(const char *reason, uv_handle_t *handle)
         abort(); \
     } while (0)
 
-#if defined(_WIN32) && defined(GOC_WIN_DBG)
-#define WIN_DBG(fmt, ...) \
+#if !defined(__linux__) && defined(GOC_NON_LINUX_DBG)
+#define NON_LINUX_DBG(fmt, ...) \
     do { \
-        fprintf(stderr, "[WIN_DBG] " fmt, ##__VA_ARGS__); \
+        fprintf(stderr, "[NON_LINUX_DBG] " fmt, ##__VA_ARGS__); \
         fflush(stderr); \
     } while (0)
 #else
-#define WIN_DBG(fmt, ...) do {} while (0)
+#define NON_LINUX_DBG(fmt, ...) do {} while (0)
 #endif
 
 static inline void goc_uv_callback_enter(const char *name)

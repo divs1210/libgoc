@@ -32,6 +32,8 @@ jobs:
           - { os: ubuntu-latest,  cmake_flags: "",                   name: "Ubuntu (canary)" }
           - { os: macos-latest,   cmake_flags: "",                   name: "macOS (canary)" }
           - { os: windows-latest, cmake_flags: "",                   name: "Windows (canary)" }
+          # Linux fallback path without SO_REUSEPORT
+          - { os: ubuntu-latest,  cmake_flags: "-DGOC_HTTP_REUSEPORT=0", name: "Ubuntu (no reuseport)" }
           # Virtual memory mode - Ubuntu only
           - { os: ubuntu-latest,  cmake_flags: "-DLIBGOC_VMEM=ON",  name: "Ubuntu (vmem)" }
 
@@ -134,7 +136,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           set -x
-          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo ${{ matrix.cmake_flags }}
+          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGOC_NON_LINUX_DBG=ON ${{ matrix.cmake_flags }}
           cmake --build build --parallel $(sysctl -n hw.ncpu)
         timeout-minutes: 5
 
@@ -177,7 +179,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGOC_WIN_DBG=ON ${{ matrix.cmake_flags }}
+          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGOC_NON_LINUX_DBG=ON ${{ matrix.cmake_flags }}
           cmake --build build --parallel $(nproc)
         timeout-minutes: 10
 
