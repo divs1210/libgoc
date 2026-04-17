@@ -103,17 +103,12 @@ typedef goc_http_status_t (*goc_http_middleware_t)(goc_http_ctx_t* ctx);
  * Example (all defaults):
  *   goc_http_server_t* srv = goc_http_server_make(goc_http_server_opts());
  *
- * Example (custom pool, one middleware):
+ * Example (one middleware):
  *   goc_http_server_opts_t* opts = goc_http_server_opts();
- *   opts->pool       = my_pool;
  *   opts->middleware = goc_array_of(auth_mw);
  *   goc_http_server_t* srv = goc_http_server_make(opts);
  */
 typedef struct {
-    /* Pool whose libuv loop the server runs on.
-     * Default (NULL): goc_default_pool(). */
-    goc_pool* pool;
-
     /* Middleware chain executed in order inside the per-request fiber before
      * the handler is called.  goc_array of goc_http_middleware_t function
      * pointers.  Default (NULL): no middleware. */
@@ -134,10 +129,6 @@ typedef struct {
  * Obtain a heap-allocated zero-initialised default with
  * goc_http_request_opts(); set only the fields you need. */
 typedef struct {
-    /* Pool to run the outbound client fiber on.
-     * Default (NULL): goc_current_or_default_pool(). */
-    goc_pool* pool;
-
     /* Extra headers to send with the request.
      * goc_array of goc_http_header_t*.  Default (NULL): none. */
     goc_array* headers;
@@ -161,8 +152,8 @@ typedef struct {
 /**
  * goc_http_server_opts — allocate and return a default options struct.
  *
- * All fields zero-initialised: pool defaults to goc_default_pool(),
- * middleware to NULL.  Never returns NULL (aborts on allocation failure).
+ * All fields zero-initialised: middleware to NULL.
+ * Never returns NULL (aborts on allocation failure).
  */
 goc_http_server_opts_t* goc_http_server_opts(void);
 
@@ -280,7 +271,7 @@ goc_chan* goc_http_server_respond_error(goc_http_ctx_t* ctx, int status,
 /**
  * goc_http_request_opts — allocate and return a default request options
  * struct.  Zero-initialised: no extra headers, no timeout,
- * keep-alive disabled, and pool set to goc_current_or_default_pool().
+ * keep-alive disabled.
  */
 goc_http_request_opts_t* goc_http_request_opts(void);
 
@@ -303,8 +294,7 @@ goc_http_request_opts_t* goc_http_request_opts(void);
  * pre-filled channel carrying a zero-status response is returned.
  *
  * Must be called from fiber context when a timeout is set; may be called
- * from any fiber context otherwise (pool assignment follows opts->pool or
- * goc_current_or_default_pool()).
+ * from any fiber context otherwise.
  */
 goc_chan* goc_http_request(const char* method, const char* url,
                            const char* content_type,

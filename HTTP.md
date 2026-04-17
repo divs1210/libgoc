@@ -130,20 +130,17 @@ int main(void) {
 Both the server and client are built on `goc_io` TCP and share libgoc's
 `uv_loop_t`. Neither requires any additional runtime dependency beyond libuv.
 
-**Server**: `goc_http_server_listen` binds a GC-managed `uv_tcp_t` and calls
-`goc_io_tcp_server_make` to obtain an accept channel. An accept-loop fiber
-reads one `uv_tcp_t*` per accepted connection and spawns a per-connection
-fiber. The connection fiber reads a complete HTTP/1.1 request via
-`goc_io_read_start`, parses it with `phr_parse_request` (picohttpparser),
-matches a route, runs middleware, calls the handler, and writes the response
-via `goc_io_write` (which dispatches the `uv_write` to the event loop thread
-through a `uv_async` bridge). No extra threads or mutexes are required beyond
-what `goc_io` already uses.
+**Server**: `goc_http_server_listen` has two operating modes selected at runtime:
+
+- **SO_REUSEPORT multi-listener** (Linux, pool size ≥ 2): one `uv_tcp_t` listener is created per pool worker, each bound to the same `host:port` with `SO_REUSEPORT`. The kernel load-balances `accept()` calls across all N listeners, distributing connections across workers without any application-level round-robin. Each worker runs its own accept-loop fiber (`reuseport_accept_loop_fiber`) that initialises its TCP handle on the worker's own `uv_loop_t`, avoiding cross-thread dispatch for all subsequent I/O on accepted connections.
+
+- **Single-listener fallback** (pool size == 1 or no `SO_REUSEPORT`): a single GC-managed `uv_tcp_t` is bound and `goc_io_tcp_server_make` is used to obtain an accept channel. One accept-loop fiber dispatches all connections.
+
+In both modes, each accepted connection is handled by a per-connection fiber spawned via `goc_go_on`. The connection fiber reads a complete HTTP/1.1 request via `goc_io_read_start`, parses it with `phr_parse_request` (picohttpparser), matches a route, runs middleware, calls the handler, and writes the response via `goc_io_write`. In the multi-listener path all I/O on a connection uses the same worker's loop directly (no cross-thread hops). No extra threads or mutexes are required beyond what `goc_io` already uses.
 
 **Client**: outbound requests return a channel that delivers a
 `goc_http_response_t*` when the response arrives. A single `http_client_fiber`
-on `opts->pool` (or `goc_current_or_default_pool()` when unset) drives the
-entire request: DNS lookup via
+on the current-or-default pool drives the entire request: DNS lookup via
 `goc_io_getaddrinfo`, TCP connect via `goc_io_tcp_connect`, write via
 `goc_io_write`, and read/parse via `goc_io_read_start`. All I/O completes
 through `goc_take` in the fiber. The event loop is never blocked; other fibers
@@ -166,7 +163,7 @@ handler fiber
     │ CSP operations (channels, I/O, timeouts, …)
     │ goc_take(goc_http_server_respond(ctx, …))
     ▼
-goc_io_write (→ post_on_loop → callback queue → loop thread → uv_write) → TCP → client
+goc_io_write (→ dispatch_on_handle_loop → direct call or post_on_loop → uv_write) → TCP → client
 ```
 
 The raw connection handle is never exposed to user code. All access goes
@@ -180,7 +177,7 @@ through `goc_http_ctx_t` helpers; the context is valid only until
 Server-side functions (`goc_http_server_respond`, `goc_http_server_header`, etc.) operate
 within the per-connection fiber and do not need any cross-thread dispatch.
 Client-side functions (`goc_http_get`, `goc_http_post`, etc.) launch a fiber
-on `opts->pool` (or the current-or-default pool when unset) that drives the entire request through `goc_io` channel
+on the current-or-default pool that drives the entire request through `goc_io` channel
 operations and are safe to call from any fiber.
 
 `goc_http_ctx_t` must not be passed across independent requests or stored
@@ -237,20 +234,12 @@ typedef goc_http_status_t (*goc_http_middleware_t)(goc_http_ctx_t* ctx);
  * Obtain a heap-allocated zero-initialised default with goc_http_server_opts();
  * set only the fields you need.
  *
- * Example (all defaults):
- *   goc_http_server_t* srv = goc_http_server_make(goc_http_server_opts());
- *
- * Example (custom pool, one middleware):
+ * Example (one middleware):
  *   goc_http_server_opts_t* opts = goc_http_server_opts();
- *   opts->pool       = my_pool;
  *   opts->middleware = goc_array_of(auth_mw);
  *   goc_http_server_t* srv = goc_http_server_make(opts);
  */
 typedef struct {
-    /* Pool whose libuv loop the server runs on.
-    * Default (NULL): goc_current_or_default_pool(). */
-    goc_pool* pool;
-
     /* Middleware chain executed in order inside the per-request fiber before
      * the handler is called.  goc_array of goc_http_middleware_t function pointers.
      * Default (NULL): no middleware. */
@@ -295,7 +284,7 @@ typedef struct {
 |---|---|---|
 | `goc_http_server_opts` | `goc_http_server_opts_t* goc_http_server_opts(void)` | Allocate and return a default options struct. `pool` defaults to `goc_current_or_default_pool()`, `middleware` to NULL. |
 | `goc_http_server_make` | `goc_http_server_t* goc_http_server_make(const goc_http_server_opts_t* opts)` | Allocate and initialise a server from `opts`. Returns a GC-managed pointer. Never returns NULL (aborts on failure). |
-| `goc_http_server_listen` | `goc_chan* goc_http_server_listen(goc_http_server_t* srv, const char* host, int port)` | Bind and start listening on `host:port`. Returns a channel that delivers `goc_box_int(rc)` once `uv_listen` has been called on the event-loop thread (rc == 0 = ready; rc < 0 = libuv error). Always `goc_take()` the channel before sending requests. |
+| `goc_http_server_listen` | `goc_chan* goc_http_server_listen(goc_http_server_t* srv, const char* host, int port)` | Bind and start listening on `host:port`. On Linux with SO_REUSEPORT and a pool of size ≥ 2, creates one listener per worker for kernel-level load balancing. Falls back to a single listener otherwise. Returns a channel that delivers `goc_box_int(rc)` once all listeners are ready (rc == 0 = ready; rc < 0 = first libuv error). Always `goc_take()` the channel before sending requests. |
 | `goc_http_server_close` | `goc_chan* goc_http_server_close(goc_http_server_t* srv)` | Gracefully stop accepting new connections and drain in-flight requests. Returns a channel delivering `goc_box_int(0)` when shutdown is complete. Safe from any context. |
 
 ```c
@@ -440,7 +429,7 @@ goc_http_response_t* r2 = goc_take(c2)->val;
 
 | Function | Signature | Description |
 |---|---|---|
-| `goc_http_request_opts` | `goc_http_request_opts_t* goc_http_request_opts(void)` | Allocate and return a default request options struct. Pool defaults to `goc_current_or_default_pool()`, no headers, no timeout, keep-alive disabled. |
+| `goc_http_request_opts` | `goc_http_request_opts_t* goc_http_request_opts(void)` | Allocate and return a default request options struct. No headers, no timeout, keep-alive disabled. |
 
 ### REST helpers
 

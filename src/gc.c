@@ -20,6 +20,11 @@
 #include "../include/goc.h"
 #include "chan_type.h"
 #include "internal.h"
+#include "channel_internal.h"
+
+/* Forward declarations for module lifecycle reset hooks. */
+extern void goc_http_reset_globals(void);
+extern size_t goc_cb_queue_get_hwm(void);
 
 /* ---------------------------------------------------------------------------
  * goc_thread_create / goc_thread_join  (all platforms)
@@ -334,10 +339,7 @@ static void lifecycle_abort_non_main_thread(const char* fn_name)
 
     uv_thread_t self = uv_thread_self();
     if (!uv_thread_equal(&self, &g_main_thread)) {
-        fprintf(stderr,
-                "libgoc: %s must be called from the main thread\n",
-                fn_name);
-        abort();
+        ABORT("%s must be called from the main thread\n", fn_name);
     }
 }
 
@@ -369,8 +371,7 @@ char* goc_sprintf(const char* fmt, ...) {
     int len = vsnprintf(NULL, 0, fmt, ap);
     va_end(ap);
     if (len < 0) {
-        fprintf(stderr, "libgoc: goc_sprintf: vsnprintf failed (len=%d)\n", len);
-        abort();
+        ABORT("goc_sprintf: vsnprintf failed (len=%d)\n", len);
     }
 
     char* buf = (char*)GC_malloc((size_t)len + 1);
@@ -559,6 +560,9 @@ void goc_init(void) {
     /* Step 4 — Pool registry (pool.c). */
     pool_registry_init();
 
+    /* Step 4.5 — goc_io internal init. */
+    goc_io_init();
+
     /* Step 4.1 — Mutex registry (mutex.c). */
     mutex_registry_init();
 
@@ -614,12 +618,14 @@ void goc_init(void) {
 
 void goc_shutdown(void) {
     lifecycle_abort_non_main_thread("goc_shutdown");
+    goc_debug_set_close_phase("goc_shutdown");
     GOC_DBG("goc_shutdown: begin\n");
 
     /* B.1 — Drain and destroy all registered pools (including g_default_pool). */
     GOC_DBG("goc_shutdown: B.1 pool_registry_destroy_all begin\n");
     pool_registry_destroy_all();
-    GOC_DBG("goc_shutdown: B.1 pool_registry_destroy_all done\n");
+    GOC_DBG("goc_shutdown: B.1 pool_registry_destroy_all done g_loop_shutting_down=%d\n",
+            goc_loop_is_shutting_down());
 
     /* B.2 — Shut down the event loop and join the loop thread.
      *
@@ -632,9 +638,14 @@ void goc_shutdown(void) {
      * callbacks that run on the loop thread call gc_handle_unregister(). */
     GOC_DBG("goc_shutdown: B.2 loop_shutdown begin\n");
     loop_shutdown();
-    GOC_DBG("goc_shutdown: B.2 loop_shutdown done\n");
+    GOC_DBG("goc_shutdown: B.2 loop_shutdown done g_loop_shutting_down=%d hwm=%zu\n",
+            goc_loop_is_shutting_down(),
+            goc_cb_queue_get_hwm());
 
-    /* B.2a — Tear down the live UV handle roots registry. */
+    /* B.2a — goc_io internal shutdown. */
+    goc_io_shutdown();
+
+    /* B.2b — Tear down the live UV handle roots registry. */
     live_uv_handles     = NULL;
     live_uv_handles_len = 0;
     live_uv_handles_cap = 0;
@@ -684,4 +695,10 @@ void goc_shutdown(void) {
     atomic_store_explicit(&fiber_root_num_chunks, 0, memory_order_relaxed);
     uv_mutex_destroy(&fiber_root_mutex);
     GOC_DBG("goc_shutdown: B.4 fiber roots teardown done; shutdown complete\n");
+
+    /* Reset any module-level globals that persist across goc_init/goc_shutdown cycles. */
+    goc_http_reset_globals();
+    goc_debug_set_close_phase("normal");
+
+    GOC_DBG("goc_shutdown: END\n");
 }

@@ -24,19 +24,37 @@
 /* -------------------------------------------------------------------------
  * Debug logging macro
  *
- * GOC_DBG(fmt, ...) emits a [GOC_DBG]-prefixed line to stderr and flushes
- * immediately. Compiled out entirely unless LIBGOC_DEBUG is defined at build
- * time (CMake: -DLIBGOC_DEBUG=ON; compiler: -DLIBGOC_DEBUG).
+ * GOC_DBG(fmt, ...) emits a timestamped [GOC_DBG] line to an in-process
+ * buffer. The buffer is flushed automatically when full and may be flushed
+ * explicitly on normal process exit or on crash. Compiled out entirely unless
+ * LIBGOC_DEBUG is defined at build time (CMake: -DLIBGOC_DEBUG=ON;
+ * compiler: -DLIBGOC_DEBUG).
+ *
+ * Capture is scoped at runtime: call GOC_DBG_START() before the interval you
+ * want logged and GOC_DBG_STOP() when finished. Messages emitted outside the
+ * enabled interval are ignored.
  * ---------------------------------------------------------------------- */
 #ifdef LIBGOC_DEBUG
 #  define GOC_DBG(fmt, ...) \
-     do { fprintf(stderr, "[GOC_DBG] " fmt, ##__VA_ARGS__); fflush(stderr); } while (0)
+     do { goc_dbg_log("[GOC_DBG] " fmt, ##__VA_ARGS__); } while (0)
+#  define GOC_DBG_START() goc_dbg_start()
+#  define GOC_DBG_STOP()  goc_dbg_stop()
 #else
 #  define GOC_DBG(fmt, ...) do {} while (0)
+#  define GOC_DBG_START() ((void)0)
+#  define GOC_DBG_STOP()  ((void)0)
 #endif
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+#ifdef LIBGOC_DEBUG
+void goc_dbg_log(const char *fmt, ...);
+void goc_dbg_flush(void);
+void goc_dbg_flush_signal_safe(void);
+void goc_dbg_start(void);
+void goc_dbg_stop(void);
 #endif
 
 /* -------------------------------------------------------------------------
@@ -268,7 +286,7 @@ goc_chan* goc_chan_make(size_t buf_size);
 /**
  * goc_close() — Close a channel.
  *
- * Idempotent: a second call on an already-closed channel is a no-op.
+ * Idempotent. Dispatches a close signal to the channel.
  * After closing:
  *   - All parked takers are woken with GOC_CLOSED.
  *   - All parked putters are woken with GOC_CLOSED.
@@ -277,6 +295,13 @@ goc_chan* goc_chan_make(size_t buf_size);
  *     returning GOC_CLOSED.
  */
 void goc_close(goc_chan* ch);
+
+/**
+ * goc_close_cb() — Close channel on completion.
+ *
+ * Convenience helper: use with goc_take_cb / goc_put_cb.
+ */
+void goc_close_cb(goc_chan* ch, void* val, goc_status_t ok, void* arg);
 
 /* -------------------------------------------------------------------------
  * Channel I/O — Fiber context
@@ -340,13 +365,13 @@ goc_val_t* goc_take_try(goc_chan* ch);
  * chs : array of n channel pointers.
  * n   : number of channels (0 is allowed; returns an empty GC array).
  *
- * Calls goc_take() on each channel in order, parking the calling fiber
- * on each one until a value arrives or the channel is closed.
+ * Starts a concurrent receive on every channel in chs[], then waits until
+ * all channels have delivered a value or closed. Results are returned in
+ * the same order as the input channel array.
  *
- * Returns a GC-managed array of n goc_val_t* results, one per channel,
- * in the same order as chs[].  Each element follows the same semantics
- * as a direct goc_take() call: {val, GOC_OK} on success or
- * {NULL, GOC_CLOSED} if the channel was closed.
+ * Returns a GC-managed array of n goc_val_t* results, one per channel.
+ * Each element follows the same semantics as a direct goc_take() call:
+ * {val, GOC_OK} on success or {NULL, GOC_CLOSED} if the channel was closed.
  *
  * Must only be called from within a fiber; calling from an OS thread
  * aborts with a diagnostic message (same constraint as goc_take).
@@ -359,13 +384,13 @@ goc_val_t** goc_take_all(goc_chan** chs, size_t n);
  * chs : array of n channel pointers.
  * n   : number of channels (0 is allowed; returns an empty GC array).
  *
- * Calls goc_take_sync() on each channel in order, blocking the calling
- * OS thread on each one until a value arrives or the channel is closed.
+ * Starts a concurrent receive on every channel in chs[], then blocks the
+ * calling OS thread until all channels have delivered a value or closed.
+ * Results are returned in the same order as the input channel array.
  *
- * Returns a GC-managed array of n goc_val_t* results, one per channel,
- * in the same order as chs[].  Each element follows the same semantics
- * as a direct goc_take_sync() call: {val, GOC_OK} on success or
- * {NULL, GOC_CLOSED} if the channel was closed.
+ * Returns a GC-managed array of n goc_val_t* results, one per channel.
+ * Each element follows the same semantics as a direct goc_take_sync() call:
+ * {val, GOC_OK} on success or {NULL, GOC_CLOSED} if the channel was closed.
  *
  * Must not be called from a fiber; calling from fiber context aborts
  * with a diagnostic message (same constraint as goc_take_sync).
@@ -393,12 +418,13 @@ goc_status_t goc_put_sync(goc_chan* ch, void* val);
  * goc_take_cb() — Asynchronous receive with callback.
  *
  * ch  : channel to receive from.
- * cb  : called on the loop thread with (val, ok, ud) when a value arrives or
+ * val : value received.
+ * cb  : called on the loop thread with (ch, val, ok, ud) when a value arrives or
  *       the channel closes. Must not be NULL.
  * ud  : opaque user data forwarded to cb.
  */
 void goc_take_cb(goc_chan* ch,
-                 void (*cb)(void* val, goc_status_t ok, void* ud),
+                 void (*cb)(goc_chan* ch, void* val, goc_status_t ok, void* ud),
                  void* ud);
 
 /**
@@ -406,12 +432,13 @@ void goc_take_cb(goc_chan* ch,
  *
  * ch  : channel to send to.
  * val : value to send.
- * cb  : called on the loop thread with (ok, ud) when the send completes.
+ * cb  : called on the loop thread with (ch, val, ok, ud) when the send completes.
  *       May be NULL if the caller does not need notification.
  * ud  : opaque user data forwarded to cb.
  */
-void goc_put_cb(goc_chan* ch, void* val,
-                void (*cb)(goc_status_t ok, void* ud),
+void goc_put_cb(goc_chan* ch, 
+                void* val,
+                void (*cb)(goc_chan* ch, void* val, goc_status_t ok, void* ud),
                 void* ud);
 
 /* -------------------------------------------------------------------------
@@ -522,6 +549,11 @@ goc_pool* goc_pool_make(size_t threads);
  * explicitly target the default pool.
  */
 goc_pool* goc_default_pool(void);
+
+/**
+ * goc_pool_thread_count() — Return the number of worker threads in pool.
+ */
+size_t goc_pool_thread_count(goc_pool* pool);
 
 /**
  * goc_pool_destroy() — Drain and destroy pool.
