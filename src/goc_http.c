@@ -43,6 +43,9 @@ static void http_client_fiber(void* arg);
 void (*g_http_client_fiber_ptr)(void*) = http_client_fiber;
 #include <stdbool.h>
 #include <stdatomic.h>
+#if defined(_WIN32)
+#  include <winsock2.h>
+#endif
 #include <uv.h>
 #if !defined(GOC_HTTP_REUSEPORT)
 #  if defined(SO_REUSEPORT)
@@ -834,7 +837,19 @@ static void reuseport_accept_loop_fiber(void* arg)
 
     /* Set socket reuse options before bind so the kernel can load-balance
      * across all N listeners bound to the same port. */
-    uv_os_fd_t rawfd = socket(a->addr.ss_family, SOCK_STREAM, 0);
+    uv_os_sock_t rawfd = socket(a->addr.ss_family, SOCK_STREAM, 0);
+#if defined(_WIN32)
+    if (rawfd == INVALID_SOCKET) {
+        int eno = WSAGetLastError();
+        GOC_DBG(
+                "reuseport_accept_loop_fiber[%zu]: socket failed family=%d errno=%d\n",
+                slot, a->addr.ss_family, eno);
+        goc_io_handle_close((uv_handle_t*)tcp);
+        goc_http_chan_put(slot_ready_ch, goc_box_int(-eno));
+        goc_close(slot_ready_ch);
+        return;
+    }
+#else
     if (rawfd < 0) {
         int eno = errno;
         GOC_DBG(
@@ -845,8 +860,30 @@ static void reuseport_accept_loop_fiber(void* arg)
         goc_close(slot_ready_ch);
         return;
     }
+#endif
 
     int optval = 1;
+#if defined(_WIN32)
+    if (setsockopt((SOCKET)rawfd, SOL_SOCKET, SO_REUSEADDR,
+                   (const char*)&optval, sizeof(optval)) != 0) {
+        int eno = WSAGetLastError();
+        GOC_DBG(
+                "reuseport_accept_loop_fiber[%zu]: setsockopt(SO_REUSEADDR) failed fd=%llu errno=%d\n",
+                slot, (unsigned long long)rawfd, eno);
+    }
+    if (setsockopt((SOCKET)rawfd, SOL_SOCKET, SO_REUSEPORT,
+                   (const char*)&optval, sizeof(optval)) != 0) {
+        int eno = WSAGetLastError();
+        GOC_DBG(
+                "reuseport_accept_loop_fiber[%zu]: setsockopt(SO_REUSEPORT) failed fd=%llu errno=%d\n",
+                slot, (unsigned long long)rawfd, eno);
+        closesocket((SOCKET)rawfd);
+        goc_io_handle_close((uv_handle_t*)tcp);
+        goc_http_chan_put(slot_ready_ch, goc_box_int(-eno));
+        goc_close(slot_ready_ch);
+        return;
+    }
+#else
     if (setsockopt((int)rawfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
         int eno = errno;
         GOC_DBG(
@@ -864,6 +901,7 @@ static void reuseport_accept_loop_fiber(void* arg)
         goc_close(slot_ready_ch);
         return;
     }
+#endif
 
     int rc = uv_tcp_open(tcp, rawfd);
     if (rc < 0) {

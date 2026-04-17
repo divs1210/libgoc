@@ -3683,7 +3683,8 @@ typedef struct {
 static void on_tcp_open_dispatch(void* arg)
 {
     goc_io_tcp_open_dispatch_t* d = (goc_io_tcp_open_dispatch_t*)arg;
-    int rc = uv_tcp_open((uv_tcp_t*)d->handle, d->fd);
+    int rc = uv_tcp_open((uv_tcp_t*)d->handle,
+                         (uv_os_sock_t)(uintptr_t)d->fd);
     goc_put_cb(d->ch, SCALAR(rc), goc_close_cb, d->ch);
     free(d);
 }
