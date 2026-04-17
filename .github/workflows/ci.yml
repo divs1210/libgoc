@@ -144,12 +144,16 @@ jobs:
         if: runner.os == 'macOS'
         run: ctest --test-dir build --output-on-failure -O test.log --quiet --timeout 60
 
+      - name: Compress test log (macOS)
+        if: always() && runner.os == 'macOS'
+        run: zip -q test.log.zip test.log
+
       - name: Upload test.log artifact (macOS)
         if: always() && runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
           name: test-log-${{ matrix.name }}
-          path: test.log
+          path: test.log.zip
 
       # ---- Windows -----------------------------------------------------
       # Uses MSYS2/MinGW-w64 (UCRT64) to provide a POSIX-compatible toolchain
