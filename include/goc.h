@@ -29,12 +29,20 @@
  * explicitly on normal process exit or on crash. Compiled out entirely unless
  * LIBGOC_DEBUG is defined at build time (CMake: -DLIBGOC_DEBUG=ON;
  * compiler: -DLIBGOC_DEBUG).
+ *
+ * Capture is scoped at runtime: call GOC_DBG_START() before the interval you
+ * want logged and GOC_DBG_STOP() when finished. Messages emitted outside the
+ * enabled interval are ignored.
  * ---------------------------------------------------------------------- */
 #ifdef LIBGOC_DEBUG
 #  define GOC_DBG(fmt, ...) \
      do { goc_dbg_log("[GOC_DBG] " fmt, ##__VA_ARGS__); } while (0)
+#  define GOC_DBG_START() goc_dbg_start()
+#  define GOC_DBG_STOP()  goc_dbg_stop()
 #else
 #  define GOC_DBG(fmt, ...) do {} while (0)
+#  define GOC_DBG_START() ((void)0)
+#  define GOC_DBG_STOP()  ((void)0)
 #endif
 
 #ifdef __cplusplus
@@ -45,6 +53,8 @@ extern "C" {
 void goc_dbg_log(const char *fmt, ...);
 void goc_dbg_flush(void);
 void goc_dbg_flush_signal_safe(void);
+void goc_dbg_start(void);
+void goc_dbg_stop(void);
 #endif
 
 /* -------------------------------------------------------------------------

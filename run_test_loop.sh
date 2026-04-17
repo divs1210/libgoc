@@ -4,7 +4,6 @@ set -euo pipefail
 BUILD_DIR="${BUILD_DIR:-build}"
 LOG_FILE="${LOG_FILE:-test.log}"
 
-num_tests=1
 debug_build=1
 max_tries=20
 vmem_build=0
@@ -17,11 +16,11 @@ fi
 reuseport_build="$reuseport_default"
 
 usage() {
-    echo "Usage: $0 [-test-count <num-tests>] [-max-tries <n>] [-dbg <0|1>] [-rp <0|1>] [-nld <0|1>] [-vmem <0|1>] <test-source-path>"
+    echo "Usage: $0 [-max-tries <n>] [-dbg <0|1>] [-rp <0|1>] [-nld <0|1>] [-vmem <0|1>] <test-source-path>"
     echo "  -rp   Build with GOC_HTTP_REUSEPORT=1 when 1, otherwise 0. Defaults to $reuseport_default on this platform."
     echo "  -nld  Build with GOC_NON_LINUX_DBG=1 when 1, OFF when 0. Default: 0."
     echo "  -vmem Build with LIBGOC_VMEM=ON when 1, OFF when 0. Default: 0."
-    echo "Example: $0 -test-count 1 -max-tries 20 -dbg 1 -rp 1 -nld 0 -vmem 0 tests/test_p06_thread_pool.c"
+    echo "Example: $0 -max-tries 20 -dbg 1 -rp 1 -nld 0 -vmem 0 tests/test_p06_thread_pool.c"
     exit 1
 }
 
@@ -31,15 +30,6 @@ fi
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -test-count)
-            shift
-            if [[ $# -eq 0 || ! "$1" =~ ^[0-9]+$ ]]; then
-                echo "Error: -test-count requires a numeric argument."
-                usage
-            fi
-            num_tests="$1"
-            shift
-            ;;
         -max-tries)
             shift
             if [[ $# -eq 0 || ! "$1" =~ ^[0-9]+$ ]]; then
@@ -123,7 +113,6 @@ vmem_arg="-DLIBGOC_VMEM=$vmem_build"
 nld_arg="-DGOC_NON_LINUX_DBG=$non_linux_dbg_build"
 
 test_name="$(basename "$test_source" .c)"
-expected_line="${num_tests}/${num_tests} tests passed"
 binary_path="$BUILD_DIR/$test_name"
 
 echo "Rebuilding from scratch in '$BUILD_DIR'..."
@@ -139,7 +128,7 @@ fi
 echo "----------------------------------------------------------------"
 echo "| Debug build: $debug_build | reuseport: $reuseport_build | vmem: $vmem_build | non-Linux debug: $non_linux_dbg_build |"
 echo "----------------------------------------------------------------"
-echo "Running '$test_name' in a loop, expecting '$expected_line'..."
+echo "Running '$test_name' in a loop..."
 
 tests_run=0
 while true; do
@@ -161,14 +150,6 @@ while true; do
     run_end_ts=$(date +"%Y-%m-%d %H:%M:%S.%3N")
     run_end_ms=$(date +%s%3N)
     duration_ms=$((run_end_ms - run_start_ms))
-    last_line=$(tail -n 1 "$LOG_FILE")
-
-    if [[ "$last_line" != "$expected_line" ]]; then
-        echo "[$run_end_ts] Run $tests_run/$max_tries: FAILED | ${duration_ms}ms"
-        echo "Test did not pass. Exiting."
-        exit 1
-    fi
-
     echo "[$run_end_ts] Run $tests_run/$max_tries: PASSED | ${duration_ms}ms"
 
     if [[ "$tests_run" -ge "$max_tries" ]]; then

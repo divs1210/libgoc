@@ -244,6 +244,9 @@ static int worker_try_wakeup(goc_worker* w) {
     }
 
     int rc = uv_async_send(w->wakeup);
+    if (rc == UV_EINTR) {
+        rc = uv_async_send(w->wakeup);
+    }
     if (rc == UV_EBADF || rc == UV_EINVAL) {
         GOC_DBG("worker_try_wakeup: wakeup send race; closing/invalid wakeup w=%p wakeup=%p rc=%d\n",
                 (void*)w, (void*)w->wakeup, rc);
@@ -305,8 +308,17 @@ int post_on_handle_loop(uv_loop_t* loop, void (*fn)(void*), void* arg) {
                         i, (void*)loop, (void*)old);
                 int rc = worker_try_wakeup(w);
                 GOC_DBG(
-                        "post_on_handle_loop: worker_try_wakeup posted to worker=%zu wakeup=%p rc=%d\n",
-                        i, (void*)w->wakeup, rc);
+                        "post_on_handle_loop: worker_try_wakeup worker=%zu wakeup=%p rc=%d loop_alive=%d closing=%d shutdown=%d\n",
+                        i, (void*)w->wakeup, rc, loop_alive,
+                        atomic_load_explicit(&w->closing, memory_order_acquire),
+                        atomic_load_explicit(&pool->shutdown, memory_order_relaxed));
+                if (rc < 0) {
+                    GOC_DBG("post_on_handle_loop: wakeup failed for loop=%p fn=%p arg=%p rc=%d\n",
+                            (void*)loop, (void*)fn, arg, rc);
+                    free(arg);
+                    ABORT("post_on_handle_loop: cannot wake worker loop %p rc=%d\n",
+                          (void*)loop, rc);
+                }
                 return rc;
             }
         }

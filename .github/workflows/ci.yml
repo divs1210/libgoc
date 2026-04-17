@@ -136,13 +136,20 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           set -x
-          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGOC_NON_LINUX_DBG=ON ${{ matrix.cmake_flags }}
+          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLIBGOC_DEBUG=ON ${{ matrix.cmake_flags }}
           cmake --build build --parallel $(sysctl -n hw.ncpu)
         timeout-minutes: 5
 
       - name: Test (macOS)
         if: runner.os == 'macOS'
-        run: ctest --test-dir build --output-on-failure --timeout 60
+        run: ctest --test-dir build --output-on-failure -O test.log --quiet --timeout 60
+
+      - name: Upload test.log artifact (macOS)
+        if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ matrix.name }}
+          path: test.log
 
       # ---- Windows -----------------------------------------------------
       # Uses MSYS2/MinGW-w64 (UCRT64) to provide a POSIX-compatible toolchain
@@ -179,7 +186,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGOC_NON_LINUX_DBG=ON ${{ matrix.cmake_flags }}
+          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo ${{ matrix.cmake_flags }}
           cmake --build build --parallel $(nproc)
         timeout-minutes: 10
 

@@ -55,6 +55,9 @@
 #include <signal.h>
 #include <assert.h>
 #include <stdatomic.h>
+#ifndef _WIN32
+# include <sys/socket.h>
+#endif
 #include <uv.h>
 #include <gc.h>
 #include "../include/goc_io.h"
@@ -120,19 +123,23 @@ static void dispatch_on_handle_loop(uv_loop_t* handle_loop,
         free(arg);
         return;
     }
-    if (wloop && wloop == handle_loop &&
-        !goc_current_worker_has_pending_tasks()) {
-        /* Same worker/thread as the handle owner, and no queued cross-worker
-         * tasks are pending on this loop. Direct call preserves performance
-         * while maintaining ordering relative to existing queued tasks. */
-        GOC_DBG(
-                "dispatch_on_handle_loop: direct call on worker loop %p (worker=%d) fn=%p arg=%p\n",
-                (void*)handle_loop, worker_id, (void*)fn, arg);
-        fn(arg);
-        GOC_DBG(
-                "dispatch_on_handle_loop: direct call completed on worker loop %p (worker=%d) fn=%p arg=%p\n",
-                (void*)handle_loop, worker_id, (void*)fn, arg);
-    } else if (handle_loop != g_loop) {
+    if (wloop && wloop == handle_loop) {
+        if (goc_current_worker_has_pending_tasks()) {
+            GOC_DBG(
+                    "dispatch_on_handle_loop: same worker loop %p (worker=%d) has pending tasks, falling back to post_on_handle_loop fn=%p arg=%p\n",
+                    (void*)handle_loop, worker_id, (void*)fn, arg);
+        } else {
+            GOC_DBG(
+                    "dispatch_on_handle_loop: direct call on worker loop %p (worker=%d) fn=%p arg=%p\n",
+                    (void*)handle_loop, worker_id, (void*)fn, arg);
+            fn(arg);
+            GOC_DBG(
+                    "dispatch_on_handle_loop: direct call completed on worker loop %p (worker=%d) fn=%p arg=%p\n",
+                    (void*)handle_loop, worker_id, (void*)fn, arg);
+            return;
+        }
+    }
+    if (handle_loop != g_loop) {
         GOC_DBG(
                 "dispatch_on_handle_loop: posting to worker loop %p (current_worker=%d) fn=%p arg=%p\n",
                 (void*)handle_loop, worker_id, (void*)fn, arg);
@@ -2098,9 +2105,41 @@ static void on_tcp_connect_dispatch(void* arg)
     memset(ctx, 0, sizeof(*ctx));
     ctx->ch = d->ch;
     ctx->inflight_tracked = 0;
+
+    char addrbuf[INET6_ADDRSTRLEN] = {0};
+    int port = 0;
+    if (d->addr.ss_family == AF_INET) {
+        struct sockaddr_in* sa = (struct sockaddr_in*)&d->addr;
+        uv_ip4_name(sa, addrbuf, sizeof(addrbuf));
+        port = ntohs(sa->sin_port);
+    } else if (d->addr.ss_family == AF_INET6) {
+        struct sockaddr_in6* sa6 = (struct sockaddr_in6*)&d->addr;
+        uv_ip6_name(sa6, addrbuf, sizeof(addrbuf));
+        port = ntohs(sa6->sin6_port);
+    } else {
+        strncpy(addrbuf, "<unknown>", sizeof(addrbuf) - 1);
+        addrbuf[sizeof(addrbuf) - 1] = '\0';
+    }
+    GOC_DBG("on_tcp_connect_dispatch: pre-connect handle=%p loop=%p closing=%d active=%d dst=%s port=%d family=%d\n",
+            (void*)d->handle,
+            d->handle ? (void*)d->handle->loop : NULL,
+            d->handle ? uv_is_closing((uv_handle_t*)d->handle) : -1,
+            d->handle ? uv_is_active((uv_handle_t*)d->handle) : -1,
+            addrbuf,
+            port,
+            d->addr.ss_family);
     int rc = uv_tcp_connect(&ctx->req, d->handle,
                             (const struct sockaddr*)&d->addr,
                             on_connect_cb);
+    if (rc < 0) {
+        GOC_DBG("on_tcp_connect_dispatch: uv_tcp_connect failed handle=%p dst=%s port=%d family=%d rc=%d err=%s\n",
+                (void*)d->handle,
+                addrbuf,
+                port,
+                d->addr.ss_family,
+                rc,
+                uv_strerror(rc));
+    }
     if (rc == 0) {
         ctx->inflight_tracked = 1;
         atomic_fetch_add_explicit(&g_tcp_connect_inflight,
@@ -2131,6 +2170,10 @@ goc_chan* goc_io_tcp_connect(uv_tcp_t* handle, const struct sockaddr* addr)
 {
     goc_chan*                   ch = goc_chan_make(1);
     goc_chan_set_debug_tag(ch, "goc_tcp_connect_ch");
+    GOC_DBG("goc_io_tcp_connect: dispatch handle=%p current_loop=%p target_loop=%p\n",
+            (void*)handle,
+            (void*)goc_current_worker_loop(),
+            (void*)((uv_handle_t*)handle)->loop);
     goc_tcp_connect_dispatch_t* d  = (goc_tcp_connect_dispatch_t*)malloc(
                                          sizeof(goc_tcp_connect_dispatch_t));
     d->handle = handle;
@@ -3553,6 +3596,53 @@ static void on_simple_dispatch(void* arg)
         case 1:  rc = uv_tcp_keepalive((uv_tcp_t*)d->handle, d->i1, d->u1); break;
         case 2:  rc = uv_tcp_nodelay((uv_tcp_t*)d->handle, d->i1); break;
         case 3:  rc = uv_tcp_simultaneous_accepts((uv_tcp_t*)d->handle, d->i1); break;
+        case 4: {
+            uv_os_fd_t fd;
+            GOC_DBG("on_simple_dispatch: tcp_reuseaddr handle=%p loop=%p\n",
+                    (void*)d->handle,
+                    (void*)(d->handle ? ((uv_handle_t*)d->handle)->loop : NULL));
+            rc = uv_fileno((const uv_handle_t*)d->handle, &fd);
+            if (rc == 0) {
+                GOC_DBG("on_simple_dispatch: tcp_reuseaddr uv_fileno handle=%p fd=%d\n",
+                        (void*)d->handle,
+                        (int)fd);
+                int opt = d->i1;
+#ifdef _WIN32
+                if (setsockopt((SOCKET)fd, SOL_SOCKET, SO_REUSEADDR,
+                               (const char*)&opt, sizeof(opt)) != 0) {
+                    int saved_errno = WSAGetLastError();
+                    GOC_DBG("on_simple_dispatch: tcp_reuseaddr setsockopt failed handle=%p fd=%d errno=%d\n",
+                            (void*)d->handle,
+                            (int)fd,
+                            saved_errno);
+                    rc = -saved_errno;
+                } else {
+                    GOC_DBG("on_simple_dispatch: tcp_reuseaddr setsockopt OK handle=%p fd=%d\n",
+                            (void*)d->handle,
+                            (int)fd);
+                }
+#else
+                if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+                               (const char*)&opt, sizeof(opt)) != 0) {
+                    int saved_errno = errno;
+                    GOC_DBG("on_simple_dispatch: tcp_reuseaddr setsockopt failed handle=%p fd=%d errno=%d\n",
+                            (void*)d->handle,
+                            (int)fd,
+                            saved_errno);
+                    rc = -saved_errno;
+                } else {
+                    GOC_DBG("on_simple_dispatch: tcp_reuseaddr setsockopt OK handle=%p fd=%d\n",
+                            (void*)d->handle,
+                            (int)fd);
+                }
+#endif
+            } else {
+                GOC_DBG("on_simple_dispatch: tcp_reuseaddr uv_fileno failed handle=%p rc=%d\n",
+                        (void*)d->handle,
+                        rc);
+            }
+            break;
+        }
         /* UDP */
         case 10: rc = uv_udp_bind((uv_udp_t*)d->handle,
                                   (const struct sockaddr*)&d->addr, d->u1); break;
@@ -3581,6 +3671,34 @@ static void on_simple_dispatch(void* arg)
         default: rc = UV_EINVAL; break;
     }
     goc_put_cb(d->ch, SCALAR(rc), goc_close_cb, d->ch);
+    free(d);
+}
+
+typedef struct {
+    void*      handle;
+    uv_os_fd_t fd;
+    goc_chan*  ch;
+} goc_io_tcp_open_dispatch_t;
+
+static void on_tcp_open_dispatch(void* arg)
+{
+    goc_io_tcp_open_dispatch_t* d = (goc_io_tcp_open_dispatch_t*)arg;
+    int rc = uv_tcp_open((uv_tcp_t*)d->handle, d->fd);
+    goc_put_cb(d->ch, SCALAR(rc), goc_close_cb, d->ch);
+    free(d);
+}
+
+/* Dispatch uv_tcp_open; delivers goc_box_int(status). */
+goc_chan* goc_io_tcp_open(uv_tcp_t* handle, uv_os_fd_t fd)
+{
+    goc_chan* dch = goc_chan_make(1);
+    goc_io_tcp_open_dispatch_t* d = (goc_io_tcp_open_dispatch_t*)malloc(
+        sizeof(goc_io_tcp_open_dispatch_t));
+    d->handle = handle;
+    d->fd = fd;
+    d->ch = dch;
+    dispatch_on_handle_loop(((uv_handle_t*)handle)->loop, on_tcp_open_dispatch, d);
+    return dch;
 }
 
 static goc_chan* simple_dispatch(void* handle, int kind,
@@ -3591,7 +3709,7 @@ static goc_chan* simple_dispatch(void* handle, int kind,
                                  uv_membership membership)
 {
     goc_chan*               ch = goc_chan_make(1);
-    goc_simple_dispatch_t*  d  = (goc_simple_dispatch_t*)goc_malloc(
+    goc_simple_dispatch_t*  d  = (goc_simple_dispatch_t*)malloc(
                                      sizeof(goc_simple_dispatch_t));
     d->handle     = handle;
     d->kind       = kind;
@@ -3632,6 +3750,11 @@ goc_chan* goc_io_tcp_nodelay(uv_tcp_t* handle, int enable)
 goc_chan* goc_io_tcp_simultaneous_accepts(uv_tcp_t* handle, int enable)
 {
     return simple_dispatch(handle, 3, NULL, enable, 0, NULL, NULL, NULL, 0);
+}
+
+goc_chan* goc_io_tcp_reuseaddr(uv_tcp_t* handle)
+{
+    return simple_dispatch(handle, 4, NULL, 1, 0, NULL, NULL, NULL, 0);
 }
 
 goc_chan* goc_io_pipe_bind(uv_pipe_t* handle, const char* name)
@@ -3709,7 +3832,7 @@ goc_chan* goc_io_kill(int pid, int signum)
 {
     /* Reuse simple_dispatch with kind=31; i1=pid, u1=signum */
     goc_chan*               ch = goc_chan_make(1);
-    goc_simple_dispatch_t*  d  = (goc_simple_dispatch_t*)goc_malloc(
+    goc_simple_dispatch_t*  d  = (goc_simple_dispatch_t*)malloc(
                                      sizeof(goc_simple_dispatch_t));
     d->handle = NULL;
     d->kind   = 31;

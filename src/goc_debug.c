@@ -32,6 +32,7 @@
 static char goc_dbg_buffer[GOC_DBG_BUFFER_CAPACITY];
 static size_t goc_dbg_buffer_len;
 static volatile sig_atomic_t goc_dbg_signal_len;
+static bool goc_dbg_enabled;
 static uv_mutex_t goc_dbg_mutex;
 static uv_once_t goc_dbg_init_once = UV_ONCE_INIT;
 
@@ -39,6 +40,24 @@ static void goc_dbg_init_once_fn(void) {
     uv_mutex_init(&goc_dbg_mutex);
     goc_dbg_buffer_len = 0;
     goc_dbg_signal_len = 0;
+    goc_dbg_enabled = false;
+}
+
+static void goc_dbg_flush_locked(void);
+
+void goc_dbg_start(void) {
+    uv_once(&goc_dbg_init_once, goc_dbg_init_once_fn);
+    uv_mutex_lock(&goc_dbg_mutex);
+    goc_dbg_enabled = true;
+    uv_mutex_unlock(&goc_dbg_mutex);
+}
+
+void goc_dbg_stop(void) {
+    uv_once(&goc_dbg_init_once, goc_dbg_init_once_fn);
+    uv_mutex_lock(&goc_dbg_mutex);
+    goc_dbg_flush_locked();
+    goc_dbg_enabled = false;
+    uv_mutex_unlock(&goc_dbg_mutex);
 }
 
 static void goc_dbg_flush_locked(void) {
@@ -94,6 +113,13 @@ static size_t goc_dbg_format_timestamp(char *buf, size_t len) {
 
 void goc_dbg_log(const char *fmt, ...) {
     uv_once(&goc_dbg_init_once, goc_dbg_init_once_fn);
+
+    uv_mutex_lock(&goc_dbg_mutex);
+    if (!goc_dbg_enabled) {
+        uv_mutex_unlock(&goc_dbg_mutex);
+        return;
+    }
+    uv_mutex_unlock(&goc_dbg_mutex);
 
     const char *message_fmt = fmt;
     size_t prefix_len = 0;
@@ -180,6 +206,13 @@ void goc_dbg_log(const char *fmt, ...) {
     }
 
     uv_mutex_lock(&goc_dbg_mutex);
+    if (!goc_dbg_enabled) {
+        uv_mutex_unlock(&goc_dbg_mutex);
+        if (allocated) {
+            free(msg);
+        }
+        return;
+    }
 
     if (actual_len >= GOC_DBG_BUFFER_CAPACITY) {
         goc_dbg_flush_locked();

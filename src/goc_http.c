@@ -79,30 +79,6 @@ static goc_status_t goc_http_chan_put(goc_chan* ch, void* val)
     return goc_in_fiber() ? goc_put(ch, val) : goc_put_sync(ch, val);
 }
 
-static void goc_http_setsockopt_reuseaddr(uv_tcp_t* tcp)
-{
-    int opt = 1;
-    uv_os_fd_t fd;
-    int rc = uv_fileno((const uv_handle_t*)tcp, &fd);
-    if (rc != 0) {
-        GOC_DBG("goc_http_setsockopt_reuseaddr: uv_fileno failed tcp=%p rc=%d\n",
-                (void*)tcp, rc);
-        return;
-    }
-
-#ifdef _WIN32
-    SOCKET sock = (SOCKET)fd;
-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
-                   (const char*)&opt, sizeof(opt)) != 0) {
-#else
-    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
-                   (const char*)&opt, sizeof(opt)) != 0) {
-#endif
-        int eno = errno;
-        GOC_DBG("goc_http_setsockopt_reuseaddr: setsockopt failed tcp=%p errno=%d\n",
-                (void*)tcp, eno);
-    }
-}
 
 #if GOC_HTTP_REUSEPORT_LINUX
 static bool goc_http_reuseport_supported(int family)
@@ -312,6 +288,65 @@ static int keepalive_slot_matches(const goc_http_keepalive_slot_t* s,
                                   const char* host, uint16_t port)
 {
     return s && s->tcp && s->host && s->port == port && strcmp(s->host, host) == 0;
+}
+
+typedef struct {
+    uv_tcp_t* tcp;
+    char*     host;
+    uint16_t  port;
+    int       return_socket;
+} goc_http_keepalive_slot_return_arg_t;
+
+static void keepalive_slot_drop(goc_http_keepalive_slot_t* s);
+static void keepalive_slot_return_fiber(void* arg)
+{
+    goc_http_keepalive_slot_return_arg_t* r =
+        (goc_http_keepalive_slot_return_arg_t*)arg;
+    keepalive_slot_drop(&g_http_ka_slot);
+    if (r->return_socket) {
+        g_http_ka_slot.tcp    = r->tcp;
+        g_http_ka_slot.host   = r->host;
+        g_http_ka_slot.port   = r->port;
+        g_http_ka_slot.in_use = 0;
+    }
+    free(r);
+}
+
+static void keepalive_slot_return_to_owner(uv_tcp_t* tcp,
+                                           char* host,
+                                           uint16_t port,
+                                           int owner_worker)
+{
+    int current_worker = goc_current_worker_id();
+    if (owner_worker >= 0 && owner_worker == current_worker) {
+        keepalive_slot_drop(&g_http_ka_slot);
+        if (tcp) {
+            g_http_ka_slot.tcp    = tcp;
+            g_http_ka_slot.host   = host;
+            g_http_ka_slot.port   = port;
+            g_http_ka_slot.in_use = 0;
+        }
+        return;
+    }
+
+    goc_http_keepalive_slot_return_arg_t* arg =
+        (goc_http_keepalive_slot_return_arg_t*)malloc(
+            sizeof(goc_http_keepalive_slot_return_arg_t));
+    arg->tcp           = tcp;
+    arg->host          = host;
+    arg->port          = port;
+    arg->return_socket = tcp != NULL;
+
+    if (owner_worker >= 0) {
+        goc_go_on_worker(goc_current_or_default_pool(),
+                         (size_t)owner_worker,
+                         keepalive_slot_return_fiber,
+                         arg);
+    } else {
+        goc_go_on(goc_current_or_default_pool(),
+                  keepalive_slot_return_fiber,
+                  arg);
+    }
 }
 
 static void keepalive_slot_drop(goc_http_keepalive_slot_t* s)
@@ -539,8 +574,6 @@ goc_chan* goc_http_server_listen(goc_http_server_t* srv, const char* host, int p
         goc_close(ready_ch);
         return ready_ch;
     }
-
-    goc_http_setsockopt_reuseaddr(srv->tcp);
 
     r = goc_unbox_int(
             goc_http_chan_take(goc_io_tcp_bind(srv->tcp,
@@ -1802,6 +1835,9 @@ typedef struct {
     goc_array* extra_headers;
     goc_chan*  ch;         /* result channel — caller is waiting on this */
 
+    int        keepalive_slot_owner;
+    int        keepalive_slot_acquired;
+
     _Atomic(uv_tcp_t*) tcp;
     _Atomic(int)         tcp_initialized;
     _Atomic(int)         cancel_requested;
@@ -1876,9 +1912,9 @@ retry_connect:
         atomic_store_explicit(&a->tcp, tcp, memory_order_release);
         atomic_store_explicit(&a->tcp_initialized, 1, memory_order_release);
 
-        /* Take ownership of the thread-local keepalive slot. This avoids
-         * leaving the original worker's slot stuck in_use if the fiber
-         * migrates to another thread while the request is in flight. */
+        /* Take ownership of the thread-local keepalive slot for this request. */
+        a->keepalive_slot_owner = goc_current_worker_id();
+        a->keepalive_slot_acquired = 1;
         g_http_ka_slot.tcp = NULL;
         g_http_ka_slot.host = NULL;
         g_http_ka_slot.port = 0;
@@ -1960,7 +1996,14 @@ retry_connect:
             goto deliver_error;
         }
 
-        goc_http_setsockopt_reuseaddr(tcp);
+        GOC_DBG("http_client_fiber[%llu]: tcp_connect prep tcp=%p tcp_initialized=%d using_keepalive_slot=%d keep_alive=%d host=%s port=%u\n",
+                (unsigned long long)a->req_id,
+                (void*)tcp,
+                tcp_initialized,
+                using_keepalive_slot,
+                a->keep_alive,
+                a->host ? a->host : "<null>",
+                (unsigned)a->port);
 
         GOC_DBG("http_client_fiber[%llu]: tcp_connect starting tcp=%p\n",
                 (unsigned long long)a->req_id,
@@ -1981,18 +2024,29 @@ retry_connect:
             if (using_keepalive_slot && !keepalive_retry) {
                 GOC_DBG("http_client_fiber[%llu]: keepalive socket failed, dropping slot and retrying\n",
                         (unsigned long long)a->req_id);
-                keepalive_slot_drop(&g_http_ka_slot);
+                if (tcp_initialized)
+                    goc_io_handle_close((uv_handle_t*)tcp);
                 tcp = NULL;
                 tcp_initialized = 0;
                 atomic_store_explicit(&a->tcp, NULL, memory_order_release);
                 atomic_store_explicit(&a->tcp_initialized, 0, memory_order_release);
+                keepalive_slot_return_to_owner(NULL, NULL, 0,
+                                               a->keepalive_slot_owner);
+                a->keepalive_slot_acquired = 0;
                 using_keepalive_slot = 0;
                 keepalive_retry = 1;
                 goto retry_connect;
             }
-            if (rc == UV_EADDRINUSE && !connect_retry) {
-                GOC_DBG("http_client_fiber[%llu]: tcp_connect got UV_EADDRINUSE, retrying once\n",
-                        (unsigned long long)a->req_id);
+
+            /* Only retry the narrow failure cases that can be safely recovered
+             * before sending the request. This matches Go semantics: stale
+             * keepalive sockets are dropped once, and transient local bind
+             * failures are retried once. Do not retry after request
+             * transmission has begun or the response has already started. */
+            if ((rc == UV_EADDRINUSE || rc == UV_EADDRNOTAVAIL) && !connect_retry) {
+                GOC_DBG("http_client_fiber[%llu]: tcp_connect got %s, retrying once\n",
+                        (unsigned long long)a->req_id,
+                        rc == UV_EADDRINUSE ? "UV_EADDRINUSE" : "UV_EADDRNOTAVAIL");
                 if (tcp_initialized)
                     goc_io_handle_close((uv_handle_t*)tcp);
                 tcp = NULL;
@@ -2198,7 +2252,11 @@ retry_connect:
             if (using_keepalive_slot && !keepalive_retry) {
                 GOC_DBG("http_client_fiber[%llu]: keepalive socket stale, retrying without keepalive slot\n",
                         (unsigned long long)a->req_id);
-                keepalive_slot_drop(&g_http_ka_slot);
+                if (tcp_initialized)
+                    goc_io_handle_close((uv_handle_t*)tcp);
+                keepalive_slot_return_to_owner(NULL, NULL, 0,
+                                               a->keepalive_slot_owner);
+                a->keepalive_slot_acquired = 0;
                 using_keepalive_slot = 0;
                 tcp = NULL;
                 tcp_initialized = 0;
@@ -2212,9 +2270,12 @@ retry_connect:
                 body_start = 0;
                 goto retry_connect;
             }
-            if (using_keepalive_slot)
-                keepalive_slot_drop(&g_http_ka_slot);
-            else if (tcp) {
+            if (using_keepalive_slot) {
+                if (tcp_initialized)
+                    goc_io_handle_close((uv_handle_t*)tcp);
+                keepalive_slot_return_to_owner(NULL, NULL, 0,
+                                               a->keepalive_slot_owner);
+            } else if (tcp) {
                 if (tcp_initialized)
                     goc_io_handle_close((uv_handle_t*)tcp);
                 tcp = NULL;
@@ -2238,13 +2299,8 @@ retry_connect:
                        !response_has_connection_close(response);
         if (can_keep) {
             if (using_keepalive_slot) {
-                /* Return the active keepalive socket to the current worker's
-                 * slot, even if the request migrated to another thread. */
-                keepalive_slot_drop(&g_http_ka_slot);
-                g_http_ka_slot.tcp    = tcp;
-                g_http_ka_slot.host   = a->host;
-                g_http_ka_slot.port   = a->port;
-                g_http_ka_slot.in_use = 0;
+                keepalive_slot_return_to_owner(tcp, a->host, a->port,
+                                               a->keepalive_slot_owner);
                 tcp = NULL;
                 tcp_initialized = 0;
             } else if (!g_http_ka_slot.in_use) {
@@ -2261,9 +2317,14 @@ retry_connect:
                 tcp_initialized = 0;
             }
         } else {
-            if (using_keepalive_slot)
-                keepalive_slot_drop(&g_http_ka_slot);
-            else if (tcp) {
+            if (using_keepalive_slot) {
+                if (tcp_initialized)
+                    goc_io_handle_close((uv_handle_t*)tcp);
+                tcp = NULL;
+                tcp_initialized = 0;
+                keepalive_slot_return_to_owner(NULL, NULL, 0,
+                                               a->keepalive_slot_owner);
+            } else if (tcp) {
                 GOC_DBG("http_client_fiber[%llu]: closing tcp after response tcp=%p tcp_initialized=%d using_keepalive_slot=%d keep_alive=%d\n",
                         (unsigned long long)a->req_id, (void*)tcp, tcp_initialized,
                         using_keepalive_slot, a->keep_alive);
@@ -2426,6 +2487,8 @@ goc_chan* goc_http_request(const char* method, const char* url,
     atomic_store_explicit(&a->tcp, NULL, memory_order_relaxed);
     atomic_store_explicit(&a->tcp_initialized, 0, memory_order_relaxed);
     atomic_store_explicit(&a->cancel_requested, 0, memory_order_relaxed);
+    a->keepalive_slot_owner = -1;
+    a->keepalive_slot_acquired = 0;
     chan_set_on_close(ch, http_client_cancel, a);
 
             GOC_DBG("goc_http_request[%llu]: entry method=%s url=%s host=%s port=%u path=%s keep_alive=%d timeout_ms=%llu ch=%p\n",

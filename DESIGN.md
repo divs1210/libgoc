@@ -778,6 +778,8 @@ The default pool is created by `goc_init` with `max(4, hardware_concurrency)` wo
 
 **`LIBGOC_DEBUG`** — When defined at compile time (pass `-DLIBGOC_DEBUG=ON` to CMake), enables verbose `[GOC_DBG]` diagnostic output to `stderr` from the scheduler, I/O layer, and HTTP layer via the `GOC_DBG(fmt, ...)` macro defined in `include/goc.h`. When the flag is not set the macro expands to nothing, so the callsites produce zero code. Rebuild the library and tests with `-DLIBGOC_DEBUG=ON` to activate logging.
 
+Debug capture is now runtime-scoped: `GOC_DBG_START()` enables buffered debug output and `GOC_DBG_STOP()` flushes pending log data then disables capture. `GOC_DBG()` emits entries only while capture is enabled, which keeps buffer usage bounded when debug support is compiled in.
+
 Each pool also has a **live-fiber admission cap**. By default it is
 `floor(0.6 × (available_hardware_memory / fiber_stack_size))`
 in both canary and vmem builds,

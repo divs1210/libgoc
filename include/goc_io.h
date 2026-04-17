@@ -742,6 +742,12 @@ goc_chan* goc_io_tcp_nodelay(uv_tcp_t* handle, int enable);
 /** Dispatch uv_tcp_simultaneous_accepts; delivers goc_box_int(status). */
 goc_chan* goc_io_tcp_simultaneous_accepts(uv_tcp_t* handle, int enable);
 
+/** Dispatch uv_tcp_open; delivers goc_box_int(status). */
+goc_chan* goc_io_tcp_open(uv_tcp_t* handle, uv_os_fd_t fd);
+
+/** Dispatch SO_REUSEADDR on a TCP handle; delivers goc_box_int(status). */
+goc_chan* goc_io_tcp_reuseaddr(uv_tcp_t* handle);
+
 /* =========================================================================
  * Pipe server / bind
  * ====================================================================== */
