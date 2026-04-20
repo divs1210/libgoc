@@ -23,21 +23,27 @@
 #include "channel_internal.h"
 
 /* Forward declarations for module lifecycle reset hooks. */
-extern void goc_http_reset_globals(void);
+extern void goc_http_reset_globals(void*);
 extern size_t goc_cb_queue_get_hwm(void);
 
 #define GOC_LIFECYCLE_HOOK_CAP 16
 
+typedef struct {
+    void (*fn)(void*);
+    void*     ub;
+} goc_lifecycle_hook_t;
+
 static uv_mutex_t g_lifecycle_hook_lock;
-static void (*g_lifecycle_hooks[GOC_LIFECYCLE_HOOK_COUNT][GOC_LIFECYCLE_HOOK_CAP])(void);
+static goc_lifecycle_hook_t g_lifecycle_hooks[GOC_LIFECYCLE_HOOK_COUNT][GOC_LIFECYCLE_HOOK_CAP];
 static size_t g_lifecycle_hooks_len[GOC_LIFECYCLE_HOOK_COUNT] = {0};
 
-static void run_lifecycle_hooks(goc_lifecycle_hook_phase_t phase)
+void goc_run_lifecycle_hooks(goc_lifecycle_hook_phase_t phase,
+                                void* event_arg)
 {
     if (phase < 0 || phase >= GOC_LIFECYCLE_HOOK_COUNT)
         return;
 
-    void (*hooks[GOC_LIFECYCLE_HOOK_CAP])(void);
+    goc_lifecycle_hook_t hooks[GOC_LIFECYCLE_HOOK_CAP];
     size_t len = 0;
 
     uv_mutex_lock(&g_lifecycle_hook_lock);
@@ -47,20 +53,31 @@ static void run_lifecycle_hooks(goc_lifecycle_hook_phase_t phase)
     uv_mutex_unlock(&g_lifecycle_hook_lock);
 
     for (size_t i = 0; i < len; i++) {
-        if (hooks[i])
-            hooks[i]();
+        if (!hooks[i].fn)
+            continue;
+
+        if (event_arg == NULL) {
+            if (hooks[i].ub == NULL)
+                hooks[i].fn(NULL);
+        } else {
+            if (hooks[i].ub == event_arg)
+                hooks[i].fn(hooks[i].ub);
+        }
     }
 }
 
 void goc_register_lifecycle_hook(goc_lifecycle_hook_phase_t phase,
-                                 void (*fn)(void))
+                                 void (*fn)(void*),
+                                 void* ub)
 {
     if (phase < 0 || phase >= GOC_LIFECYCLE_HOOK_COUNT || !fn)
         return;
 
     uv_mutex_lock(&g_lifecycle_hook_lock);
     if (g_lifecycle_hooks_len[phase] < GOC_LIFECYCLE_HOOK_CAP) {
-        g_lifecycle_hooks[phase][g_lifecycle_hooks_len[phase]++] = fn;
+        g_lifecycle_hooks[phase][g_lifecycle_hooks_len[phase]].fn = fn;
+        g_lifecycle_hooks[phase][g_lifecycle_hooks_len[phase]].ub = ub;
+        g_lifecycle_hooks_len[phase]++;
     }
     uv_mutex_unlock(&g_lifecycle_hook_lock);
 }
@@ -610,7 +627,7 @@ void goc_init(void) {
 
     /* Step 5 — libuv event loop + loop thread (loop.c). */
     loop_init();
-    run_lifecycle_hooks(GOC_LIFECYCLE_HOOK_POST_LOOP_INIT);
+    goc_run_lifecycle_hooks(GOC_LIFECYCLE_HOOK_POST_LOOP_INIT, NULL);
 
     /* Step 6 — Default fiber pool.
      *
@@ -670,7 +687,7 @@ void goc_shutdown(void) {
     GOC_DBG("goc_shutdown: B.1 pool_registry_destroy_all done g_loop_shutting_down=%d\n",
             goc_loop_is_shutting_down());
 
-    run_lifecycle_hooks(GOC_LIFECYCLE_HOOK_PRE_LOOP_SHUTDOWN);
+    goc_run_lifecycle_hooks(GOC_LIFECYCLE_HOOK_PRE_LOOP_SHUTDOWN, NULL);
 
     /* B.2 — Shut down the event loop and join the loop thread.
      *
@@ -689,7 +706,7 @@ void goc_shutdown(void) {
 
     /* B.2a — goc_io internal shutdown. */
     goc_io_shutdown();
-    run_lifecycle_hooks(GOC_LIFECYCLE_HOOK_POST_LOOP_SHUTDOWN);
+    goc_run_lifecycle_hooks(GOC_LIFECYCLE_HOOK_POST_LOOP_SHUTDOWN, NULL);
 
     /* B.2b — Tear down the live UV handle roots registry. */
     live_uv_handles     = NULL;

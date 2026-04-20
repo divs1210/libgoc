@@ -150,10 +150,7 @@ static inline void goc_uv_walk_log(uv_loop_t *loop, const char *context)
 }
 
 /* Internal runtime helper: yield the current fiber to the scheduler. */
-void goc_yield(void);
-
-typedef void (*goc_pool_destroy_hook_fn)(goc_pool* pool);
-void goc_pool_add_destroy_hook(goc_pool* pool, goc_pool_destroy_hook_fn fn);
+/* Public API declaration moved to include/goc.h. */
 
 /* ---------------------------------------------------------------------------
  * goc_sync_t — portable binary semaphore (mutex + condvar)
@@ -441,10 +438,7 @@ void pool_submit_spawn_to_worker(goc_pool* pool,
                                  goc_chan* join_ch);
 
 /* Internal helper: spawn a fiber on a specific worker. */
-goc_chan* goc_go_on_worker(goc_pool* pool,
-                            size_t worker_idx,
-                            void (*fn)(void*),
-                            void* arg);
+/* Public API declaration moved to include/goc.h. */
 
 /* Test helper: spin until at least n workers are idle (parked on idle_sem).
  * Not part of the public API; declared here for use by internal test files. */
@@ -475,7 +469,7 @@ static inline bool try_claim_wake(goc_entry* e) {
 /* loop.c → used by channel.c, alts.c, timeout.c, gc.c */
 void loop_init(void);
 void loop_shutdown(void);
-int  goc_loop_is_shutting_down(void);
+/* Public API declaration moved to include/goc.h. */
 void post_callback(goc_entry* entry, void* value);
 int  goc_loop_submit_callback_if_running(goc_entry* entry);
 void post_on_loop(void (*fn)(void*), void* arg);
@@ -486,20 +480,12 @@ void goc_loop_wakeup(void);
 void goc_io_init(void);
 void goc_io_shutdown(void);
 
-typedef enum {
-    GOC_LIFECYCLE_HOOK_PRE_LOOP_INIT = 0,
-    GOC_LIFECYCLE_HOOK_POST_LOOP_INIT,
-    GOC_LIFECYCLE_HOOK_PRE_LOOP_SHUTDOWN,
-    GOC_LIFECYCLE_HOOK_POST_LOOP_SHUTDOWN,
-    GOC_LIFECYCLE_HOOK_COUNT,
-} goc_lifecycle_hook_phase_t;
-
-void goc_register_lifecycle_hook(goc_lifecycle_hook_phase_t phase,
-                                 void (*fn)(void));
+/* Internal lifecycle helper: invoke hooks registered for the phase. */
+void goc_run_lifecycle_hooks(goc_lifecycle_hook_phase_t phase,
+                             void* event_arg);
 
 /* pool.c → current worker helpers */
 uv_loop_t* goc_current_worker_loop(void);
-int        goc_current_worker_id(void);
 bool       goc_current_worker_has_pending_tasks(void);
 int  post_on_handle_loop(uv_loop_t* loop, void (*fn)(void*), void* arg);
 size_t     goc_pool_thread_count(goc_pool* pool);

@@ -137,6 +137,30 @@ void goc_init(void);
 void goc_shutdown(void);
 
 /**
+ * goc_lifecycle_hook_phase_t — Phases for loop lifecycle hooks.
+ */
+typedef enum {
+    GOC_LIFECYCLE_HOOK_PRE_LOOP_INIT = 0,
+    GOC_LIFECYCLE_HOOK_POST_LOOP_INIT,
+    GOC_LIFECYCLE_HOOK_PRE_LOOP_SHUTDOWN,
+    GOC_LIFECYCLE_HOOK_POST_LOOP_SHUTDOWN,
+    GOC_LIFECYCLE_HOOK_PRE_POOL_DESTROY,
+    GOC_LIFECYCLE_HOOK_COUNT,
+} goc_lifecycle_hook_phase_t;
+
+/**
+ * goc_register_lifecycle_hook() — Register a runtime lifecycle callback.
+ *
+ * phase : lifecycle phase to observe.
+ * fn    : callback invoked when the phase occurs.
+ * ub    : opaque user data passed to fn. For runtime loop lifecycle hooks,
+ *         pass NULL. For pool destroy hooks, pass the target goc_pool*.
+ */
+void goc_register_lifecycle_hook(goc_lifecycle_hook_phase_t phase,
+                                 void (*fn)(void*),
+                                 void* ub);
+
+/**
  * goc_scheduler() — Return the libuv event loop used by the runtime.
  *
  * The returned pointer is valid from goc_init() until goc_shutdown() returns.
@@ -144,6 +168,12 @@ void goc_shutdown(void);
  * or close the loop themselves.
  */
 uv_loop_t* goc_scheduler(void);
+
+/**
+ * goc_loop_is_shutting_down() — Return nonzero when the runtime shutdown has
+ * begun and the event loop is stopping.
+ */
+int goc_loop_is_shutting_down(void);
 
 /* -------------------------------------------------------------------------
  * Memory
@@ -230,6 +260,12 @@ goc_pool* goc_current_or_default_pool(void);
 uv_thread_t goc_current_thread(void);
 
 /**
+ * goc_current_worker_id() — Return the current pool worker index, or -1
+ * when called outside a pool worker thread.
+ */
+int goc_current_worker_id(void);
+
+/**
  * goc_current_fiber() — Return the currently running fiber handle, or NULL
  * outside fibers. The returned pointer is runtime-internal and opaque.
  */
@@ -268,6 +304,25 @@ goc_chan* goc_go(void (*fn)(void*), void* arg);
  * spawns made from a currently running fiber bypass that deferral.
  */
 goc_chan* goc_go_on(goc_pool* pool, void (*fn)(void*), void* arg);
+
+/**
+ * goc_go_on_worker() — Spawn a fiber on a specific worker within a pool.
+ *
+ * worker_idx : zero-based worker index within the target pool.
+ * fn         : fiber entry point.
+ * arg        : arbitrary user data passed to fn.
+ */
+goc_chan* goc_go_on_worker(goc_pool* pool,
+                            size_t worker_idx,
+                            void (*fn)(void*),
+                            void* arg);
+
+/**
+ * goc_yield() — Yield the current fiber to the scheduler.
+ *
+ * Must only be called from within a fiber; calling from an OS thread aborts.
+ */
+void goc_yield(void);
 
 /* -------------------------------------------------------------------------
  * Channel lifecycle

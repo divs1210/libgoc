@@ -72,11 +72,6 @@ static _Atomic int      g_pool_id_counter = 0;
  * goc_pool — full definition (opaque outside pool.c)
  * ---------------------------------------------------------------------- */
 
-typedef struct goc_pool_destroy_hook_entry {
-    void (*fn)(goc_pool* pool);
-    struct goc_pool_destroy_hook_entry* next;
-} goc_pool_destroy_hook_entry_t;
-
 struct goc_pool {
     int                id;
     goc_worker*        workers;
@@ -91,7 +86,6 @@ struct goc_pool {
     size_t             resident_count;    /* fibers with an allocated coroutine/stack */
     goc_spawn_req*     pending_spawn_head;
     goc_spawn_req*     pending_spawn_tail;
-    goc_pool_destroy_hook_entry_t* destroy_hooks;
 };
 
 /* -------------------------------------------------------------------------
@@ -387,21 +381,6 @@ static void registry_remove(goc_pool* pool) {
         }
     }
     uv_mutex_unlock(&g_pool_registry_mutex);
-}
-
-void goc_pool_add_destroy_hook(goc_pool* pool,
-                               goc_pool_destroy_hook_fn fn) {
-    if (!pool || !fn)
-        return;
-
-    goc_pool_destroy_hook_entry_t* entry =
-        malloc(sizeof(goc_pool_destroy_hook_entry_t));
-    if (!entry)
-        ABORT("goc_pool_add_destroy_hook: allocation failed\n");
-
-    entry->fn = fn;
-    entry->next = pool->destroy_hooks;
-    pool->destroy_hooks = entry;
 }
 
 /* -------------------------------------------------------------------------
@@ -1279,7 +1258,6 @@ goc_pool* goc_pool_make(size_t threads) {
     pool->resident_count    = 0;
     pool->pending_spawn_head = NULL;
     pool->pending_spawn_tail = NULL;
-    pool->destroy_hooks      = NULL;
 
     for (size_t i = 0; i < threads; i++) {
         atomic_store_explicit(&pool->workers[i].closing, 0, memory_order_relaxed);
@@ -1321,10 +1299,7 @@ void goc_pool_destroy(goc_pool* pool) {
     /* Invoke any module-specific destroy hooks before waiting for live fibers
      * to drain. This allows external subsystems like HTTP to wake blocked
      * fibers and observe shutdown without embedding knowledge here. */
-    for (goc_pool_destroy_hook_entry_t* e = pool->destroy_hooks; e; e = e->next) {
-        if (e->fn)
-            e->fn(pool);
-    }
+    goc_run_lifecycle_hooks(GOC_LIFECYCLE_HOOK_PRE_POOL_DESTROY, pool);
 
     /* 1. Wait for all live fibers to exit (live_count reaches zero). */
     uv_mutex_lock(&pool->drain_mutex);
@@ -1414,12 +1389,6 @@ void goc_pool_destroy(goc_pool* pool) {
         /* The worker thread performs its own loop shutdown and uv_loop_close(). */
         wsdq_destroy(&pool->workers[i].deque);
         injector_destroy(&pool->workers[i].injector);
-    }
-
-    while (pool->destroy_hooks) {
-        goc_pool_destroy_hook_entry_t* next = pool->destroy_hooks->next;
-        free(pool->destroy_hooks);
-        pool->destroy_hooks = next;
     }
 
     /* 6. Destroy drain primitives. */

@@ -309,15 +309,17 @@ static void http_client_cleanup_pool_entries(goc_pool* pool)
     uv_mutex_unlock(&g_http_worker_pools_mutex);
 }
 
-static void http_client_close_wait_chs_hook(goc_pool* pool)
+static void http_client_close_wait_chs_hook(void* ub)
 {
+    goc_pool* pool = (goc_pool*)ub;
     http_client_close_wait_chs();
     http_client_close_sweeper_ch();
     http_client_cleanup_pool_entries(pool);
 }
 
-void goc_http_reset_globals(void)
+void goc_http_reset_globals(void* ub)
 {
+    (void)ub;
     if (atomic_load_explicit(&g_http_worker_pools_mutex_init,
                               memory_order_acquire)) {
         uv_mutex_lock(&g_http_worker_pools_mutex);
@@ -2081,7 +2083,8 @@ static void http_client_register_lifecycle_hook(void)
                                                 memory_order_acq_rel,
                                                 memory_order_relaxed)) {
         goc_register_lifecycle_hook(GOC_LIFECYCLE_HOOK_PRE_LOOP_SHUTDOWN,
-                                     goc_http_reset_globals);
+                                     goc_http_reset_globals,
+                                     NULL);
     }
 }
 
@@ -2145,7 +2148,10 @@ static http_worker_pool_t* http_client_current_worker_pool(void)
     }
     g_http_worker_pools[g_http_worker_pools_len++] = wp;
     if (!pool_hook_registered) {
-        goc_pool_add_destroy_hook(pool, http_client_close_wait_chs_hook);
+        goc_register_lifecycle_hook(
+            GOC_LIFECYCLE_HOOK_PRE_POOL_DESTROY,
+            http_client_close_wait_chs_hook,
+            pool);
     }
     uv_mutex_unlock(&g_http_worker_pools_mutex);
 
