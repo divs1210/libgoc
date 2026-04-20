@@ -962,7 +962,12 @@ static void loop_process_pending_put(goc_entry *e)
             while (atomic_load_explicit(&fe_taker->parked, memory_order_acquire) != want) {
                 sched_yield();
             }
-            post_to_run_queue(fe_taker->pool, fe_taker);
+            if (fe_taker->home_worker_idx != SIZE_MAX &&
+                fe_taker->pool &&
+                fe_taker->home_worker_idx < goc_pool_thread_count(fe_taker->pool))
+                post_to_specific_worker(fe_taker->pool, fe_taker->home_worker_idx, fe_taker);
+            else
+                post_to_run_queue(fe_taker->pool, fe_taker);
         }
         if (e->put_cb) e->put_cb(ch, e->put_val, GOC_OK, e->ud);
         if (e->free_on_drain) free(e);
@@ -1038,7 +1043,12 @@ static void loop_process_pending_take(goc_entry *e)
                             (void*)ch, (void*)fe_putter);
                 }
             }
-            post_to_run_queue(fe_putter->pool, fe_putter);
+            if (fe_putter->home_worker_idx != SIZE_MAX &&
+                fe_putter->pool &&
+                fe_putter->home_worker_idx < goc_pool_thread_count(fe_putter->pool))
+                post_to_specific_worker(fe_putter->pool, fe_putter->home_worker_idx, fe_putter);
+            else
+                post_to_run_queue(fe_putter->pool, fe_putter);
         }
         if (e->cb) e->cb(ch, val, GOC_OK, e->ud);
         if (e->free_on_drain) free(e);

@@ -2217,22 +2217,23 @@ static void http_client_signal_waiters(void)
         return;
     }
 
+    /* Snapshot wait channels under the lock, then signal outside it.
+     * goc_put_cb is fire-and-forget (no fiber yield), so the lock hold
+     * time is just the snapshot copy, not one goc_alts call per worker. */
+    goc_chan* wait_chs[64];
+    size_t n_chs = 0;
     uv_mutex_lock(&g_http_worker_pools_mutex);
-    for (size_t i = 0; i < g_http_worker_pools_len; i++) {
+    for (size_t i = 0; i < g_http_worker_pools_len && n_chs < 64; i++) {
         http_worker_pool_t* wp = g_http_worker_pools[i];
-        if (!wp || !wp->wait_ch)
-            continue;
-
-        GOC_DBG("http_client_signal_waiters: worker=%d signaling waiters on %p\n",
-                wp->worker_id,
-                (void*)wp->wait_ch);
-        goc_alt_op_t ops[2] = {
-            { wp->wait_ch,  GOC_ALT_PUT,     NULL },
-            { NULL,         GOC_ALT_DEFAULT, NULL },
-        };
-        goc_alts(ops, 2);
+        if (wp && wp->wait_ch)
+            wait_chs[n_chs++] = wp->wait_ch;
     }
     uv_mutex_unlock(&g_http_worker_pools_mutex);
+
+    for (size_t i = 0; i < n_chs; i++) {
+        GOC_DBG("http_client_signal_waiters: signaling %p\n", (void*)wait_chs[i]);
+        goc_put_cb(wait_chs[i], NULL, NULL, NULL);
+    }
 }
 
 static goc_chan* http_client_sweeper_ch(void)
@@ -3438,13 +3439,19 @@ goc_chan* goc_http_request(const char* method, const char* url,
             (void*)ch);
 
     goc_pool* req_pool = goc_current_or_default_pool();
-    GOC_DBG("goc_http_request[%llu]: scheduling client fiber req_id=%llu ch=%p pool=%p keep_alive=%d\n",
+    int caller_worker = goc_current_worker_id();
+    GOC_DBG("goc_http_request[%llu]: scheduling client fiber req_id=%llu ch=%p pool=%p keep_alive=%d caller_worker=%d\n",
             (unsigned long long)a->req_id,
             (unsigned long long)a->req_id,
             (void*)ch,
             (void*)req_pool,
-            opts ? opts->keep_alive : 0);
-    goc_go_on(req_pool, http_client_fiber, a);
+            opts ? opts->keep_alive : 0,
+            caller_worker);
+    /* Pin to the calling worker so the idle connection stack is a local hit. */
+    if (caller_worker >= 0)
+        goc_go_on_worker(req_pool, (size_t)caller_worker, http_client_fiber, a);
+    else
+        goc_go_on(req_pool, http_client_fiber, a);
 
     /* Honour optional timeout (fiber context only). */
     if (opts && opts->timeout_ms > 0 && goc_in_fiber()) {
