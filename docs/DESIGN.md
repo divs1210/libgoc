@@ -107,7 +107,8 @@ libgoc/
 │   ├── ARRAY.md           # Dynamic array design and API reference
 │   ├── TELEMETRY.md       # goc_stats async telemetry system
 │   ├── IO.md              # goc_io async I/O wrappers API reference
-│   └── HTTP.md            # HTTP server API and design reference
+│   ├── HTTP.md            # HTTP server API and design reference
+|   └── OPTIMIZATION.md    # Prioritized optimization roadmap and benchmark signals
 ├── vendor/
 │   ├── minicoro/
 │   │   └── minicoro.h             # Vendored header — fiber suspend/resume (header-only)
@@ -117,7 +118,6 @@ libgoc/
 ├── CMakeLists.txt         # Build system: libgoc static lib + test binary
 ├── libgoc.pc.in           # pkg-config template; expanded by CMake at configure time
 ├── README.md
-├── OPTIMIZATION.md        # Prioritized optimization roadmap and benchmark signals
 ├── test.sh                # Full build + test runner with watch mode
 ├── run_test_loop.sh       # Single-test stress loop for flakiness detection
 └── LICENSE
@@ -238,7 +238,7 @@ libuv invokes **all handle callbacks** (read callbacks, connection callbacks, ti
 static void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
     if (nread <= 0) return;
 
-    my_msg_t* msg = goc_malloc(sizeof(my_msg_t));
+    my_msg_t* msg = goc_new(my_msg_t);
     memcpy(msg->data, buf->base, nread);
     msg->len = nread;
 
@@ -1114,8 +1114,8 @@ typedef struct {
 ```c
 goc_chan* goc_timeout(uint64_t ms) {
     goc_chan* ch = goc_chan_make(0);
-    goc_timeout_req*       req  = goc_malloc(sizeof(goc_timeout_req));
-    goc_timeout_timer_ctx* tctx = goc_malloc(sizeof(goc_timeout_timer_ctx));
+    goc_timeout_req*       req  = goc_new(goc_timeout_req);
+    goc_timeout_timer_ctx* tctx = goc_new(goc_timeout_timer_ctx);
     tctx->ch = ch;  tctx->heap_idx = SIZE_MAX;
     req->timer_ctx = tctx;  req->ms = ms;
     req->deadline_ns = uv_hrtime();
@@ -1253,12 +1253,12 @@ void          goc_shutdown(void);
 void*         goc_malloc(size_t n);
 void*         goc_realloc(void* ptr, size_t n);
 char*         goc_sprintf(const char* fmt, ...);
+/* goc_new(T)       — allocate a single T on the GC heap; returns T* */
+/* goc_new_n(T, n)  — allocate an array of n T values on the GC heap; returns T* */
 
 /* Scalar boxing helpers (macros) */
-/* goc_box_int(x)    — (void*)(intptr_t)(x)  */
-/* goc_unbox_int(p)  — (intptr_t)(p)          */
-/* goc_box_uint(x)   — (void*)(uintptr_t)(x) */
-/* goc_unbox_uint(p) — (uintptr_t)(p)         */
+/* goc_box(T, val)  — allocate a GC-managed copy of scalar val; returns void* */
+/* goc_unbox(T, p)  — dereference a boxed scalar pointer; returns T */
 
 /* Channels */
 goc_chan*     goc_chan_make(size_t buf_size);
@@ -1311,22 +1311,6 @@ goc_drain_result_t goc_pool_destroy_timeout(goc_pool* pool,
 
 /* Scheduler / event loop */
 uv_loop_t*    goc_scheduler(void);
-
-/* Dynamic array (see goc_array.h and ARRAY.md) */
-goc_array*    goc_array_make(size_t initial_cap);
-goc_array*    goc_array_from(void** items, size_t n);
-size_t        goc_array_len(const goc_array* arr);
-void*         goc_array_get(const goc_array* arr, size_t i);
-void          goc_array_set(goc_array* arr, size_t i, void* val);
-void          goc_array_push(goc_array* arr, void* val);
-void*         goc_array_pop(goc_array* arr);
-void          goc_array_push_head(goc_array* arr, void* val);
-void*         goc_array_pop_head(goc_array* arr);
-goc_array*    goc_array_concat(const goc_array* a, const goc_array* b);
-goc_array*    goc_array_slice(const goc_array* arr, size_t start, size_t end);
-goc_array*    goc_array_from_str(const char* s);
-char*         goc_array_to_str(const goc_array* arr);
-void**        goc_array_to_c(const goc_array* arr);
 ```
 
 ### Internal Functions

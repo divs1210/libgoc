@@ -143,7 +143,7 @@ typedef struct {
 
 static void send_fiber_fn(void* arg) {
     send_args_t* a = (send_args_t*)arg;
-    goc_put(a->ch, goc_box_uint(a->value));
+    goc_put(a->ch, goc_box(unsigned int, a->value));
 }
 
 static void test_p3_1(void) {
@@ -157,7 +157,7 @@ static void test_p3_1(void) {
 
     goc_val_t* v = goc_take_sync(ch);
     ASSERT(v->ok == GOC_OK);
-    ASSERT(goc_unbox_uint(v->val) == 0xDEADBEADUL);
+    ASSERT(goc_unbox(unsigned int, v->val) == 0xDEADBEADUL);
 
     /* Wait for the fiber to finish. */
     goc_val_t* jv = goc_take_sync(join);
@@ -187,7 +187,7 @@ typedef struct {
 static void fill_fiber_fn(void* arg) {
     fill_args_t* a = (fill_args_t*)arg;
     for (int i = 0; i < a->count; i++) {
-        goc_put(a->ch, goc_box_uint(i));
+        goc_put(a->ch, goc_box(unsigned int, i));
     }
 }
 
@@ -207,7 +207,7 @@ static void test_p3_2(void) {
     for (int i = 0; i < P3_2_COUNT; i++) {
         goc_val_t* v = goc_take_sync(ch);
         ASSERT(v->ok == GOC_OK);
-        ASSERT(goc_unbox_uint(v->val) == (uintptr_t)i);
+        ASSERT(goc_unbox(unsigned int, v->val) == (uintptr_t)i);
     }
 
     goc_close(ch);
@@ -248,12 +248,12 @@ static void test_p3_4(void) {
     goc_chan* ch = goc_chan_make(4);
     ASSERT(ch != NULL);
 
-    goc_status_t st = goc_put_sync(ch, goc_box_uint(99));
+    goc_status_t st = goc_put_sync(ch, goc_box(unsigned int, 99));
     ASSERT(st == GOC_OK);
 
     goc_val_t* v = goc_take_try(ch);
     ASSERT(v->ok == GOC_OK);
-    ASSERT(goc_unbox_uint(v->val) == 99);
+    ASSERT(goc_unbox(unsigned int, v->val) == 99);
 
     goc_close(ch);
     TEST_PASS();
@@ -402,14 +402,14 @@ static void test_p3_8(void) {
     /* Small delay so the fiber has time to park. */
     goc_nanosleep(5000000); /* 5 ms */
 
-    goc_status_t st = goc_put_sync(ch, goc_box_uint(0xCAFEUL));
+    goc_status_t st = goc_put_sync(ch, goc_box(unsigned int, 0xCAFEUL));
     ASSERT(st == GOC_OK);
 
     /* Wait for the fiber to record its result. */
     done_wait(&done_sem);
 
     ASSERT(args.result->ok == GOC_OK);
-    ASSERT(goc_unbox_uint(args.result->val) == 0xCAFEUL);
+    ASSERT(goc_unbox(unsigned int, args.result->val) == 0xCAFEUL);
 
     goc_val_t* jv = goc_take_sync(join);
     ASSERT(jv->ok == GOC_CLOSED);
@@ -438,7 +438,7 @@ typedef struct {
 static void* sync_putter_thread(void* arg) {
     sync_putter_args_t* a = (sync_putter_args_t*)arg;
     done_signal(a->parked);
-    a->result = goc_put_sync(a->ch, goc_box_uint(1UL));
+    a->result = goc_put_sync(a->ch, goc_box(unsigned int, 1UL));
     return NULL;
 }
 
@@ -547,7 +547,7 @@ typedef struct {
 static void parked_putter_fn(void* arg) {
     parked_putter_args_t* a = (parked_putter_args_t*)arg;
     done_signal(a->parked);
-    a->result = goc_put(a->ch, goc_box_uint(1UL));
+    a->result = goc_put(a->ch, goc_box(unsigned int, 1UL));
     done_signal(a->done);
 }
 
@@ -619,7 +619,7 @@ static void test_p3_12(void) {
     for (int i = 0; i < P3_12_COUNT; i++) {
         goc_val_t* v = goc_take_sync(ch);
         ASSERT(v->ok == GOC_OK);
-        ASSERT(goc_unbox_uint(v->val) == (uintptr_t)i);
+        ASSERT(goc_unbox(unsigned int, v->val) == (uintptr_t)i);
     }
 
     /* The next take must return GOC_CLOSED. */
@@ -662,7 +662,7 @@ static void drain_fiber_fn(void* arg) {
             break;
         }
         if (v->ok == GOC_OK) {
-            if (goc_unbox_uint(v->val) != (uintptr_t)a->ok_count) {
+            if (goc_unbox(unsigned int, v->val) != (uintptr_t)a->ok_count) {
                 a->order_ok = false;
             }
             a->ok_count++;
@@ -786,7 +786,7 @@ static void test_p3_16(void) {
     for (int i = 0; i < P3_16_N; i++) {
         chs[i] = goc_chan_make(1);
         ASSERT(chs[i] != NULL);
-        goc_status_t s = goc_put_sync(chs[i], goc_box_uint(vals[i]));
+        goc_status_t s = goc_put_sync(chs[i], goc_box(unsigned int, vals[i]));
         ASSERT(s == GOC_OK);
     }
 
@@ -796,7 +796,7 @@ static void test_p3_16(void) {
     for (int i = 0; i < P3_16_N; i++) {
         ASSERT(results[i] != NULL);
         ASSERT(results[i]->ok == GOC_OK);
-        ASSERT(goc_unbox_uint(results[i]->val) == vals[i]);
+        ASSERT(goc_unbox(unsigned int, results[i]->val) == vals[i]);
     }
 
     TEST_PASS();
@@ -851,7 +851,7 @@ typedef struct {
 
 static void p3_18_sender_fn(void* arg) {
     p3_18_sender_args_t* a = (p3_18_sender_args_t*)arg;
-    goc_put(a->ch, goc_box_uint(a->val));
+    goc_put(a->ch, goc_box(unsigned int, a->val));
 }
 
 static void test_p3_18(void) {
@@ -876,7 +876,7 @@ static void test_p3_18(void) {
     for (int i = 0; i < P3_18_N; i++) {
         ASSERT(results[i] != NULL);
         ASSERT(results[i]->ok == GOC_OK);
-        ASSERT(goc_unbox_uint(results[i]->val) == args[i].val);
+        ASSERT(goc_unbox(unsigned int, results[i]->val) == args[i].val);
         /* Wait for the fiber to finish. */
         goc_val_t* jv = goc_take_sync(joins[i]);
         ASSERT(jv->ok == GOC_CLOSED);
@@ -917,7 +917,7 @@ static void test_p3_19(void) {
     for (int i = 0; i < P3_19_N; i++) {
         chs[i] = goc_chan_make(1);
         ASSERT(chs[i] != NULL);
-        goc_status_t s = goc_put_sync(chs[i], goc_box_uint(vals[i]));
+        goc_status_t s = goc_put_sync(chs[i], goc_box(unsigned int, vals[i]));
         ASSERT(s == GOC_OK);
     }
 
@@ -938,7 +938,7 @@ static void test_p3_19(void) {
     for (int i = 0; i < P3_19_N; i++) {
         ASSERT(results[i] != NULL);
         ASSERT(results[i]->ok == GOC_OK);
-        ASSERT(goc_unbox_uint(results[i]->val) == vals[i]);
+        ASSERT(goc_unbox(unsigned int, results[i]->val) == vals[i]);
     }
 
     goc_val_t* jv = goc_take_sync(join);
@@ -973,7 +973,7 @@ typedef struct {
 
 static void p3_20_sender_fn(void* arg) {
     p3_20_sender_args_t* a = (p3_20_sender_args_t*)arg;
-    goc_put(a->ch, goc_box_uint(a->val));
+    goc_put(a->ch, goc_box(unsigned int, a->val));
 }
 
 static void p3_20_taker_fn(void* arg) {
@@ -1015,7 +1015,7 @@ static void test_p3_20(void) {
     for (int i = 0; i < P3_20_N; i++) {
         ASSERT(results[i] != NULL);
         ASSERT(results[i]->ok == GOC_OK);
-        ASSERT(goc_unbox_uint(results[i]->val) == sender_args[i].val);
+        ASSERT(goc_unbox(unsigned int, results[i]->val) == sender_args[i].val);
         goc_val_t* jv = goc_take_sync(sender_joins[i]);
         ASSERT(jv->ok == GOC_CLOSED);
     }
